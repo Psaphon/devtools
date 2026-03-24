@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check syntax
+        run: python -m py_compile dtl.py
+      - name: Run ruff lint
+        run: pip install ruff && ruff check dtl.py
+      - name: Run ruff format check
+        run: ruff format --check dtl.py
+
+  test-scaffold:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        stack: [python, node, go, rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scaffold project (no AI)
+        run: python dtl.py new --name test-${{ matrix.stack }} --stack ${{ matrix.stack }}
+
+      - name: Validate scaffold
+        run: |
+          test -f test-${{ matrix.stack }}/CLAUDE.md
+          test -f test-${{ matrix.stack }}/.devcontainer/devcontainer.json
+          test -f test-${{ matrix.stack }}/.pre-commit-config.yaml
+          test -f test-${{ matrix.stack }}/.github/workflows/ci.yml
+          test -f test-${{ matrix.stack }}/.gitignore
+
+  test-ai-attach:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - provider: claude
+            mode: docker
+          - provider: openclaw
+            mode: docker
+          - provider: claude
+            mode: vm
+          - provider: ollama
+            mode: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scaffold base project
+        run: python dtl.py new --name test-ai --stack python
+
+      - name: Attach AI (${{ matrix.provider }} / ${{ matrix.mode }})
+        run: python dtl.py ai attach --project test-ai --provider ${{ matrix.provider }} --mode ${{ matrix.mode }}
+
+      - name: Validate AI config
+        run: |
+          test -f test-ai/.ai/config.json
+          test -f test-ai/.ai/notify.py
+          test -f test-ai/.ai/run.sh
+          # Check config.json has correct provider and mode
+          python -c "
+          import json
+          config = json.load(open('test-ai/.ai/config.json'))
+          assert config['provider'] == '${{ matrix.provider }}', f'wrong provider: {config[\"provider\"]}'
+          assert config['mode'] == '${{ matrix.mode }}', f'wrong mode: {config[\"mode\"]}'
+          print(f'OK: {config[\"provider\"]} / {config[\"mode\"]}')
+          "
+
+      - name: Detach AI
+        run: python dtl.py ai detach --project test-ai
+
+      - name: Validate detach
+        run: test ! -d test-ai/.ai
+
+  test-templates:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        template: [general, terraform, monitoring, security, etl, api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scaffold with template (${{ matrix.template }})
+        run: python dtl.py new --name test-tpl --stack python --template ${{ matrix.template }}
+
+      - name: Validate CLAUDE.md
+        run: test -f test-tpl/CLAUDE.md
+
+  test-commands:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: dtl --help
+        run: python dtl.py --help
+
+      - name: dtl list-stacks
+        run: python dtl.py list-stacks
+
+      - name: dtl ai --help
+        run: python dtl.py ai --help
+
+      - name: dtl ai list-providers
+        run: python dtl.py ai list-providers
