@@ -77,9 +77,7 @@ STACKS: Dict[str, dict] = {
             .mypy_cache/
             .ruff_cache/
         """),
-        "dockerfile_run": (
-            "RUN pip install --no-cache-dir --upgrade pip"
-        ),
+        "dockerfile_run": ("RUN pip install --no-cache-dir --upgrade pip"),
         "ci_setup": textwrap.dedent("""\
               - uses: actions/setup-python@v5
                 with:
@@ -162,7 +160,7 @@ STACKS: Dict[str, dict] = {
               - run: go vet ./...
               - run: go test ./...
         """),
-        "claude_linter": "go vet ./... && test -z \"$(gofmt -l .)\"",
+        "claude_linter": 'go vet ./... && test -z "$(gofmt -l .)"',
     },
     "rust": {
         "display": "Rust (stable)",
@@ -187,9 +185,7 @@ STACKS: Dict[str, dict] = {
             /target/
             Cargo.lock
         """),
-        "dockerfile_run": (
-            "RUN rustup component add clippy rustfmt"
-        ),
+        "dockerfile_run": ("RUN rustup component add clippy rustfmt"),
         "ci_setup": textwrap.dedent("""\
               - uses: dtolnay/rust-toolchain@stable
                 with:
@@ -492,7 +488,7 @@ def make_docker_compose(
                     volumes_needed.append(vol_name)
 
         lines.append("    healthcheck:")
-        lines.append(f"      test: [\"{svc['healthcheck_cmd']}\"]")
+        lines.append(f'      test: ["{svc["healthcheck_cmd"]}"]')
         lines.append("      interval: 10s")
         lines.append("      timeout: 5s")
         lines.append("      retries: 5")
@@ -721,15 +717,12 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
     ollama_forward = ""
     if "ollama" in ai_providers:
         ollama_forward = (
-            '  -netdev user,id=net0,'
-            'hostfwd=tcp::2222-:22,'
-            'guestfwd=tcp:10.0.2.100:11434-tcp:127.0.0.1:11434 \\'
+            "  -netdev user,id=net0,"
+            "hostfwd=tcp::2222-:22,"
+            "guestfwd=tcp:10.0.2.100:11434-tcp:127.0.0.1:11434 \\"
         )
     else:
-        ollama_forward = (
-            '  -netdev user,id=net0,'
-            'hostfwd=tcp::2222-:22 \\'
-        )
+        ollama_forward = "  -netdev user,id=net0,hostfwd=tcp::2222-:22 \\"
 
     return textwrap.dedent(f"""\
         #!/usr/bin/env bash
@@ -863,37 +856,41 @@ def make_ai_vm_compose(
     lines = ["services:"]
 
     if "claude" in ai_providers:
-        lines.extend([
-            "  claude-code:",
-            "    build: ./claude-code",
-            "    volumes:",
-            "      - /workspace:/workspace",
-            "    working_dir: /workspace",
-            "    stdin_open: true",
-            "    tty: true",
-            "    cap_drop:",
-            "      - ALL",
-            "    security_opt:",
-            "      - no-new-privileges:true",
-            "    deploy:",
-            "      resources:",
-            "        limits:",
-            "          cpus: '2'",
-            "          memory: 4G",
-            "    environment:",
-            "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
-            "",
-        ])
+        lines.extend(
+            [
+                "  claude-code:",
+                "    build: ./claude-code",
+                "    volumes:",
+                "      - /workspace:/workspace",
+                "    working_dir: /workspace",
+                "    stdin_open: true",
+                "    tty: true",
+                "    cap_drop:",
+                "      - ALL",
+                "    security_opt:",
+                "      - no-new-privileges:true",
+                "    deploy:",
+                "      resources:",
+                "        limits:",
+                "          cpus: '2'",
+                "          memory: 4G",
+                "    environment:",
+                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
+                "",
+            ]
+        )
 
     if mcp_servers:
         for srv in mcp_servers:
             lines.extend(_mcp_compose_entry(srv))
     else:
-        lines.extend([
-            "  # To add an MCP server run:",
-            "  #   dtl add-mcp --name <server> --project .",
-            "",
-        ])
+        lines.extend(
+            [
+                "  # To add an MCP server run:",
+                "  #   dtl add-mcp --name <server> --project .",
+                "",
+            ]
+        )
 
     return "\n".join(lines) + "\n"
 
@@ -955,7 +952,7 @@ def make_ai_claude_settings(
 ) -> str:
     """Generate Claude Code settings for the sandbox."""
     mcp_config: dict = {}
-    for srv in (mcp_servers or []):
+    for srv in mcp_servers or []:
         binary_name = MCP_KNOWN_PACKAGES.get(srv, srv).rsplit("/", 1)[-1]
         mcp_config[srv] = {
             "command": "docker",
@@ -996,78 +993,84 @@ def make_ai_docker_compose(
             model_id = pconfig["models"].get(model, model)
             model_env = f"      - CLAUDE_MODEL={model_id}"
 
-        lines.extend([
-            "  claude-code:",
-            "    build: ./claude-code",
-            "    volumes:",
-            "      - ../../:/workspace",
-            "    working_dir: /workspace",
-            "    stdin_open: true",
-            "    tty: true",
-            "    cap_drop:",
-            "      - ALL",
-            "    security_opt:",
-            "      - no-new-privileges:true",
-            "    deploy:",
-            "      resources:",
-            "        limits:",
-            "          cpus: '2'",
-            "          memory: 4G",
-            "    environment:",
-            "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
-        ])
+        lines.extend(
+            [
+                "  claude-code:",
+                "    build: ./claude-code",
+                "    volumes:",
+                "      - ../../:/workspace",
+                "    working_dir: /workspace",
+                "    stdin_open: true",
+                "    tty: true",
+                "    cap_drop:",
+                "      - ALL",
+                "    security_opt:",
+                "      - no-new-privileges:true",
+                "    deploy:",
+                "      resources:",
+                "        limits:",
+                "          cpus: '2'",
+                "          memory: 4G",
+                "    environment:",
+                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
+            ]
+        )
         if model_env:
             lines.append(model_env)
         lines.append("")
 
     elif provider == "openclaw":
-        lines.extend([
-            "  openclaw-gateway:",
-            f"    image: {AI_PROVIDERS_CONFIG['openclaw']['image']}",
-            "    volumes:",
-            "      - openclaw-config:/home/node/.openclaw",
-            "      - ../../:/home/node/.openclaw/workspace",
-            "    ports:",
-            '      - "18789:18789"',
-            "    environment:",
-            "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
-            '    user: "1000:1000"',
-            "    restart: unless-stopped",
-            "    healthcheck:",
-            '      test: ["CMD", "curl", "-f", "http://localhost:18789/healthz"]',
-            "      interval: 30s",
-            "      timeout: 10s",
-            "      retries: 3",
-            "    deploy:",
-            "      resources:",
-            "        limits:",
-            "          cpus: '2'",
-            "          memory: 4G",
-            "",
-        ])
+        lines.extend(
+            [
+                "  openclaw-gateway:",
+                f"    image: {AI_PROVIDERS_CONFIG['openclaw']['image']}",
+                "    volumes:",
+                "      - openclaw-config:/home/node/.openclaw",
+                "      - ../../:/home/node/.openclaw/workspace",
+                "    ports:",
+                '      - "18789:18789"',
+                "    environment:",
+                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
+                '    user: "1000:1000"',
+                "    restart: unless-stopped",
+                "    healthcheck:",
+                '      test: ["CMD", "curl", "-f", "http://localhost:18789/healthz"]',
+                "      interval: 30s",
+                "      timeout: 10s",
+                "      retries: 3",
+                "    deploy:",
+                "      resources:",
+                "        limits:",
+                "          cpus: '2'",
+                "          memory: 4G",
+                "",
+            ]
+        )
 
     elif provider == "ollama":
-        lines.extend([
-            "  ollama:",
-            f"    image: {AI_PROVIDERS_CONFIG['ollama']['image']}",
-            "    volumes:",
-            "      - ollama-models:/root/.ollama",
-            "      - ../../:/workspace",
-            "    ports:",
-            '      - "11434:11434"',
-            "    deploy:",
-            "      resources:",
-            "        limits:",
-            "          cpus: '4'",
-            "          memory: 8G",
-            "    restart: unless-stopped",
-            "    healthcheck:",
-            '      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]',
-            "      interval: 30s",
-            "      timeout: 10s",
-            "      retries: 3",
-            "",
-        ])
+        lines.extend(
+            [
+                "  ollama:",
+                f"    image: {AI_PROVIDERS_CONFIG['ollama']['image']}",
+                "    volumes:",
+                "      - ollama-models:/root/.ollama",
+                "      - ../../:/workspace",
+                "    ports:",
+                '      - "11434:11434"',
+                "    deploy:",
+                "      resources:",
+                "        limits:",
+                "          cpus: '4'",
+                "          memory: 8G",
+                "    restart: unless-stopped",
+                "    healthcheck:",
+                '      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]',
+                "      interval: 30s",
+                "      timeout: 10s",
+                "      retries: 3",
+                "",
+            ]
+        )
 
     if mcp_servers:
         for srv in mcp_servers:
@@ -1402,12 +1405,16 @@ def scaffold_project(
     files: Dict[Path, str] = {
         project_dir / ".gitignore": make_gitignore(stack),
         project_dir / "README.md": make_readme(name, stack_name),
-        project_dir / "CLAUDE.md": make_claude_md(name, stack_name, stack, claude_md_template),
+        project_dir / "CLAUDE.md": make_claude_md(
+            name, stack_name, stack, claude_md_template
+        ),
         project_dir / ".pre-commit-config.yaml": make_precommit_config(),
         project_dir / ".github" / "workflows" / "ci.yml": make_ci_workflow(name, stack),
         project_dir / ".devcontainer" / "Dockerfile": make_dockerfile(stack),
         project_dir / ".devcontainer" / "devcontainer.json": make_devcontainer_json(
-            name, stack, services,
+            name,
+            stack,
+            services,
         ),
         project_dir / ".env.example": make_env_example(services),
     }
@@ -1447,7 +1454,10 @@ def _ai_attach_to_project(
     elif mode == "vm":
         _ai_attach_vm(ai_dir, name, provider, model, key_source)
     else:
-        print(f"Error: unknown mode '{mode}'. Available: {', '.join(AI_MODES)}", file=sys.stderr)
+        print(
+            f"Error: unknown mode '{mode}'. Available: {', '.join(AI_MODES)}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -1468,7 +1478,9 @@ def _ai_attach_docker(
         d.mkdir(parents=True, exist_ok=True)
 
     files: Dict[Path, str] = {
-        ai_dir / "config.json": make_ai_config(name, provider, "docker", model, key_source),
+        ai_dir / "config.json": make_ai_config(
+            name, provider, "docker", model, key_source
+        ),
         ai_dir / "docker-compose.yml": make_ai_docker_compose(provider, model),
         ai_dir / "notify.py": make_notify_script(),
         ai_dir / "run.sh": make_run_script(provider),
@@ -1477,7 +1489,9 @@ def _ai_attach_docker(
 
     if provider == "claude":
         files[ai_dir / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
-        files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings([provider])
+        files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings(
+            [provider]
+        )
 
     for path, content in files.items():
         path.write_text(content)
@@ -1516,15 +1530,21 @@ def _ai_attach_vm(
         ai_dir / "Makefile": make_ai_makefile(name),
         ai_dir / "vm" / "cloud-init.yaml": make_ai_cloud_init(),
         ai_dir / "vm" / "vm-config.sh": make_ai_vm_config(name, ai_providers_list),
-        ai_dir / "containers" / "docker-compose.yml": make_ai_vm_compose(ai_providers_list),
+        ai_dir / "containers" / "docker-compose.yml": make_ai_vm_compose(
+            ai_providers_list
+        ),
         ai_dir / "containers" / "mcp-servers" / ".gitkeep": "",
         ai_dir / "notify.py": make_notify_script(),
         ai_dir / "run.sh": make_run_script(provider),
     }
 
     if provider == "claude":
-        files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
-        files[ai_dir / "containers" / "claude-code" / "settings.json"] = make_ai_claude_settings(ai_providers_list)
+        files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = (
+            make_ai_claude_dockerfile()
+        )
+        files[ai_dir / "containers" / "claude-code" / "settings.json"] = (
+            make_ai_claude_settings(ai_providers_list)
+        )
 
     for path, content in files.items():
         path.write_text(content)
@@ -1572,24 +1592,26 @@ def ai_start(project_dir: Path) -> None:
 
     if mode == "docker":
         compose_file = ai_dir / "docker-compose.yml"
-        print(f"[dtl ai] Starting Docker containers...")
+        print("[dtl ai] Starting Docker containers...")
         _run_cmd(["docker", "compose", "-f", str(compose_file), "up", "-d"])
-        print(f"[dtl ai] Containers started.")
+        print("[dtl ai] Containers started.")
 
         provider = config["provider"]
         if provider == "claude":
-            print(f"[dtl ai] Interactive session:")
+            print("[dtl ai] Interactive session:")
             print(f"  docker compose -f {compose_file} run --rm claude-code")
         elif provider == "openclaw":
-            print(f"[dtl ai] OpenClaw gateway running on port 18789")
-            print(f"[dtl ai] Connect via Telegram or configured chat apps")
+            print("[dtl ai] OpenClaw gateway running on port 18789")
+            print("[dtl ai] Connect via Telegram or configured chat apps")
         elif provider == "ollama":
-            print(f"[dtl ai] Ollama running on port 11434")
-            print(f"[dtl ai] Pull a model: docker compose -f {compose_file} exec ollama ollama pull llama3")
+            print("[dtl ai] Ollama running on port 11434")
+            print(
+                f"[dtl ai] Pull a model: docker compose -f {compose_file} exec ollama ollama pull llama3"
+            )
 
     elif mode == "vm":
         vm_script = ai_dir / "vm" / "vm-config.sh"
-        print(f"[dtl ai] Starting AI sandbox VM...")
+        print("[dtl ai] Starting AI sandbox VM...")
         _run_cmd(["bash", str(vm_script), "start"])
 
     print(f"[dtl ai] Provider: {config['provider']} | Mode: {mode}")
@@ -1605,13 +1627,13 @@ def ai_stop(project_dir: Path) -> None:
 
     if mode == "docker":
         compose_file = ai_dir / "docker-compose.yml"
-        print(f"[dtl ai] Stopping Docker containers...")
+        print("[dtl ai] Stopping Docker containers...")
         _run_cmd(["docker", "compose", "-f", str(compose_file), "down"])
     elif mode == "vm":
         vm_script = ai_dir / "vm" / "vm-config.sh"
         _run_cmd(["bash", str(vm_script), "stop"])
 
-    print(f"[dtl ai] Stopped.")
+    print("[dtl ai] Stopped.")
 
 
 def ai_status(project_dir: Path) -> None:
@@ -1630,7 +1652,7 @@ def ai_status(project_dir: Path) -> None:
     if notify.get("provider"):
         print(f"[dtl ai] Notify:   {notify['provider']}")
     else:
-        print(f"[dtl ai] Notify:   not configured")
+        print("[dtl ai] Notify:   not configured")
 
     print()
 
@@ -1654,7 +1676,11 @@ def ai_run(project_dir: Path, prompt: str) -> None:
         print(
             f"Error: provider '{provider}' does not support autonomous mode.\n"
             f"  Providers with autonomous support: "
-            + ", ".join(p for p, c in AI_PROVIDERS_CONFIG.items() if c.get("supports_autonomous")),
+            + ", ".join(
+                p
+                for p, c in AI_PROVIDERS_CONFIG.items()
+                if c.get("supports_autonomous")
+            ),
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1662,7 +1688,7 @@ def ai_run(project_dir: Path, prompt: str) -> None:
     if mode == "docker":
         if provider == "claude":
             compose_file = ai_dir / "docker-compose.yml"
-            print(f"[dtl ai run] Running Claude Code autonomously...")
+            print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
             print()
 
@@ -1670,16 +1696,27 @@ def ai_run(project_dir: Path, prompt: str) -> None:
             try:
                 result = subprocess.run(
                     [
-                        "docker", "compose", "-f", str(compose_file),
-                        "run", "--rm", "claude-code",
-                        "claude", "--print", "-p", prompt,
+                        "docker",
+                        "compose",
+                        "-f",
+                        str(compose_file),
+                        "run",
+                        "--rm",
+                        "claude-code",
+                        "claude",
+                        "--print",
+                        "-p",
+                        prompt,
                     ],
                     capture_output=True,
                     text=True,
                     env={**os.environ},
                 )
             except FileNotFoundError:
-                print("Error: docker not found. Install Docker to use AI containers.", file=sys.stderr)
+                print(
+                    "Error: docker not found. Install Docker to use AI containers.",
+                    file=sys.stderr,
+                )
                 sys.exit(127)
 
             # Print output
@@ -1689,26 +1726,42 @@ def ai_run(project_dir: Path, prompt: str) -> None:
                 print(result.stderr, file=sys.stderr)
 
             # Send notification
-            _send_notification(ai_dir, result.returncode, result.stdout or result.stderr or "(no output)")
+            _send_notification(
+                ai_dir,
+                result.returncode,
+                result.stdout or result.stderr or "(no output)",
+            )
 
             sys.exit(result.returncode)
 
         elif provider == "openclaw":
             # OpenClaw is natively autonomous — just start the gateway
             compose_file = ai_dir / "docker-compose.yml"
-            print(f"[dtl ai run] Starting OpenClaw gateway (autonomous mode)...")
-            print(f"[dtl ai run] OpenClaw handles its own chat-app integration.")
-            print(f"[dtl ai run] Connect via Telegram to send prompts.")
-            _run_cmd(["docker", "compose", "-f", str(compose_file), "up", "-d", "openclaw-gateway"])
-            _send_notification(ai_dir, 0, "OpenClaw gateway started. Send commands via Telegram.")
+            print("[dtl ai run] Starting OpenClaw gateway (autonomous mode)...")
+            print("[dtl ai run] OpenClaw handles its own chat-app integration.")
+            print("[dtl ai run] Connect via Telegram to send prompts.")
+            _run_cmd(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    str(compose_file),
+                    "up",
+                    "-d",
+                    "openclaw-gateway",
+                ]
+            )
+            _send_notification(
+                ai_dir, 0, "OpenClaw gateway started. Send commands via Telegram."
+            )
 
     elif mode == "vm":
         run_script = ai_dir / "run.sh"
         if provider == "claude":
-            print(f"[dtl ai run] Running Claude Code in VM...")
+            print("[dtl ai run] Running Claude Code in VM...")
             _run_cmd(["bash", str(run_script), prompt])
         elif provider == "openclaw":
-            print(f"[dtl ai run] Starting OpenClaw in VM...")
+            print("[dtl ai run] Starting OpenClaw in VM...")
             _run_cmd(["bash", str(run_script), "start"])
 
 
@@ -1872,8 +1925,12 @@ def validate_project(project_dir: Path) -> bool:
                 if not srv_dir.is_dir() or srv_dir.name.startswith("."):
                     continue
                 srv = srv_dir.name
-                check(f"mcp-{srv}: Dockerfile exists", (srv_dir / "Dockerfile").exists())
-                check(f"mcp-{srv}: config.json exists", (srv_dir / "config.json").exists())
+                check(
+                    f"mcp-{srv}: Dockerfile exists", (srv_dir / "Dockerfile").exists()
+                )
+                check(
+                    f"mcp-{srv}: config.json exists", (srv_dir / "config.json").exists()
+                )
 
     # Legacy ai-sandbox/ checks (backward compat)
     sandbox = project_dir / "ai-sandbox"
@@ -1943,8 +2000,7 @@ def cmd_new(args: argparse.Namespace) -> None:
     ai_mode = getattr(args, "mode", "docker") or "docker"
     if ai_mode not in AI_MODES:
         print(
-            f"Error: unknown AI mode '{ai_mode}'. "
-            f"Available: {', '.join(AI_MODES)}",
+            f"Error: unknown AI mode '{ai_mode}'. Available: {', '.join(AI_MODES)}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1979,7 +2035,10 @@ def cmd_new(args: argparse.Namespace) -> None:
         print(f"  CLAUDE.md template: {template}")
 
     project_dir = scaffold_project(
-        name, stack_name, services, base_dir,
+        name,
+        stack_name,
+        services,
+        base_dir,
         ai_providers=ai_providers or None,
         ai_mode=ai_mode,
         ai_model=ai_model,
@@ -2026,7 +2085,9 @@ def cmd_list_stacks(args: argparse.Namespace) -> None:
         print(f"  {key:12s}  {pconfig['display']}{auto}")
         if pconfig["models"]:
             models = ", ".join(sorted(pconfig["models"].keys()))
-            print(f"  {' ':12s}  Models: {models} (default: {pconfig['default_model']})")
+            print(
+                f"  {' ':12s}  Models: {models} (default: {pconfig['default_model']})"
+            )
 
     print("\nAI modes:\n")
     print("  docker      Lightweight — containers on host Docker")
@@ -2071,19 +2132,23 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
 
     srv_dir = mcp_dir / server_name
     if srv_dir.exists():
-        print(f"Error: MCP server '{server_name}' already exists at {srv_dir}", file=sys.stderr)
+        print(
+            f"Error: MCP server '{server_name}' already exists at {srv_dir}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     srv_dir.mkdir(parents=True, exist_ok=True)
 
     # Write Dockerfile and config
     (srv_dir / "Dockerfile").write_text(make_mcp_server_dockerfile(server_name))
-    (srv_dir / "config.json").write_text(make_mcp_server_config(server_name, project_path))
+    (srv_dir / "config.json").write_text(
+        make_mcp_server_config(server_name, project_path)
+    )
 
     # Discover all MCP servers
     existing_servers: List[str] = sorted(
-        d.name for d in mcp_dir.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
+        d.name for d in mcp_dir.iterdir() if d.is_dir() and not d.name.startswith(".")
     )
 
     # Detect active AI providers from existing compose
@@ -2115,7 +2180,7 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
     print("  memory: 512MB, 1 CPU  (resource limits)")
     print("  /workspace: read-only (project files)")
 
-    print(f"\nNext steps:")
+    print("\nNext steps:")
     print(f"  1. Review {srv_dir / 'Dockerfile'}")
     if npm_package != server_name:
         print(f"     (installs {npm_package})")
@@ -2154,8 +2219,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
 
     if mode not in AI_MODES:
         print(
-            f"Error: unknown mode '{mode}'. "
-            f"Available: {', '.join(AI_MODES)}",
+            f"Error: unknown mode '{mode}'. Available: {', '.join(AI_MODES)}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2205,9 +2269,11 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
     if mode == "docker":
         print(f"  dtl ai start --project {project_dir}")
         if provider == "claude":
-            print(f"  # Then: docker compose -f {ai_dir}/docker-compose.yml run --rm claude-code")
+            print(
+                f"  # Then: docker compose -f {ai_dir}/docker-compose.yml run --rm claude-code"
+            )
         elif provider == "openclaw":
-            print(f"  # Then connect via Telegram")
+            print("  # Then connect via Telegram")
     elif mode == "vm":
         print(f"  make -C {ai_dir} up")
         print(f"  make -C {ai_dir} ssh")
@@ -2244,6 +2310,7 @@ def cmd_ai_detach(args: argparse.Namespace) -> None:
             _run_cmd(["bash", str(vm_script), "stop"])
 
     import shutil
+
     shutil.rmtree(ai_dir)
     print(f"[dtl ai] AI detached from {project_dir.name}")
     print(f"  Removed: {ai_dir}")
@@ -2292,13 +2359,13 @@ def cmd_ai_config_notify(args: argparse.Namespace) -> None:
 
     # Test notification
     if args.test:
-        print(f"\n[dtl ai] Sending test notification...")
+        print("\n[dtl ai] Sending test notification...")
         _send_notification(
             project_dir / ".ai",
             0,
             f"Test notification from dtl for project '{config['project_name']}'",
         )
-        print(f"[dtl ai] Check your Telegram.")
+        print("[dtl ai] Check your Telegram.")
 
 
 def cmd_ai_list_providers(args: argparse.Namespace) -> None:
@@ -2404,7 +2471,8 @@ def main() -> None:
     mcp_parser.add_argument(
         "--name",
         required=True,
-        help="MCP server name (e.g. filesystem, github). Known: " + ", ".join(sorted(MCP_KNOWN_PACKAGES)),
+        help="MCP server name (e.g. filesystem, github). Known: "
+        + ", ".join(sorted(MCP_KNOWN_PACKAGES)),
     )
     mcp_parser.add_argument(
         "--project",
