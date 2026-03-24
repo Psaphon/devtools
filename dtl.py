@@ -536,11 +536,36 @@ def make_claude_md(
         - `test:` -- adding or updating tests
         - `ci:` -- CI/CD changes
 
-        ## Branching
+        ## Branching (Gitflow)
 
-        - Push to feature branches, NEVER directly to main.
-        - Branch naming: `feat/short-description`, `fix/short-description`.
-        - Open a PR for every change.
+        This project follows **gitflow**. NEVER commit directly to `main` or `develop`.
+
+        ### Branch types
+
+        | Branch | Purpose | Branches from | Merges into |
+        |--------|---------|---------------|-------------|
+        | `main` | Production-ready releases (tagged) | -- | -- |
+        | `develop` | Integration branch for next release | `main` (initial) | `release/*` |
+        | `feature/*` | New features and non-urgent work | `develop` | `develop` |
+        | `release/*` | Release prep (bug fixes, docs only) | `develop` | `main` + `develop` |
+        | `hotfix/*` | Emergency production fixes | `main` | `main` + `develop` |
+
+        ### Workflow
+
+        1. **Feature work:** `git checkout develop && git checkout -b feature/short-description`
+        2. Work, commit with conventional commits, push.
+        3. Open a PR from `feature/short-description` → `develop`.
+        4. **Release prep:** `git checkout develop && git checkout -b release/vX.Y.Z`
+        5. Only bug fixes and docs in release branches — no new features.
+        6. When ready: merge `release/vX.Y.Z` → `main`, tag `vX.Y.Z`, merge back → `develop`.
+        7. **Hotfix:** `git checkout main && git checkout -b hotfix/description`
+        8. Fix, merge → `main` (tag), merge → `develop`.
+
+        ### Branch naming
+
+        - `feature/add-cli`, `feature/eth-tracker`
+        - `release/v1.0.0`, `release/v1.1.0`
+        - `hotfix/fix-crash`, `hotfix/patch-auth`
 
         ## Linting & Formatting
 
@@ -607,9 +632,9 @@ def make_ci_workflow(name: str, stack: dict) -> str:
 
         on:
           push:
-            branches: [main]
+            branches: [main, develop, "feature/**", "release/**", "hotfix/**"]
           pull_request:
-            branches: [main]
+            branches: [main, develop]
 
         permissions:
           contents: read
@@ -628,6 +653,38 @@ def make_ci_workflow(name: str, stack: dict) -> str:
               - uses: gitleaks/gitleaks-action@v2
                 env:
                   GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
+    """)
+
+
+def make_cd_workflow(name: str) -> str:
+    """Generate .github/workflows/release.yml for automated GitHub Releases."""
+    _ = name  # available for future template use
+    return textwrap.dedent("""\
+        name: Release
+
+        on:
+          push:
+            tags:
+              - "v*"
+
+        permissions:
+          contents: write
+
+        jobs:
+          release:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@v4
+                with:
+                  fetch-depth: 0
+
+              - name: Create GitHub Release
+                env:
+                  GH_TOKEN: ${{ github.token }}
+                run: |
+                  gh release create "${{ github.ref_name }}" \\
+                    --title "${{ github.ref_name }}" \\
+                    --generate-notes
     """)
 
 
@@ -1410,6 +1467,7 @@ def scaffold_project(
         ),
         project_dir / ".pre-commit-config.yaml": make_precommit_config(),
         project_dir / ".github" / "workflows" / "ci.yml": make_ci_workflow(name, stack),
+        project_dir / ".github" / "workflows" / "release.yml": make_cd_workflow(name),
         project_dir / ".devcontainer" / "Dockerfile": make_dockerfile(stack),
         project_dir / ".devcontainer" / "devcontainer.json": make_devcontainer_json(
             name,
@@ -1854,6 +1912,10 @@ def validate_project(project_dir: Path) -> bool:
     check(
         "CI workflow exists",
         (project_dir / ".github" / "workflows" / "ci.yml").exists(),
+    )
+    check(
+        "Release workflow exists",
+        (project_dir / ".github" / "workflows" / "release.yml").exists(),
     )
 
     compose = project_dir / "docker-compose.yml"

@@ -44,7 +44,9 @@ jobs:
           test -f test-${{ matrix.stack }}/.devcontainer/devcontainer.json
           test -f test-${{ matrix.stack }}/.pre-commit-config.yaml
           test -f test-${{ matrix.stack }}/.github/workflows/ci.yml
+          test -f test-${{ matrix.stack }}/.github/workflows/release.yml
           test -f test-${{ matrix.stack }}/.gitignore
+          grep -q "Gitflow" test-${{ matrix.stack }}/CLAUDE.md
 
   test-ai-attach:
     runs-on: ubuntu-latest
