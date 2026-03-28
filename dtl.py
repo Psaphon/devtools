@@ -24,6 +24,10 @@ Usage:
     dtl ai run --project ~/myproject --prompt "implement the CLI"
     dtl ai config-notify --project ~/myproject --telegram-token TOKEN --telegram-chat-id ID
     dtl ai list-providers
+
+    dtl workflow list --plan docs/DEVPLAN.md
+    dtl workflow next --plan docs/DEVPLAN.md
+    dtl workflow next --plan docs/DEVPLAN.md --project ~/myproject
 """
 
 from __future__ import annotations
@@ -31,11 +35,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Stack definitions
@@ -569,13 +574,14 @@ def make_claude_md(
 
         ## Linting & Formatting
 
-        Run before every commit:
+        **CRITICAL: You MUST run linting and formatting before EVERY commit.** No exceptions.
 
         ```bash
         {stack["claude_linter"]}
         ```
 
-        If linting fails, fix the issues before committing.
+        If linting fails, fix ALL issues before committing. Never use `--no-verify` to skip checks.
+        A commit that fails lint is a broken commit — treat it as a build failure.
 
         ## Docker
 
@@ -987,6 +993,8 @@ def make_ai_claude_dockerfile() -> str:
                 git \\
                 ripgrep \\
                 python3 \\
+                python3-pip \\
+                python3-venv \\
                 ca-certificates \\
                 curl \\
             && rm -rf /var/lib/apt/lists/*
@@ -994,9 +1002,14 @@ def make_ai_claude_dockerfile() -> str:
         # Install Claude Code
         RUN npm install -g @anthropic-ai/claude-code
 
-        # Create non-root user
-        RUN useradd -m -s /bin/bash dev
-        USER dev
+        # Set up home directory for host-mapped user (UID 1000)
+        RUN mkdir -p /home/claude/.claude && chown -R 1000:1000 /home/claude
+
+        # Copy settings into Claude Code's config directory
+        COPY settings.json /home/claude/.claude/settings.json
+        RUN chown 1000:1000 /home/claude/.claude/settings.json
+
+        ENV HOME=/home/claude
         WORKDIR /workspace
 
         ENTRYPOINT ["claude"]
@@ -1020,8 +1033,11 @@ def make_ai_claude_settings(
         "permissions": {
             "allow": [
                 "Read",
+                "Write",
+                "Edit",
                 "Glob",
                 "Grep",
+                "Bash(*)",
             ],
             "deny": [],
         },
@@ -1054,8 +1070,10 @@ def make_ai_docker_compose(
             [
                 "  claude-code:",
                 "    build: ./claude-code",
+                '    user: "${UID:-1000}:${GID:-1000}"',
                 "    volumes:",
                 "      - ../../:/workspace",
+                "      - claude-data:/home/claude",
                 "    working_dir: /workspace",
                 "    stdin_open: true",
                 "    tty: true",
@@ -1070,6 +1088,10 @@ def make_ai_docker_compose(
                 "          memory: 4G",
                 "    environment:",
                 "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
+                "      - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-Developer}",
+                "      - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
+                "      - GIT_COMMITTER_NAME=${GIT_AUTHOR_NAME:-Developer}",
+                "      - GIT_COMMITTER_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
             ]
         )
         if model_env:
@@ -1136,6 +1158,8 @@ def make_ai_docker_compose(
     # Volumes
     vol_lines: List[str] = []
     compose_text = "\n".join(lines)
+    if "claude-data:" in compose_text:
+        vol_lines.append("  claude-data:")
     if "openclaw-config:" in compose_text:
         vol_lines.append("  openclaw-config:")
     if "ollama-models:" in compose_text:
@@ -1722,7 +1746,7 @@ def ai_status(project_dir: Path) -> None:
         _run_cmd(["bash", str(vm_script), "status"])
 
 
-def ai_run(project_dir: Path, prompt: str) -> None:
+def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> None:
     """Run an autonomous AI session with a prompt."""
     config = _load_ai_config(project_dir)
     provider = config["provider"]
@@ -1746,26 +1770,32 @@ def ai_run(project_dir: Path, prompt: str) -> None:
     if mode == "docker":
         if provider == "claude":
             compose_file = ai_dir / "docker-compose.yml"
-            print("[dtl ai run] Running Claude Code autonomously...")
+            if continue_session:
+                print("[dtl ai run] Continuing previous session...")
+            else:
+                print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
             print()
 
             # Run Claude Code in print mode (non-interactive)
+            cmd = [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "run",
+                "--rm",
+                "claude-code",
+                "--print",
+            ]
+            if continue_session:
+                cmd.append("--continue")
+            cmd.extend(["-p", prompt])
+
             try:
                 result = subprocess.run(
-                    [
-                        "docker",
-                        "compose",
-                        "-f",
-                        str(compose_file),
-                        "run",
-                        "--rm",
-                        "claude-code",
-                        "claude",
-                        "--print",
-                        "-p",
-                        prompt,
-                    ],
+                    cmd,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     env={**os.environ},
@@ -2400,7 +2430,9 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     """Handle 'dtl ai run'."""
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
-    ai_run(project_dir, prompt)
+    ai_run(
+        project_dir, prompt, continue_session=getattr(args, "continue_session", False)
+    )
 
 
 def cmd_ai_config_notify(args: argparse.Namespace) -> None:
@@ -2454,6 +2486,205 @@ def cmd_ai_list_providers(args: argparse.Namespace) -> None:
     print()
     print("  vm        Full QEMU/KVM micro-VM isolation")
     print("            Best for: untrusted code, security research, production")
+
+
+# ---------------------------------------------------------------------------
+# Workflow: DEVPLAN parsing and branch management
+# ---------------------------------------------------------------------------
+
+
+def _parse_devplan(text: str) -> tuple[str, list[dict]]:
+    """Parse a DEVPLAN.md into (constraints_block, list_of_feature_dicts).
+
+    Each feature dict has keys:
+        name        str    e.g. "workflow-command"
+        branch      str    e.g. "feature/workflow-command"
+        depends_on  str
+        status      str    e.g. "Not Started"
+        block       str    raw markdown of the full feature section
+    """
+    # Extract the Constraints section (everything between ## Constraints and the next ##)
+    constraints_match = re.search(
+        r"^## Constraints\s*\n(.*?)(?=^##\s|\Z)", text, re.MULTILINE | re.DOTALL
+    )
+    constraints_block = constraints_match.group(0).strip() if constraints_match else ""
+
+    features: list[dict] = []
+
+    # Split on ## Feature: headings; keep the heading with the block
+    # Pattern: ## Feature: <name> up to next ## heading or end of string
+    feature_pattern = re.compile(
+        r"^## Feature:\s*(.+?)\s*\n(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL
+    )
+    for m in feature_pattern.finditer(text):
+        heading_name = m.group(1).strip()
+        body = m.group(2)
+        full_block = f"## Feature: {heading_name}\n{body}".rstrip()
+
+        # Extract **Branch:**
+        branch_match = re.search(r"\*\*Branch:\*\*\s*`?([^`\n]+)`?", body)
+        branch = (
+            branch_match.group(1).strip() if branch_match else f"feature/{heading_name}"
+        )
+
+        # Extract **Depends on:**
+        depends_match = re.search(r"\*\*Depends on:\*\*\s*(.+)", body)
+        depends_on = depends_match.group(1).strip() if depends_match else "none"
+
+        # Extract **Status:**
+        status_match = re.search(r"\*\*Status:\*\*\s*(.+)", body)
+        status = status_match.group(1).strip() if status_match else "Unknown"
+
+        features.append(
+            {
+                "name": heading_name,
+                "branch": branch,
+                "depends_on": depends_on,
+                "status": status,
+                "block": full_block,
+            }
+        )
+
+    return constraints_block, features
+
+
+def _update_feature_status(plan_path: Path, feature_name: str, new_status: str) -> None:
+    """Rewrite the **Status:** line for a specific feature block in the plan file."""
+    text = plan_path.read_text()
+
+    # Find the feature block and replace its Status line
+    # We replace the first **Status:** occurrence inside the right feature block
+    feature_header = re.escape(f"## Feature: {feature_name}")
+    pattern = re.compile(
+        rf"(^{feature_header}\s*\n.*?\*\*Status:\*\*\s*)(\S[^\n]*)",
+        re.MULTILINE | re.DOTALL,
+    )
+
+    def replacer(m: re.Match) -> str:
+        return m.group(1) + new_status
+
+    new_text, count = pattern.subn(replacer, text, count=1)
+    if count == 0:
+        raise ValueError(f"Could not find Status field for feature '{feature_name}'")
+    plan_path.write_text(new_text)
+
+
+def _git_is_dirty(project_dir: Path) -> bool:
+    """Return True if the working tree has uncommitted changes."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    return bool(result.stdout.strip())
+
+
+def _git_current_branch(project_dir: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_create_branch(project_dir: Path, branch: str, base: str = "develop") -> None:
+    """Create and checkout a new branch off base."""
+    subprocess.run(["git", "checkout", base], cwd=project_dir, check=True)
+    subprocess.run(["git", "checkout", "-b", branch], cwd=project_dir, check=True)
+
+
+def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
+    """Build the prompt string passed to the AI for a feature."""
+    parts = []
+    if constraints_block:
+        parts.append(constraints_block)
+        parts.append("")
+    parts.append(feature["block"])
+    parts.append("")
+    parts.append(
+        "Implement this feature exactly as specified above. "
+        "Follow all constraints. Commit when done."
+    )
+    return "\n".join(parts)
+
+
+def cmd_workflow_list(args: argparse.Namespace) -> None:
+    """Handle 'dtl workflow list'."""
+    plan_path = Path(args.plan).resolve()
+    if not plan_path.exists():
+        print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+        sys.exit(1)
+
+    _, features = _parse_devplan(plan_path.read_text())
+
+    if not features:
+        print("No features found in plan.")
+        return
+
+    name_width = max(len(f["name"]) for f in features)
+    print(f"\n{'Feature':<{name_width}}  {'Status':<14}  Branch")
+    print("-" * (name_width + 36))
+    for f in features:
+        print(f"{f['name']:<{name_width}}  {f['status']:<14}  {f['branch']}")
+    print()
+
+
+def cmd_workflow_next(args: argparse.Namespace) -> None:
+    """Handle 'dtl workflow next'."""
+    plan_path = Path(args.plan).resolve()
+    project_dir = (
+        Path(args.project).resolve()
+        if hasattr(args, "project") and args.project
+        else plan_path.parent.parent
+    )
+
+    if not plan_path.exists():
+        print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+        sys.exit(1)
+
+    text = plan_path.read_text()
+    constraints_block, features = _parse_devplan(text)
+
+    if not features:
+        print("No features found in plan.", file=sys.stderr)
+        sys.exit(1)
+
+    # Find next unstarted feature
+    next_feature: Optional[dict] = None
+    for f in features:
+        if f["status"] == "Not Started":
+            next_feature = f
+            break
+
+    if next_feature is None:
+        print("All features are done (no 'Not Started' features remaining).")
+        return
+
+    # Guard: dirty working tree
+    if _git_is_dirty(project_dir):
+        print(
+            "Error: working tree is dirty. Commit or stash changes before starting a feature.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    branch = next_feature["branch"]
+    print(f"[dtl workflow] Next feature: {next_feature['name']}")
+    print(f"[dtl workflow] Creating branch {branch!r} off develop...")
+
+    _git_create_branch(project_dir, branch, base="develop")
+
+    print(f"[dtl workflow] Updating status to 'In Progress' in {plan_path.name}...")
+    _update_feature_status(plan_path, next_feature["name"], "In Progress")
+
+    prompt = _build_ai_prompt(constraints_block, next_feature)
+
+    print("[dtl workflow] Launching AI with feature spec...")
+    print()
+    ai_run(project_dir, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -2652,6 +2883,12 @@ def main() -> None:
         required=True,
         help="The prompt/task for the AI to execute",
     )
+    ai_run_parser.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Continue the previous conversation instead of starting fresh",
+    )
     ai_run_parser.set_defaults(func=cmd_ai_run)
 
     # -- ai config-notify --
@@ -2688,6 +2925,42 @@ def main() -> None:
     )
     ai_list_parser.set_defaults(func=cmd_ai_list_providers)
 
+    # -- workflow (subcommand group) --
+    workflow_parser = subparsers.add_parser(
+        "workflow",
+        help="Manage gitflow feature workflow from a DEVPLAN.md",
+    )
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command")
+
+    # -- workflow list --
+    wf_list_parser = workflow_subparsers.add_parser(
+        "list",
+        help="Print all features with their status",
+    )
+    wf_list_parser.add_argument(
+        "--plan",
+        required=True,
+        help="Path to DEVPLAN.md (e.g. docs/DEVPLAN.md)",
+    )
+    wf_list_parser.set_defaults(func=cmd_workflow_list)
+
+    # -- workflow next --
+    wf_next_parser = workflow_subparsers.add_parser(
+        "next",
+        help="Start the next Not Started feature: create branch, update status, launch AI",
+    )
+    wf_next_parser.add_argument(
+        "--plan",
+        required=True,
+        help="Path to DEVPLAN.md (e.g. docs/DEVPLAN.md)",
+    )
+    wf_next_parser.add_argument(
+        "--project",
+        default=".",
+        help="Path to the project/git root (default: current directory)",
+    )
+    wf_next_parser.set_defaults(func=cmd_workflow_next)
+
     # -- Parse and dispatch --
     args = parser.parse_args()
     if not args.command:
@@ -2698,6 +2971,12 @@ def main() -> None:
     if args.command == "ai":
         if not getattr(args, "ai_command", None):
             ai_parser.print_help()
+            sys.exit(1)
+
+    # Handle 'workflow' subcommand group
+    if args.command == "workflow":
+        if not getattr(args, "workflow_command", None):
+            workflow_parser.print_help()
             sys.exit(1)
 
     args.func(args)
