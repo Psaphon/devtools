@@ -2429,7 +2429,9 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     """Handle 'dtl ai run'."""
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
-    ai_run(project_dir, prompt, continue_session=getattr(args, "continue_session", False))
+    ai_run(
+        project_dir, prompt, continue_session=getattr(args, "continue_session", False)
+    )
 
 
 def cmd_ai_config_notify(args: argparse.Namespace) -> None:
