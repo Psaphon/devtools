@@ -62,6 +62,8 @@ For each feature, fill in:
 - **State decisions, don't leave them open.** "Use SQLite" not "choose a database." "Parse with regex" not "find a way to parse." The AI will make a choice if you don't — and it might not be the one you want.
 - **Acceptance criteria are tests.** Write them as things you can verify: "returns empty list when API key not set" not "handles missing keys gracefully."
 - **Keep features small.** If a feature has more than 8 files in the table, consider splitting it.
+- **Always end acceptance criteria with "All tests pass" and "Lint clean."** This reminds the AI to run checks before committing. The only exception is `Requires: human` features where no code is written.
+- **Human-only features still need structure.** Use Key Decisions to document *why* a certain approach was chosen. Add a note in Notes that no files are created. Skip the Files table.
 - **Always end with a docs/readme feature.** The AI writes better READMEs when all the code exists.
 
 ### Minimal Feature Block (Phone-Friendly)
