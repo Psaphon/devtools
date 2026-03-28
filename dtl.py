@@ -1036,12 +1036,21 @@ def make_ai_claude_settings(
     settings: dict = {
         "permissions": {
             "allow": [
+                "Bash(*)",
                 "Read",
                 "Write",
                 "Edit",
                 "Glob",
                 "Grep",
-                "Bash(*)",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "Agent",
+                "TaskCreate",
+                "TaskGet",
+                "TaskList",
+                "TaskUpdate",
+                "TodoWrite",
             ],
             "deny": [],
         },
