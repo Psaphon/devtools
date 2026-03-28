@@ -129,3 +129,18 @@ jobs:
 
       - name: dtl ai list-providers
         run: python dtl.py ai list-providers
+
+      - name: dtl workflow --help
+        run: python dtl.py workflow --help
+
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run unit tests
+        run: pytest tests/ -v

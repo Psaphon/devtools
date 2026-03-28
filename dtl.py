@@ -28,17 +28,23 @@ Usage:
     dtl workflow list --plan docs/DEVPLAN.md
     dtl workflow next --plan docs/DEVPLAN.md
     dtl workflow next --plan docs/DEVPLAN.md --project ~/myproject
+    dtl workflow finish --plan docs/DEVPLAN.md --watch
+    dtl workflow run --projects ~/proj1,~/proj2
+    dtl workflow run --projects ~/proj1 --schedule 02:00
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -2611,6 +2617,595 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
     return "\n".join(parts)
 
 
+def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
+    """Set up a logger that writes to both stderr and a log file."""
+    logger = logging.getLogger("dtl.workflow")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+
+    fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(fmt)
+    logger.addHandler(stderr_handler)
+
+    if log_path is None:
+        log_dir = Path.home() / ".local" / "share" / "dtl"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "workflow.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(str(log_path))
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
+    """Run lint and tests in the project. Returns (passed, output)."""
+    # Detect stack from files present
+    lint_cmd = None
+    test_cmd = None
+    if (project_dir / "pyproject.toml").exists() or (project_dir / "setup.py").exists():
+        lint_cmd = ["ruff", "check", "."]
+        test_cmd = ["pytest", "--tb=short"]
+    elif (project_dir / "package.json").exists():
+        lint_cmd = ["npm", "run", "lint"]
+        test_cmd = ["npm", "test"]
+    elif (project_dir / "go.mod").exists():
+        lint_cmd = ["golangci-lint", "run"]
+        test_cmd = ["go", "test", "./..."]
+    elif (project_dir / "Cargo.toml").exists():
+        lint_cmd = ["cargo", "clippy"]
+        test_cmd = ["cargo", "test"]
+
+    output_parts = []
+
+    if lint_cmd:
+        result = subprocess.run(
+            lint_cmd, cwd=project_dir, capture_output=True, text=True
+        )
+        output_parts.append(
+            f"=== lint ({' '.join(lint_cmd)}) ===\n{result.stdout}{result.stderr}"
+        )
+        if result.returncode != 0:
+            return False, "\n".join(output_parts)
+
+    if test_cmd:
+        result = subprocess.run(
+            test_cmd, cwd=project_dir, capture_output=True, text=True
+        )
+        output_parts.append(
+            f"=== test ({' '.join(test_cmd)}) ===\n{result.stdout}{result.stderr}"
+        )
+        if result.returncode != 0:
+            return False, "\n".join(output_parts)
+
+    return True, "\n".join(output_parts)
+
+
+def _git_push_branch(project_dir: Path, branch: str) -> bool:
+    """Push the current branch to origin. Returns True on success."""
+    result = subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _gh_create_pr(
+    project_dir: Path, branch: str, title: str, body: str, base: str = "develop"
+) -> Optional[str]:
+    """Create a PR using gh CLI. Returns the PR URL or None on failure."""
+    result = subprocess.run(
+        ["gh", "pr", "create", "--title", title, "--body", body, "--base", base],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    # PR may already exist
+    if "already exists" in result.stderr:
+        view = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "url", "-q", ".url"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        if view.returncode == 0:
+            return view.stdout.strip()
+    return None
+
+
+def _gh_pr_state(project_dir: Path, branch: str) -> Optional[str]:
+    """Check PR state via gh CLI. Returns 'MERGED', 'OPEN', 'CLOSED', or None."""
+    result = subprocess.run(
+        ["gh", "pr", "view", branch, "--json", "state", "-q", ".state"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return None
+
+
+def _detect_auth_failure(output: str) -> bool:
+    """Check if AI output indicates an authentication failure."""
+    auth_patterns = [
+        "authentication failed",
+        "auth error",
+        "invalid api key",
+        "unauthorized",
+        "expired token",
+        "please run claude login",
+        "not authenticated",
+    ]
+    lower = output.lower()
+    return any(p in lower for p in auth_patterns)
+
+
+def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict]:
+    """Find the feature dict matching the given branch name."""
+    for f in features:
+        if f["branch"] == branch:
+            return f
+    return None
+
+
+def cmd_workflow_finish(args: argparse.Namespace) -> None:
+    """Handle 'dtl workflow finish'."""
+    plan_path = Path(args.plan).resolve()
+    project_dir = Path(args.project).resolve()
+    watch = getattr(args, "watch", False)
+    log = _setup_workflow_logger()
+
+    if not plan_path.exists():
+        print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+        sys.exit(1)
+
+    text = plan_path.read_text()
+    _, features = _parse_devplan(text)
+    branch = _git_current_branch(project_dir)
+
+    feature = _find_feature_for_branch(features, branch)
+    if feature is None:
+        print(
+            f"Error: current branch '{branch}' does not match any feature in the plan.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    log.info("Finishing feature: %s (branch: %s)", feature["name"], branch)
+
+    # Step 1: lint + test
+    log.info("Running lint and tests...")
+    passed, test_output = _run_lint_and_tests(project_dir)
+    if not passed:
+        log.info("Tests or lint FAILED — aborting push.")
+        print(test_output, file=sys.stderr)
+        _update_feature_status(plan_path, feature["name"], "Failed")
+        sys.exit(1)
+    log.info("Lint and tests passed.")
+
+    # Step 2: commit any uncommitted work (the AI may have left staged changes)
+    if _git_is_dirty(project_dir):
+        log.info("Committing uncommitted changes...")
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=project_dir,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "commit",
+                "-m",
+                f"feat: {feature['name']} — automated commit by dtl workflow finish",
+            ],
+            cwd=project_dir,
+            check=True,
+            capture_output=True,
+        )
+
+    # Step 3: push
+    log.info("Pushing %s to origin...", branch)
+    if not _git_push_branch(project_dir, branch):
+        log.info("Push failed.")
+        sys.exit(1)
+
+    # Step 4: create PR
+    pr_title = f"feat: {feature['name']}"
+    goal_match = re.search(r"### Goal\s*\n(.*?)(?=###|\Z)", feature["block"], re.DOTALL)
+    goal_text = goal_match.group(1).strip() if goal_match else feature["name"]
+    pr_body = (
+        f"## Summary\n\n{goal_text}\n\n"
+        f"## Feature spec\n\nFrom `{plan_path.name}`: **{feature['name']}**\n\n"
+        f"---\n*Automated by `dtl workflow finish`*"
+    )
+
+    log.info("Creating PR...")
+    pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
+    if pr_url:
+        log.info("PR created: %s", pr_url)
+        print(f"\nPR: {pr_url}")
+    else:
+        log.info("Failed to create PR — check gh auth status.")
+        sys.exit(1)
+
+    # Step 5: update status
+    _update_feature_status(plan_path, feature["name"], "PR Open")
+    subprocess.run(
+        ["git", "add", str(plan_path)],
+        cwd=project_dir,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", f"chore: update {feature['name']} status to PR Open"],
+        cwd=project_dir,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push"],
+        cwd=project_dir,
+        capture_output=True,
+    )
+
+    if not watch:
+        return
+
+    # Step 6: poll for merge
+    log.info("Watching for merge (polling every 60s)...")
+    while True:
+        time.sleep(60)
+        state = _gh_pr_state(project_dir, branch)
+        if state == "MERGED":
+            log.info("PR merged! Updating status.")
+            # Checkout develop and pull to get merge
+            subprocess.run(
+                ["git", "checkout", "develop"], cwd=project_dir, capture_output=True
+            )
+            subprocess.run(
+                ["git", "pull", "origin", "develop"],
+                cwd=project_dir,
+                capture_output=True,
+            )
+            _update_feature_status(plan_path, feature["name"], "Merged")
+            subprocess.run(
+                ["git", "add", str(plan_path)],
+                cwd=project_dir,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    f"chore: update {feature['name']} status to Merged",
+                ],
+                cwd=project_dir,
+                capture_output=True,
+            )
+            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True)
+            break
+        elif state == "CLOSED":
+            log.info("PR was closed without merging. Stopping.")
+            _update_feature_status(plan_path, feature["name"], "Closed")
+            sys.exit(1)
+        elif state is None:
+            log.info("Could not check PR state — will retry.")
+
+
+def cmd_workflow_run(args: argparse.Namespace) -> None:
+    """Handle 'dtl workflow run' — the full autonomous loop."""
+    projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
+    schedule_time = getattr(args, "schedule", None)
+    max_failures = getattr(args, "max_failures", 3)
+    log = _setup_workflow_logger()
+
+    # Wait for scheduled time if specified
+    if schedule_time:
+        now = datetime.datetime.now()
+        hour, minute = map(int, schedule_time.split(":"))
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        wait_secs = (target - now).total_seconds()
+        log.info(
+            "Scheduled start at %s (waiting %.0f minutes)...",
+            schedule_time,
+            wait_secs / 60,
+        )
+        time.sleep(wait_secs)
+
+    log.info("=== dtl workflow run starting ===")
+    log.info("Projects: %s", ", ".join(str(p) for p in projects))
+
+    consecutive_failures: dict[str, int] = {}
+
+    while True:
+        any_work_done = False
+
+        for project_dir in projects:
+            plan_path = project_dir / "docs" / "DEVPLAN.md"
+            if not plan_path.exists():
+                log.info("[%s] No DEVPLAN.md found, skipping.", project_dir.name)
+                continue
+
+            text = plan_path.read_text()
+            _, features = _parse_devplan(text)
+
+            # Find next unstarted feature
+            next_feature = None
+            for f in features:
+                if f["status"] == "Not Started":
+                    fail_key = f"{project_dir.name}:{f['name']}"
+                    if consecutive_failures.get(fail_key, 0) >= max_failures:
+                        log.info(
+                            "[%s] Skipping %s (failed %d times).",
+                            project_dir.name,
+                            f["name"],
+                            max_failures,
+                        )
+                        _update_feature_status(plan_path, f["name"], "Failed")
+                        continue
+                    next_feature = f
+                    break
+
+            if next_feature is None:
+                log.info("[%s] No unstarted features remaining.", project_dir.name)
+                continue
+
+            any_work_done = True
+            fail_key = f"{project_dir.name}:{next_feature['name']}"
+            branch = next_feature["branch"]
+            log.info(
+                "[%s] Starting feature: %s", project_dir.name, next_feature["name"]
+            )
+
+            # Ensure clean tree and on develop
+            if _git_is_dirty(project_dir):
+                log.info("[%s] Working tree is dirty — skipping.", project_dir.name)
+                continue
+
+            subprocess.run(
+                ["git", "checkout", "develop"],
+                cwd=project_dir,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "pull", "origin", "develop"],
+                cwd=project_dir,
+                capture_output=True,
+            )
+
+            # Create branch
+            try:
+                _git_create_branch(project_dir, branch, base="develop")
+            except subprocess.CalledProcessError:
+                log.info("[%s] Failed to create branch %s.", project_dir.name, branch)
+                consecutive_failures[fail_key] = (
+                    consecutive_failures.get(fail_key, 0) + 1
+                )
+                continue
+
+            # Update status
+            _update_feature_status(plan_path, next_feature["name"], "In Progress")
+
+            # Build prompt and run AI
+            constraints_block, _ = _parse_devplan(plan_path.read_text())
+            prompt = _build_ai_prompt(constraints_block, next_feature)
+
+            log.info(
+                "[%s] Launching AI for %s...", project_dir.name, next_feature["name"]
+            )
+
+            ai_dir = project_dir / ".ai"
+            ai_config_path = ai_dir / "config.json"
+            ai_exit_code = 1
+            ai_output = ""
+
+            if ai_config_path.exists():
+                # Use dtl's ai_run mechanism via subprocess to isolate failures
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        __file__,
+                        "ai",
+                        "run",
+                        "--project",
+                        str(project_dir),
+                        "--prompt",
+                        prompt,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ},
+                )
+                ai_exit_code = result.returncode
+                ai_output = result.stdout + result.stderr
+            else:
+                log.info(
+                    "[%s] No .ai/config.json — running claude directly.",
+                    project_dir.name,
+                )
+                result = subprocess.run(
+                    ["claude", "--print", "-p", prompt],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ},
+                )
+                ai_exit_code = result.returncode
+                ai_output = result.stdout + result.stderr
+
+            # Check for auth failure
+            if _detect_auth_failure(ai_output):
+                log.info(
+                    "[%s] AUTH FAILURE detected — pausing workflow. "
+                    "Run 'claude login' to re-authenticate.",
+                    project_dir.name,
+                )
+                _update_feature_status(plan_path, next_feature["name"], "Not Started")
+                sys.exit(2)
+
+            if ai_exit_code != 0:
+                log.info(
+                    "[%s] AI exited with code %d for %s.",
+                    project_dir.name,
+                    ai_exit_code,
+                    next_feature["name"],
+                )
+                consecutive_failures[fail_key] = (
+                    consecutive_failures.get(fail_key, 0) + 1
+                )
+                _update_feature_status(plan_path, next_feature["name"], "Not Started")
+                continue
+
+            # AI succeeded — now finish: lint, test, push, PR
+            log.info("[%s] AI done. Running finish...", project_dir.name)
+
+            passed, test_output = _run_lint_and_tests(project_dir)
+            if not passed:
+                log.info(
+                    "[%s] Lint/tests failed after AI. Output:\n%s",
+                    project_dir.name,
+                    test_output,
+                )
+                consecutive_failures[fail_key] = (
+                    consecutive_failures.get(fail_key, 0) + 1
+                )
+                _update_feature_status(plan_path, next_feature["name"], "Not Started")
+                # Return to develop
+                subprocess.run(
+                    ["git", "checkout", "develop"],
+                    cwd=project_dir,
+                    capture_output=True,
+                )
+                continue
+
+            # Commit any remaining changes
+            if _git_is_dirty(project_dir):
+                subprocess.run(
+                    ["git", "add", "-A"], cwd=project_dir, capture_output=True
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "commit",
+                        "-m",
+                        f"feat: {next_feature['name']} — automated commit by dtl workflow run",
+                    ],
+                    cwd=project_dir,
+                    capture_output=True,
+                )
+
+            # Push
+            if not _git_push_branch(project_dir, branch):
+                log.info("[%s] Push failed for %s.", project_dir.name, branch)
+                consecutive_failures[fail_key] = (
+                    consecutive_failures.get(fail_key, 0) + 1
+                )
+                continue
+
+            # Create PR
+            pr_title = f"feat: {next_feature['name']}"
+            goal_match = re.search(
+                r"### Goal\s*\n(.*?)(?=###|\Z)", next_feature["block"], re.DOTALL
+            )
+            goal_text = (
+                goal_match.group(1).strip() if goal_match else next_feature["name"]
+            )
+            pr_body = (
+                f"## Summary\n\n{goal_text}\n\n---\n*Automated by `dtl workflow run`*"
+            )
+            pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
+            if pr_url:
+                log.info("[%s] PR created: %s", project_dir.name, pr_url)
+            else:
+                log.info("[%s] Failed to create PR.", project_dir.name)
+                continue
+
+            _update_feature_status(plan_path, next_feature["name"], "PR Open")
+            subprocess.run(
+                ["git", "add", str(plan_path)],
+                cwd=project_dir,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    f"chore: update {next_feature['name']} status to PR Open",
+                ],
+                cwd=project_dir,
+                capture_output=True,
+            )
+            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True)
+
+            # Poll for merge
+            log.info("[%s] Waiting for PR merge...", project_dir.name)
+            while True:
+                time.sleep(60)
+                state = _gh_pr_state(project_dir, branch)
+                if state == "MERGED":
+                    log.info(
+                        "[%s] PR merged for %s!", project_dir.name, next_feature["name"]
+                    )
+                    subprocess.run(
+                        ["git", "checkout", "develop"],
+                        cwd=project_dir,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "pull", "origin", "develop"],
+                        cwd=project_dir,
+                        capture_output=True,
+                    )
+                    _update_feature_status(plan_path, next_feature["name"], "Merged")
+                    subprocess.run(
+                        ["git", "add", str(plan_path)],
+                        cwd=project_dir,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "commit",
+                            "-m",
+                            f"chore: update {next_feature['name']} status to Merged",
+                        ],
+                        cwd=project_dir,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "push"],
+                        cwd=project_dir,
+                        capture_output=True,
+                    )
+                    # Reset failure counter on success
+                    consecutive_failures[fail_key] = 0
+                    break
+                elif state == "CLOSED":
+                    log.info(
+                        "[%s] PR closed without merge for %s.",
+                        project_dir.name,
+                        next_feature["name"],
+                    )
+                    _update_feature_status(plan_path, next_feature["name"], "Closed")
+                    break
+
+        if not any_work_done:
+            log.info("=== All projects complete. Exiting. ===")
+            break
+
+
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow list'."""
     plan_path = Path(args.plan).resolve()
@@ -2960,6 +3555,51 @@ def main() -> None:
         help="Path to the project/git root (default: current directory)",
     )
     wf_next_parser.set_defaults(func=cmd_workflow_next)
+
+    # -- workflow finish --
+    wf_finish_parser = workflow_subparsers.add_parser(
+        "finish",
+        help="Lint, test, push, create PR for the current feature branch",
+    )
+    wf_finish_parser.add_argument(
+        "--plan",
+        required=True,
+        help="Path to DEVPLAN.md (e.g. docs/DEVPLAN.md)",
+    )
+    wf_finish_parser.add_argument(
+        "--project",
+        default=".",
+        help="Path to the project/git root (default: current directory)",
+    )
+    wf_finish_parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Poll for PR merge and auto-update status",
+    )
+    wf_finish_parser.set_defaults(func=cmd_workflow_finish)
+
+    # -- workflow run --
+    wf_run_parser = workflow_subparsers.add_parser(
+        "run",
+        help="Full autonomous loop: branch -> AI -> test -> PR -> wait for merge -> repeat",
+    )
+    wf_run_parser.add_argument(
+        "--projects",
+        required=True,
+        help="Comma-separated project directories (e.g. ~/proj1,~/proj2)",
+    )
+    wf_run_parser.add_argument(
+        "--schedule",
+        default=None,
+        help="Defer start until HH:MM (e.g. 02:00 for off-peak)",
+    )
+    wf_run_parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=3,
+        help="Skip a feature after this many consecutive failures (default: 3)",
+    )
+    wf_run_parser.set_defaults(func=cmd_workflow_run)
 
     # -- Parse and dispatch --
     args = parser.parse_args()

@@ -1,0 +1,16 @@
+[Unit]
+Description=dtl autonomous development loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/devtools/dtl workflow run --projects %h/Projects
+EnvironmentFile=%h/.config/dtl/env
+Restart=on-failure
+RestartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
