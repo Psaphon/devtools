@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 *.~lock.*
 .ai/
+.env*
+*.pem
+*.key
