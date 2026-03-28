@@ -22,7 +22,7 @@ dtl is a single-file Python scaffolder for containerized dev environments with A
 
 **Branch:** `feature/workflow-command`
 **Depends on:** none
-**Status:** In Progress
+**Status:** PR Open
 
 ### Goal
 

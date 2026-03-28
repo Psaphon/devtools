@@ -992,6 +992,8 @@ def make_ai_claude_dockerfile() -> str:
                 git \\
                 ripgrep \\
                 python3 \\
+                python3-pip \\
+                python3-venv \\
                 ca-certificates \\
                 curl \\
             && rm -rf /var/lib/apt/lists/*
@@ -999,9 +1001,14 @@ def make_ai_claude_dockerfile() -> str:
         # Install Claude Code
         RUN npm install -g @anthropic-ai/claude-code
 
-        # Create non-root user
-        RUN useradd -m -s /bin/bash dev
-        USER dev
+        # Set up home directory for host-mapped user (UID 1000)
+        RUN mkdir -p /home/claude/.claude && chown -R 1000:1000 /home/claude
+
+        # Copy settings into Claude Code's config directory
+        COPY settings.json /home/claude/.claude/settings.json
+        RUN chown 1000:1000 /home/claude/.claude/settings.json
+
+        ENV HOME=/home/claude
         WORKDIR /workspace
 
         ENTRYPOINT ["claude"]
@@ -1025,8 +1032,11 @@ def make_ai_claude_settings(
         "permissions": {
             "allow": [
                 "Read",
+                "Write",
+                "Edit",
                 "Glob",
                 "Grep",
+                "Bash(*)",
             ],
             "deny": [],
         },
@@ -1059,8 +1069,10 @@ def make_ai_docker_compose(
             [
                 "  claude-code:",
                 "    build: ./claude-code",
+                '    user: "${UID:-1000}:${GID:-1000}"',
                 "    volumes:",
                 "      - ../../:/workspace",
+                "      - claude-data:/home/claude",
                 "    working_dir: /workspace",
                 "    stdin_open: true",
                 "    tty: true",
@@ -1075,6 +1087,10 @@ def make_ai_docker_compose(
                 "          memory: 4G",
                 "    environment:",
                 "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
+                "      - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-Developer}",
+                "      - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
+                "      - GIT_COMMITTER_NAME=${GIT_AUTHOR_NAME:-Developer}",
+                "      - GIT_COMMITTER_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
             ]
         )
         if model_env:
@@ -1141,6 +1157,8 @@ def make_ai_docker_compose(
     # Volumes
     vol_lines: List[str] = []
     compose_text = "\n".join(lines)
+    if "claude-data:" in compose_text:
+        vol_lines.append("  claude-data:")
     if "openclaw-config:" in compose_text:
         vol_lines.append("  openclaw-config:")
     if "ollama-models:" in compose_text:
@@ -1727,7 +1745,7 @@ def ai_status(project_dir: Path) -> None:
         _run_cmd(["bash", str(vm_script), "status"])
 
 
-def ai_run(project_dir: Path, prompt: str) -> None:
+def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> None:
     """Run an autonomous AI session with a prompt."""
     config = _load_ai_config(project_dir)
     provider = config["provider"]
@@ -1751,26 +1769,32 @@ def ai_run(project_dir: Path, prompt: str) -> None:
     if mode == "docker":
         if provider == "claude":
             compose_file = ai_dir / "docker-compose.yml"
-            print("[dtl ai run] Running Claude Code autonomously...")
+            if continue_session:
+                print("[dtl ai run] Continuing previous session...")
+            else:
+                print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
             print()
 
             # Run Claude Code in print mode (non-interactive)
+            cmd = [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "run",
+                "--rm",
+                "claude-code",
+                "--print",
+            ]
+            if continue_session:
+                cmd.append("--continue")
+            cmd.extend(["-p", prompt])
+
             try:
                 result = subprocess.run(
-                    [
-                        "docker",
-                        "compose",
-                        "-f",
-                        str(compose_file),
-                        "run",
-                        "--rm",
-                        "claude-code",
-                        "claude",
-                        "--print",
-                        "-p",
-                        prompt,
-                    ],
+                    cmd,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     env={**os.environ},
@@ -2405,7 +2429,7 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     """Handle 'dtl ai run'."""
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
-    ai_run(project_dir, prompt)
+    ai_run(project_dir, prompt, continue_session=getattr(args, "continue_session", False))
 
 
 def cmd_ai_config_notify(args: argparse.Namespace) -> None:
@@ -2855,6 +2879,12 @@ def main() -> None:
         "--prompt",
         required=True,
         help="The prompt/task for the AI to execute",
+    )
+    ai_run_parser.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Continue the previous conversation instead of starting fresh",
     )
     ai_run_parser.set_defaults(func=cmd_ai_run)
 
