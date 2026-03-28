@@ -2,17 +2,18 @@
 
 ## What This Is
 
-Single-file Python scaffolder for containerized dev environments with AI provider support. Installed to `/opt/devtools/` via `install.sh`. The main file is `dtl.py` (~2600 lines, stdlib-only).
+Single-file Python scaffolder for containerized dev environments with AI provider support. Installed to `/opt/devtools/` via `install.sh`. The main file is `dtl.py` (~3600 lines, stdlib-only).
 
 ## Architecture
 
 ```
 dtl.py (single file, stdlib-only Python)
-├── CLI: dtl new / dtl ai start / dtl ai run / dtl workflow next
+├── CLI: dtl new / dtl ai / dtl workflow
 ├── Templates: Dockerfile, docker-compose, CLAUDE.md, CI, pre-commit (all inline)
 ├── Stacks: python, node, go, rust
 ├── Services: postgres, redis
-├── AI providers: claude (containerized Claude Code)
+├── AI providers: claude, ollama, openclaw (containerized)
+├── Workflow: next, finish, run (autonomous gitflow loop)
 └── Security: cap_drop ALL, no-new-privileges, gitleaks, semgrep
 ```
 
@@ -42,9 +43,13 @@ dtl.py (single file, stdlib-only Python)
 | File | Purpose |
 |------|---------|
 | `dtl.py` | The tool (all code lives here) |
-| `install.sh` | Copies dtl.py to /opt/devtools/, creates symlink |
+| `install.sh` | Copies dtl.py to /opt/devtools/, symlinks env from SECRETS partition |
+| `dtl-autodev.service` | systemd user unit for boot-triggered autonomous dev |
 | `templates/DEVPLAN.md` | Reusable development plan template |
+| `templates/CLAUDE.md` | Reusable project context template |
+| `templates/PLANNING-GUIDE.md` | Instructions for creating DEVPLANs from phone |
 | `docs/DEVPLAN.md` | This project's own development plan |
+| `env.example` | Template for API keys and git identity |
 
 ## Development Plans (DEVPLAN.md)
 
@@ -96,7 +101,6 @@ A Development Plan is a planning document structured so each section maps direct
 ```
 
 3. Save as `DEVPLAN.md` in the project's `docs/` directory
-4. (Future) Send via Telegram to `dtl workflow listen` for automatic pickup
 
 ### Rules for Good Feature Specs
 
@@ -115,8 +119,13 @@ dtl workflow list --plan docs/DEVPLAN.md
 # Start the next feature (creates branch, launches AI)
 dtl workflow next --plan docs/DEVPLAN.md
 
-# After AI finishes (future)
-dtl workflow finish
+# After AI finishes: lint, test, push, create PR
+dtl workflow finish --plan docs/DEVPLAN.md
+dtl workflow finish --plan docs/DEVPLAN.md --watch  # also poll for merge
+
+# Full autonomous loop (branch -> AI -> test -> PR -> merge -> repeat)
+dtl workflow run --projects ~/Projects/myproject
+dtl workflow run --projects ~/proj1,~/proj2 --schedule 02:00
 ```
 
 ## After Editing dtl.py

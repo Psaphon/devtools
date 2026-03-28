@@ -64,7 +64,7 @@ Add a `dtl workflow next` command that reads a DEVPLAN.md, finds the next unstar
 
 **Branch:** `feature/gitflow-automation`
 **Depends on:** workflow-command
-**Status:** Not Started
+**Status:** Merged
 
 ### Goal
 
@@ -72,21 +72,21 @@ Automate the full gitflow cycle into a continuous loop: AI codes a feature → l
 
 ### Acceptance Criteria
 
-- [ ] `dtl workflow finish` runs lint + tests, commits, pushes, creates PR to develop
-- [ ] PR title and body derived from the feature spec in DEVPLAN.md
-- [ ] Commit message follows conventional commits (`feat:` prefix, spec summary)
-- [ ] If tests fail, stops and notifies user instead of pushing broken code
-- [ ] Updates feature status to "PR Open" in DEVPLAN.md
-- [ ] `dtl workflow finish --watch` polls `gh pr view --json state` every 60s for merge
-- [ ] When merge detected, updates status to "Merged" and auto-runs `dtl workflow next`
-- [ ] `dtl workflow run --plan docs/DEVPLAN.md` runs the full loop: next → AI → finish → watch → repeat
-- [ ] Loop exits cleanly when: all features done, a feature fails tests, or PR is closed (not merged)
-- [ ] `dtl workflow run` can target multiple projects via `--projects dir1,dir2,...`
-- [ ] Logs all activity to `~/.local/share/dtl/workflow.log`
-- [ ] `dtl workflow run --schedule HH:MM` defers start until the specified time (for off-peak API usage)
-- [ ] Startup integration: `dtl-autodev.service` systemd user unit runs `dtl workflow run` on boot
-- [ ] Service loads secrets from `EnvironmentFile=~/.config/dtl/env` (symlinked to SECRETS partition)
-- [ ] Tests cover the happy path, test-failure abort, merge detection, and multi-project queueing
+- [x] `dtl workflow finish` runs lint + tests, commits, pushes, creates PR to develop
+- [x] PR title and body derived from the feature spec in DEVPLAN.md
+- [x] Commit message follows conventional commits (`feat:` prefix, spec summary)
+- [x] If tests fail, stops and notifies user instead of pushing broken code
+- [x] Updates feature status to "PR Open" in DEVPLAN.md
+- [x] `dtl workflow finish --watch` polls `gh pr view --json state` every 60s for merge
+- [x] When merge detected, updates status to "Merged" and auto-runs `dtl workflow next`
+- [x] `dtl workflow run --projects dir1,dir2,...` runs the full loop: next → AI → finish → watch → repeat
+- [x] Loop exits cleanly when: all features done, a feature fails tests, or PR is closed (not merged)
+- [x] `dtl workflow run` can target multiple projects via `--projects dir1,dir2,...`
+- [x] Logs all activity to `~/.local/share/dtl/workflow.log`
+- [x] `dtl workflow run --schedule HH:MM` defers start until the specified time (for off-peak API usage)
+- [x] Startup integration: `dtl-autodev.service` systemd user unit runs `dtl workflow run` on boot
+- [x] Service loads secrets from `EnvironmentFile=~/.config/dtl/env` (symlinked to SECRETS partition)
+- [x] Tests cover the happy path, test-failure abort, merge detection, and multi-project queueing
 
 ### Files to Create or Modify
 
