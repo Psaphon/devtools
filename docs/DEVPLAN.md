@@ -119,6 +119,39 @@ Automate the full gitflow cycle into a continuous loop: AI codes a feature → l
 
 ---
 
+## Feature: smart-validation
+
+**Branch:** `feature/smart-validation`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make the `validate_project` checks smarter so they don't produce false positives. Currently the port mapping check flags any `ports:` in the project's docker-compose.yml, but service containers (e.g. Ollama, Postgres) legitimately need host ports.
+
+### Acceptance Criteria
+
+- [ ] Port mapping check only flags the AI container (`claude-code`, `openclaw-gateway`), not service containers
+- [ ] Check parses docker-compose.yml per-service instead of searching the whole file for `ports:`
+- [ ] No false positives on projects with Ollama, Postgres, or Redis services
+- [ ] Tests cover: AI container with ports (fail), service container with ports (pass), no ports (pass)
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Smarter port check in `validate_project` |
+| `tests/test_validation.py` | Create | Test validation logic |
+
+### Key Decisions
+
+- Parse YAML with regex (stdlib-only constraint, no `pyyaml`)
+- Only AI containers are expected to have no ports — service containers are fine
+
+---
+
 ## Feature: mcp-isolation
 
 **Branch:** `feature/mcp-isolation`
