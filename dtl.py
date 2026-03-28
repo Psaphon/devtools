@@ -237,7 +237,7 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
         "display": "Claude Code",
         "description": "Anthropic Claude Code CLI in a container",
         "image": "node:22-slim",
-        "env_key": "ANTHROPIC_API_KEY",
+        "env_key": None,
         "models": {
             "opus": "claude-opus-4-20250514",
             "sonnet": "claude-sonnet-4-20250514",
@@ -943,8 +943,6 @@ def make_ai_vm_compose(
                 "        limits:",
                 "          cpus: '2'",
                 "          memory: 4G",
-                "    environment:",
-                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
                 "",
             ]
         )
@@ -1093,7 +1091,6 @@ def make_ai_docker_compose(
                 "          cpus: '2'",
                 "          memory: 4G",
                 "    environment:",
-                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
                 "      - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-Developer}",
                 "      - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
                 "      - GIT_COMMITTER_NAME=${GIT_AUTHOR_NAME:-Developer}",
@@ -2376,7 +2373,10 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
         print(f"  make -C {ai_dir} up")
         print(f"  make -C {ai_dir} ssh")
 
-    # Env key reminder
+    # Auth hints
+    if provider == "claude":
+        print("\n  Auth: run 'claude login' inside the container (one-time OAuth).")
+        print("  Token persists in the claude-data volume across restarts.")
     env_key = pconfig.get("env_key")
     if env_key:
         env_val = os.environ.get(env_key, "")
