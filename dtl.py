@@ -574,13 +574,14 @@ def make_claude_md(
 
         ## Linting & Formatting
 
-        Run before every commit:
+        **CRITICAL: You MUST run linting and formatting before EVERY commit.** No exceptions.
 
         ```bash
         {stack["claude_linter"]}
         ```
 
-        If linting fails, fix the issues before committing.
+        If linting fails, fix ALL issues before committing. Never use `--no-verify` to skip checks.
+        A commit that fails lint is a broken commit — treat it as a build failure.
 
         ## Docker
 
