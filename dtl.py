@@ -2621,7 +2621,10 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
     parts.append("")
     parts.append(
         "Implement this feature exactly as specified above. "
-        "Follow all constraints. Commit when done."
+        "Follow all constraints. "
+        "Run linting and tests before committing. "
+        "When finished, commit all changes with a conventional commit message "
+        "(feat: prefix), then push the branch to origin."
     )
     return "\n".join(parts)
 
