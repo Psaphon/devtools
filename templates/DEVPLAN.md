@@ -22,6 +22,7 @@
 **Branch:** `feature/{feature-name}`
 **Depends on:** {previous feature branch, or "none"}
 **Status:** Not Started | In Progress | PR Open | Merged
+**Requires:** ai | human | both
 
 ### Goal
 
@@ -57,3 +58,5 @@
 <!-- Copy the "Feature" block above for each feature branch. -->
 <!-- Each feature should be mergeable independently and leave the project working. -->
 <!-- Order features so each builds on the last — minimize merge conflicts. -->
+<!-- Requires field: "ai" = fully automated, "human" = manual setup/config, "both" = AI codes but human does setup steps -->
+<!-- For "both" features, prefix human-required acceptance criteria with [HUMAN] -->
