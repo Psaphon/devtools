@@ -44,9 +44,32 @@ ENVEOF
     ln -sf "$SECRETS_ENV" "$CONFIG_ENV"
 fi
 
+#--- Link SSH keys from SECRETS partition ---
+SECRETS_SSH="/media/secrets/ssh"
+USER_SSH="${PREFIX}/home/${SUDO_USER:-$USER}/.ssh"
+
+if [ -d "$SECRETS_SSH" ]; then
+    mkdir -p "$USER_SSH"
+    chmod 700 "$USER_SSH"
+    for key in "$SECRETS_SSH"/id_*; do
+        [ -f "$key" ] || continue
+        cp "$key" "$USER_SSH/"
+        chmod 600 "$USER_SSH/$(basename "$key")"
+    done
+    # Make public keys readable
+    for pub in "$USER_SSH"/*.pub; do
+        [ -f "$pub" ] && chmod 644 "$pub"
+    done
+    # Pre-trust GitHub so SSH never prompts
+    if ! grep -q "github.com" "$USER_SSH/known_hosts" 2>/dev/null; then
+        ssh-keyscan -t ed25519 github.com >> "$USER_SSH/known_hosts" 2>/dev/null
+    fi
+fi
+
 # Fix ownership (install.sh runs as sudo)
 if [ -n "${SUDO_USER:-}" ]; then
     chown -R "$SUDO_USER:$SUDO_USER" "$CONFIG_DIR"
+    [ -d "$USER_SSH" ] && chown -R "$SUDO_USER:$SUDO_USER" "$USER_SSH"
 fi
 
 echo "[devtools] installed"
