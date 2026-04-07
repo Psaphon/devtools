@@ -1087,6 +1087,7 @@ def make_ai_docker_compose(
                 "    volumes:",
                 "      - ../:/workspace",
                 "      - claude-data:/home/claude",
+                "      - ./claude-code/settings.json:/home/claude/.claude/settings.json:ro",
                 "    working_dir: /workspace",
                 "    stdin_open: true",
                 "    tty: true",
@@ -2624,7 +2625,7 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
         "Follow all constraints. "
         "Run linting and tests before committing. "
         "When finished, commit all changes with a conventional commit message "
-        "(feat: prefix), then push the branch to origin."
+        "(feat: prefix). Do NOT push — the host workflow handles push and PR."
     )
     return "\n".join(parts)
 
