@@ -2734,6 +2734,17 @@ def _gh_create_pr(
     return None
 
 
+def _gh_enable_auto_merge(project_dir: Path, branch: str) -> bool:
+    """Enable auto-merge (squash) on a PR. Returns True on success."""
+    result = subprocess.run(
+        ["gh", "pr", "merge", branch, "--auto", "--squash"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
 def _gh_pr_state(project_dir: Path, branch: str) -> Optional[str]:
     """Check PR state via gh CLI. Returns 'MERGED', 'OPEN', 'CLOSED', or None."""
     result = subprocess.run(
@@ -2847,6 +2858,11 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
     if pr_url:
         log.info("PR created: %s", pr_url)
         print(f"\nPR: {pr_url}")
+        if _gh_enable_auto_merge(project_dir, branch):
+            log.info("Auto-merge enabled.")
+            print("Auto-merge: enabled (will merge when CI passes)")
+        else:
+            log.info("Auto-merge not available — manual merge required.")
     else:
         log.info("Failed to create PR — check gh auth status.")
         sys.exit(1)
@@ -3140,6 +3156,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
             if pr_url:
                 log.info("[%s] PR created: %s", project_dir.name, pr_url)
+                if _gh_enable_auto_merge(project_dir, branch):
+                    log.info("[%s] Auto-merge enabled.", project_dir.name)
+                else:
+                    log.info(
+                        "[%s] Auto-merge not available — manual merge required.",
+                        project_dir.name,
+                    )
             else:
                 log.info("[%s] Failed to create PR.", project_dir.name)
                 continue
