@@ -123,7 +123,7 @@ Automate the full gitflow cycle into a continuous loop: AI codes a feature → l
 
 **Branch:** `feature/smart-validation`
 **Depends on:** none
-**Status:** In Progress
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
