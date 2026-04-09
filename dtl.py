@@ -2352,6 +2352,12 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_ai_add_mcp(args: argparse.Namespace) -> None:
+    """Handle 'dtl ai add-mcp' subcommand (maps --server → --name)."""
+    args.name = args.server
+    cmd_add_mcp(args)
+
+
 def cmd_ai_attach(args: argparse.Namespace) -> None:
     """Handle 'dtl ai attach'."""
     project_dir = Path(args.project).resolve()
@@ -3605,6 +3611,29 @@ def main() -> None:
         help="Show available AI providers and their capabilities",
     )
     ai_list_parser.set_defaults(func=cmd_ai_list_providers)
+
+    # -- ai add-mcp --
+    ai_mcp_parser = ai_subparsers.add_parser(
+        "add-mcp",
+        help="Add an isolated MCP server to an existing AI project",
+    )
+    ai_mcp_parser.add_argument(
+        "--server",
+        required=True,
+        help="MCP server name (e.g. filesystem, github). Known: "
+        + ", ".join(sorted(MCP_KNOWN_PACKAGES)),
+    )
+    ai_mcp_parser.add_argument(
+        "--project",
+        default=".",
+        help="Path to the project directory (default: current directory)",
+    )
+    ai_mcp_parser.add_argument(
+        "--project-path",
+        default="/workspace",
+        help="Mount path for project files inside the container (default: /workspace)",
+    )
+    ai_mcp_parser.set_defaults(func=cmd_ai_add_mcp)
 
     # -- workflow (subcommand group) --
     workflow_parser = subparsers.add_parser(

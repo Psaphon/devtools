@@ -156,7 +156,7 @@ Make the `validate_project` checks smarter so they don't produce false positives
 
 **Branch:** `feature/mcp-isolation`
 **Depends on:** none
-**Status:** Not Started
+**Status:** PR Open
 
 ### Goal
 
@@ -164,13 +164,13 @@ Individually containerize MCP servers with strict isolation: no network, read-on
 
 ### Acceptance Criteria
 
-- [ ] `dtl ai add-mcp --server filesystem --project .` scaffolds an isolated MCP container
-- [ ] Generated container: `network_mode: none`, `read_only: true`, `cap_drop: ALL`, 512MB/1CPU
-- [ ] Communication via stdio pipe (docker exec), not TCP
-- [ ] 10 well-known MCP packages recognized (filesystem, github, memory, etc.)
-- [ ] Unknown package names pass through for custom servers
-- [ ] Claude Code settings.json wired to use containerized MCP servers
-- [ ] Tests cover container config generation and validation
+- [x] `dtl ai add-mcp --server filesystem --project .` scaffolds an isolated MCP container
+- [x] Generated container: `network_mode: none`, `read_only: true`, `cap_drop: ALL`, 512MB/1CPU
+- [x] Communication via stdio pipe (docker exec), not TCP
+- [x] 10 well-known MCP packages recognized (filesystem, github, memory, etc.)
+- [x] Unknown package names pass through for custom servers
+- [x] Claude Code settings.json wired to use containerized MCP servers
+- [x] Tests cover container config generation and validation
 
 ### Files to Create or Modify
 
