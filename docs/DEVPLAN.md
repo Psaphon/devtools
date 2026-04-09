@@ -191,7 +191,7 @@ Individually containerize MCP servers with strict isolation: no network, read-on
 
 **Branch:** `feature/ai-sandbox-vm`
 **Depends on:** none (parallel track)
-**Status:** PR Open
+**Status:** Merged
 
 ### Goal
 
