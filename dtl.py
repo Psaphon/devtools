@@ -1914,6 +1914,56 @@ def _run_cmd(cmd: List[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _check_ai_port_mappings(compose_content: str) -> bool:
+    """Return True if no AI containers have host port mappings.
+
+    AI containers (claude-code, openclaw-gateway) must not expose host ports.
+    Service containers (postgres, redis, ollama, etc.) are allowed to have ports.
+    Parses docker-compose.yml per-service using regex (no pyyaml dependency).
+    """
+    AI_SERVICES = {"claude-code", "openclaw-gateway"}
+
+    lines = compose_content.splitlines()
+    in_services = False
+    current_service: str | None = None
+    current_service_lines: list[str] = []
+    services: dict[str, list[str]] = {}
+
+    for line in lines:
+        if line.rstrip() == "services:":
+            in_services = True
+            continue
+
+        if in_services:
+            # A non-indented non-empty line ends the services section
+            if line and not line[0].isspace():
+                if current_service:
+                    services[current_service] = current_service_lines
+                in_services = False
+                current_service = None
+                current_service_lines = []
+                continue
+
+            # Service name: exactly 2-space indent, word chars, colon
+            m = re.match(r"^  ([a-zA-Z][\w-]*):\s*$", line)
+            if m:
+                if current_service:
+                    services[current_service] = current_service_lines
+                current_service = m.group(1)
+                current_service_lines = [line]
+            elif current_service is not None:
+                current_service_lines.append(line)
+
+    if current_service:
+        services[current_service] = current_service_lines
+
+    for service_name, service_lines in services.items():
+        if service_name in AI_SERVICES and "ports:" in "\n".join(service_lines):
+            return False
+
+    return True
+
+
 def validate_project(project_dir: Path) -> bool:
     """Run basic validation checks on the scaffolded project."""
     passed = 0
@@ -1965,8 +2015,8 @@ def validate_project(project_dir: Path) -> bool:
     if compose.exists():
         content = compose.read_text()
         check(
-            "docker-compose.yml: no host port mappings",
-            "ports:" not in content,
+            "docker-compose.yml: AI containers have no host port mappings",
+            _check_ai_port_mappings(content),
         )
 
     # AI config checks (new .ai/ structure)
