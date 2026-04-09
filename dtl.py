@@ -750,6 +750,7 @@ def make_ai_cloud_init() -> str:
           - tmux
           - curl
           - ca-certificates
+          - iptables-persistent
 
         runcmd:
           - systemctl enable --now docker
@@ -762,6 +763,14 @@ def make_ai_cloud_init() -> str:
           # Create workspace mount point
           - mkdir -p /workspace
           - chown dev:dev /workspace
+          # Network isolation (defense-in-depth): restrict outbound to QEMU SLIRP
+          # internal network only. SLIRP restrict=on on host is the primary control;
+          # iptables here prevents lateral movement if SLIRP is misconfigured.
+          - iptables -P OUTPUT DROP
+          - iptables -A OUTPUT -o lo -j ACCEPT
+          - iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          - iptables -A OUTPUT -d 10.0.2.0/24 -j ACCEPT
+          - iptables-save > /etc/iptables/rules.v4
 
         write_files:
           - path: /etc/docker/daemon.json
@@ -776,27 +785,43 @@ def make_ai_cloud_init() -> str:
 
           - path: /etc/sysctl.d/99-ai-sandbox.conf
             content: |
-              # Restrict network from inside VM
+              # Prevent VM from acting as a router
               net.ipv4.ip_forward=0
+
+          - path: /etc/hosts.d/ai-sandbox
+            content: |
+              # Route Anthropic API through host-side proxy (guestfwd 10.0.2.101:443)
+              10.0.2.101  api.anthropic.com
     """)
 
 
 def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
     """Generate QEMU launch script for the AI sandbox VM."""
-    ollama_forward = ""
+    # Build restricted SLIRP network: SSH + Anthropic API proxy + optional Ollama
+    # restrict=on blocks all outbound traffic; guestfwd creates explicit allowlist
     if "ollama" in ai_providers:
-        ollama_forward = (
-            "  -netdev user,id=net0,"
+        netdev_line = (
+            "  -netdev user,id=net0,restrict=on,"
             "hostfwd=tcp::2222-:22,"
-            "guestfwd=tcp:10.0.2.100:11434-tcp:127.0.0.1:11434 \\"
+            "guestfwd=tcp:10.0.2.100:11434-tcp:127.0.0.1:11434,"
+            "guestfwd=tcp:10.0.2.101:443-tcp:127.0.0.1:4430 \\"
         )
     else:
-        ollama_forward = "  -netdev user,id=net0,hostfwd=tcp::2222-:22 \\"
+        netdev_line = (
+            "  -netdev user,id=net0,restrict=on,"
+            "hostfwd=tcp::2222-:22,"
+            "guestfwd=tcp:10.0.2.101:443-tcp:127.0.0.1:4430 \\"
+        )
 
     return textwrap.dedent(f"""\
         #!/usr/bin/env bash
         # AI Sandbox VM launcher for project: {name}
         # Configurable via environment variables.
+        #
+        # Network isolation: SLIRP restrict=on blocks all outbound traffic.
+        # Allowlist:
+        #   10.0.2.101:443  -> host proxy -> api.anthropic.com:443
+        #   10.0.2.100:11434 -> host:11434 (Ollama, if enabled)
         set -euo pipefail
 
         SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
@@ -811,6 +836,59 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
         VM_DISK="$VM_DIR/{name}-vm.qcow2"
         CLOUD_INIT="$VM_DIR/cloud-init.yaml"
         PIDFILE="$VM_DIR/vm.pid"
+        PROXY_PIDFILE="$VM_DIR/anthropic-proxy.pid"
+
+        start_anthropic_proxy() {{
+            # Start a host-side TCP proxy that forwards to api.anthropic.com:443.
+            # The VM connects via guestfwd (10.0.2.101:443 -> 127.0.0.1:4430).
+            # TLS passes through unmodified so certificate verification succeeds.
+            if [ -f "$PROXY_PIDFILE" ] && kill -0 "$(cat "$PROXY_PIDFILE")" 2>/dev/null; then
+                return 0
+            fi
+            python3 -c "
+import socket, threading, sys
+
+def proxy(client, host, port):
+    try:
+        server = socket.create_connection((host, port), timeout=10)
+    except Exception:
+        client.close()
+        return
+    def pipe(src, dst):
+        try:
+            while True:
+                d = src.recv(4096)
+                if not d:
+                    break
+                dst.sendall(d)
+        except Exception:
+            pass
+        finally:
+            src.close()
+            dst.close()
+    t = threading.Thread(target=pipe, args=(server, client), daemon=True)
+    t.start()
+    pipe(client, server)
+
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 4430))
+s.listen(10)
+sys.stdout.flush()
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=proxy, args=(c, 'api.anthropic.com', 443), daemon=True).start()
+" &
+            echo $! > "$PROXY_PIDFILE"
+            echo "[ai-sandbox] Anthropic API proxy started on 127.0.0.1:4430 (PID $(cat "$PROXY_PIDFILE"))"
+        }}
+
+        stop_anthropic_proxy() {{
+            if [ -f "$PROXY_PIDFILE" ] && kill -0 "$(cat "$PROXY_PIDFILE")" 2>/dev/null; then
+                kill "$(cat "$PROXY_PIDFILE")"
+                rm -f "$PROXY_PIDFILE"
+            fi
+        }}
 
         create_disk() {{
             if [ ! -f "$VM_DISK" ]; then
@@ -829,6 +907,7 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
                 return 0
             fi
 
+            start_anthropic_proxy
             create_disk
 
             echo "[ai-sandbox] Starting VM (cpus=$AI_VM_CPUS, ram=$AI_VM_RAM)..."
@@ -839,7 +918,7 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
               -m "$AI_VM_RAM" \\
               -drive file="$VM_DISK",format=qcow2 \\
               -drive file="$VM_DIR/seed.iso",format=raw \\
-        {ollama_forward}
+        {netdev_line}
               -device virtio-net-pci,netdev=net0 \\
               -virtfs local,path="$(cd "$SCRIPT_DIR/../.." && pwd)",mount_tag=workspace,security_model=mapped-xattr \\
               -nographic \\
@@ -858,6 +937,7 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
             else
                 echo "[ai-sandbox] VM not running."
             fi
+            stop_anthropic_proxy
         }}
 
         status_vm() {{
@@ -3419,6 +3499,8 @@ def main() -> None:
     )
     new_parser.add_argument(
         "--mode",
+        "--isolation",
+        dest="mode",
         default="docker",
         choices=AI_MODES,
         help="AI isolation mode: docker (lightweight) or vm (QEMU/KVM). Default: docker",
@@ -3491,6 +3573,8 @@ def main() -> None:
     )
     ai_attach_parser.add_argument(
         "--mode",
+        "--isolation",
+        dest="mode",
         default="docker",
         choices=AI_MODES,
         help="Isolation mode: docker or vm (default: docker)",
@@ -3528,6 +3612,12 @@ def main() -> None:
         "--project",
         default=".",
         help="Path to the project directory",
+    )
+    ai_start_parser.add_argument(
+        "--isolation",
+        default=None,
+        choices=AI_MODES,
+        help="Override isolation mode from config: docker or vm",
     )
     ai_start_parser.set_defaults(func=cmd_ai_start)
 

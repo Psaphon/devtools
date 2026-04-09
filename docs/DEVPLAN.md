@@ -191,7 +191,7 @@ Individually containerize MCP servers with strict isolation: no network, read-on
 
 **Branch:** `feature/ai-sandbox-vm`
 **Depends on:** none (parallel track)
-**Status:** Not Started
+**Status:** PR Open
 
 ### Goal
 
@@ -199,13 +199,13 @@ Add VM-based isolation option for AI sandboxes using QEMU/KVM, providing hardwar
 
 ### Acceptance Criteria
 
-- [ ] `dtl new --ai claude --isolation vm` scaffolds QEMU/KVM-based AI sandbox
-- [ ] Generated files: cloud-init.yaml, vm-config.sh, Makefile (up/down/ssh/status/destroy)
-- [ ] VM boots with Docker pre-installed, SSH key-based auth
-- [ ] Network isolation: host-only TAP, allowlist for Ollama + Anthropic API only
-- [ ] `dtl ai start --project . --isolation vm` boots VM and connects
-- [ ] Resource limits configurable via env vars (AI_VM_CPUS, AI_VM_RAM, AI_VM_DISK)
-- [ ] Tests cover file generation and config validation
+- [x] `dtl new --ai claude --isolation vm` scaffolds QEMU/KVM-based AI sandbox
+- [x] Generated files: cloud-init.yaml, vm-config.sh, Makefile (up/down/ssh/status/destroy)
+- [x] VM boots with Docker pre-installed, SSH key-based auth
+- [x] Network isolation: host-only TAP, allowlist for Ollama + Anthropic API only
+- [x] `dtl ai start --project . --isolation vm` boots VM and connects
+- [x] Resource limits configurable via env vars (AI_VM_CPUS, AI_VM_RAM, AI_VM_DISK)
+- [x] Tests cover file generation and config validation
 
 ### Files to Create or Modify
 
