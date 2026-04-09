@@ -156,7 +156,7 @@ Make the `validate_project` checks smarter so they don't produce false positives
 
 **Branch:** `feature/mcp-isolation`
 **Depends on:** none
-**Status:** PR Open
+**Status:** Merged
 
 ### Goal
 
