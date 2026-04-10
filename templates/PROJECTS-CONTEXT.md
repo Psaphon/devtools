@@ -1,6 +1,6 @@
-# Patrick's ~/Projects Stable — Context for Planning
+# User's ~/Projects Stable — Context for Planning
 
-This file summarizes the repos in Patrick's `~/Projects` directory and the cross-cutting conventions they share. Use it when proposing stacks or features during planning sessions. Prefer existing patterns unless there's a clear reason to deviate.
+This file summarizes the repos in User's `~/Projects` directory and the cross-cutting conventions they share. Use it when proposing stacks or features during planning sessions. Prefer existing patterns unless there's a clear reason to deviate.
 
 **Last updated:** 2026-04-09
 
@@ -24,11 +24,11 @@ This file summarizes the repos in Patrick's `~/Projects` directory and the cross
 
 **Security posture** — no secrets in code, all config via env vars, Docker containers run with `cap_drop: ALL` and `no-new-privileges`, SSH keys live on the SECRETS USB partition (persist across weekly workstation rebuilds).
 
-**Ephemeral workstation** — Patrick's development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent.
+**Ephemeral workstation** — User's development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent.
 
 **LLM strategy** — local-first. Use Ollama (Qwen 2.5 7B on RTX 2060) for bulk work. Use Claude API only for synthesis or high-reasoning tasks where quality matters more than cost. Budget: $5-10/week total.
 
-**Remote access** — Tailscale mesh VPN. Phone access via Terminus SSH over Tailscale. Patrick manages projects from his phone via claude.ai and SSH terminal.
+**Remote access** — Tailscale mesh VPN. Phone access via Terminus SSH over Tailscale. the user manages projects from his phone via claude.ai and SSH terminal.
 
 **Scheduling** — systemd user units (`.service` + `.timer`) for batch jobs. `dtl workflow run --schedule HH:MM` for overnight autonomous development, typically 02:00 for off-peak electricity.
 
@@ -36,11 +36,11 @@ This file summarizes the repos in Patrick's `~/Projects` directory and the cross
 
 ## Default Stack Choices
 
-When Patrick says "PM decides" or hasn't expressed a preference, the PM will default to:
+When the user says "PM decides" or hasn't expressed a preference, the PM will default to:
 
 | Need | Default | Why |
 |------|---------|-----|
-| Language | Python 3.11+ | Most existing projects, Patrick is fluent |
+| Language | Python 3.11+ | Most existing projects, the user is fluent |
 | HTTP client | httpx (async) | Used in morning-brief, handles async well |
 | Database | SQLite | Single-user, simple, no server to maintain |
 | Templating | Jinja2 | Python standard, used in morning-brief |
@@ -59,6 +59,6 @@ Prefer existing patterns, but break the pattern when:
 
 - The new project has fundamentally different constraints (e.g., embedded device → Rust over Python)
 - An existing library is known to be painful for the specific use case (explain why)
-- Patrick explicitly asks for a new stack (honor it, but note any maintenance cost on an ephemeral workstation)
+- the user explicitly asks for a new stack (honor it, but note any maintenance cost on an ephemeral workstation)
 
-When in doubt, ask Patrick. Capture the answer in the PROJECT-BRIEF's Stack Preferences section.
+When in doubt, ask the user. Capture the answer in the PROJECT-BRIEF's Stack Preferences section.

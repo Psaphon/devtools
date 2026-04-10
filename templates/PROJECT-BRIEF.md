@@ -12,11 +12,11 @@
 
 ## Target User
 
-{Who uses this? Just Patrick? A persona? Hiring managers reviewing the portfolio?}
+{Who uses this? Just you? A persona? Hiring managers reviewing the portfolio?}
 
 ## Stack Preferences
 
-{Rough preferences — language, local vs cloud, database, libraries Patrick loves/hates.
+{Rough preferences — language, local vs cloud, database, libraries you love/hate.
 Use "PM decides" for anything you don't care about. Examples below.}
 
 - Language: {e.g., Python 3.11+, or "PM decides"}
