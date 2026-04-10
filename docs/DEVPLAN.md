@@ -64,7 +64,7 @@ Add a `dtl workflow next` command that reads a DEVPLAN.md, finds the next unstar
 
 **Branch:** `feature/gitflow-automation`
 **Depends on:** workflow-command
-**Status:** Not Started
+**Status:** Merged
 
 ### Goal
 
@@ -72,21 +72,21 @@ Automate the full gitflow cycle into a continuous loop: AI codes a feature → l
 
 ### Acceptance Criteria
 
-- [ ] `dtl workflow finish` runs lint + tests, commits, pushes, creates PR to develop
-- [ ] PR title and body derived from the feature spec in DEVPLAN.md
-- [ ] Commit message follows conventional commits (`feat:` prefix, spec summary)
-- [ ] If tests fail, stops and notifies user instead of pushing broken code
-- [ ] Updates feature status to "PR Open" in DEVPLAN.md
-- [ ] `dtl workflow finish --watch` polls `gh pr view --json state` every 60s for merge
-- [ ] When merge detected, updates status to "Merged" and auto-runs `dtl workflow next`
-- [ ] `dtl workflow run --plan docs/DEVPLAN.md` runs the full loop: next → AI → finish → watch → repeat
-- [ ] Loop exits cleanly when: all features done, a feature fails tests, or PR is closed (not merged)
-- [ ] `dtl workflow run` can target multiple projects via `--projects dir1,dir2,...`
-- [ ] Logs all activity to `~/.local/share/dtl/workflow.log`
-- [ ] `dtl workflow run --schedule HH:MM` defers start until the specified time (for off-peak API usage)
-- [ ] Startup integration: `dtl-autodev.service` systemd user unit runs `dtl workflow run` on boot
-- [ ] Service loads secrets from `EnvironmentFile=~/.config/dtl/env` (symlinked to SECRETS partition)
-- [ ] Tests cover the happy path, test-failure abort, merge detection, and multi-project queueing
+- [x] `dtl workflow finish` runs lint + tests, commits, pushes, creates PR to develop
+- [x] PR title and body derived from the feature spec in DEVPLAN.md
+- [x] Commit message follows conventional commits (`feat:` prefix, spec summary)
+- [x] If tests fail, stops and notifies user instead of pushing broken code
+- [x] Updates feature status to "PR Open" in DEVPLAN.md
+- [x] `dtl workflow finish --watch` polls `gh pr view --json state` every 60s for merge
+- [x] When merge detected, updates status to "Merged" and auto-runs `dtl workflow next`
+- [x] `dtl workflow run --projects dir1,dir2,...` runs the full loop: next → AI → finish → watch → repeat
+- [x] Loop exits cleanly when: all features done, a feature fails tests, or PR is closed (not merged)
+- [x] `dtl workflow run` can target multiple projects via `--projects dir1,dir2,...`
+- [x] Logs all activity to `~/.local/share/dtl/workflow.log`
+- [x] `dtl workflow run --schedule HH:MM` defers start until the specified time (for off-peak API usage)
+- [x] Startup integration: `dtl-autodev.service` systemd user unit runs `dtl workflow run` on boot
+- [x] Service loads secrets from `EnvironmentFile=~/.config/dtl/env` (symlinked to SECRETS partition)
+- [x] Tests cover the happy path, test-failure abort, merge detection, and multi-project queueing
 
 ### Files to Create or Modify
 
@@ -119,11 +119,44 @@ Automate the full gitflow cycle into a continuous loop: AI codes a feature → l
 
 ---
 
+## Feature: smart-validation
+
+**Branch:** `feature/smart-validation`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Make the `validate_project` checks smarter so they don't produce false positives. Currently the port mapping check flags any `ports:` in the project's docker-compose.yml, but service containers (e.g. Ollama, Postgres) legitimately need host ports.
+
+### Acceptance Criteria
+
+- [ ] Port mapping check only flags the AI container (`claude-code`, `openclaw-gateway`), not service containers
+- [ ] Check parses docker-compose.yml per-service instead of searching the whole file for `ports:`
+- [ ] No false positives on projects with Ollama, Postgres, or Redis services
+- [ ] Tests cover: AI container with ports (fail), service container with ports (pass), no ports (pass)
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Smarter port check in `validate_project` |
+| `tests/test_validation.py` | Create | Test validation logic |
+
+### Key Decisions
+
+- Parse YAML with regex (stdlib-only constraint, no `pyyaml`)
+- Only AI containers are expected to have no ports — service containers are fine
+
+---
+
 ## Feature: mcp-isolation
 
 **Branch:** `feature/mcp-isolation`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged
 
 ### Goal
 
@@ -131,13 +164,13 @@ Individually containerize MCP servers with strict isolation: no network, read-on
 
 ### Acceptance Criteria
 
-- [ ] `dtl ai add-mcp --server filesystem --project .` scaffolds an isolated MCP container
-- [ ] Generated container: `network_mode: none`, `read_only: true`, `cap_drop: ALL`, 512MB/1CPU
-- [ ] Communication via stdio pipe (docker exec), not TCP
-- [ ] 10 well-known MCP packages recognized (filesystem, github, memory, etc.)
-- [ ] Unknown package names pass through for custom servers
-- [ ] Claude Code settings.json wired to use containerized MCP servers
-- [ ] Tests cover container config generation and validation
+- [x] `dtl ai add-mcp --server filesystem --project .` scaffolds an isolated MCP container
+- [x] Generated container: `network_mode: none`, `read_only: true`, `cap_drop: ALL`, 512MB/1CPU
+- [x] Communication via stdio pipe (docker exec), not TCP
+- [x] 10 well-known MCP packages recognized (filesystem, github, memory, etc.)
+- [x] Unknown package names pass through for custom servers
+- [x] Claude Code settings.json wired to use containerized MCP servers
+- [x] Tests cover container config generation and validation
 
 ### Files to Create or Modify
 
@@ -158,7 +191,7 @@ Individually containerize MCP servers with strict isolation: no network, read-on
 
 **Branch:** `feature/ai-sandbox-vm`
 **Depends on:** none (parallel track)
-**Status:** Not Started
+**Status:** Merged
 
 ### Goal
 
@@ -166,13 +199,13 @@ Add VM-based isolation option for AI sandboxes using QEMU/KVM, providing hardwar
 
 ### Acceptance Criteria
 
-- [ ] `dtl new --ai claude --isolation vm` scaffolds QEMU/KVM-based AI sandbox
-- [ ] Generated files: cloud-init.yaml, vm-config.sh, Makefile (up/down/ssh/status/destroy)
-- [ ] VM boots with Docker pre-installed, SSH key-based auth
-- [ ] Network isolation: host-only TAP, allowlist for Ollama + Anthropic API only
-- [ ] `dtl ai start --project . --isolation vm` boots VM and connects
-- [ ] Resource limits configurable via env vars (AI_VM_CPUS, AI_VM_RAM, AI_VM_DISK)
-- [ ] Tests cover file generation and config validation
+- [x] `dtl new --ai claude --isolation vm` scaffolds QEMU/KVM-based AI sandbox
+- [x] Generated files: cloud-init.yaml, vm-config.sh, Makefile (up/down/ssh/status/destroy)
+- [x] VM boots with Docker pre-installed, SSH key-based auth
+- [x] Network isolation: host-only TAP, allowlist for Ollama + Anthropic API only
+- [x] `dtl ai start --project . --isolation vm` boots VM and connects
+- [x] Resource limits configurable via env vars (AI_VM_CPUS, AI_VM_RAM, AI_VM_DISK)
+- [x] Tests cover file generation and config validation
 
 ### Files to Create or Modify
 

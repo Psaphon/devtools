@@ -237,7 +237,7 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
         "display": "Claude Code",
         "description": "Anthropic Claude Code CLI in a container",
         "image": "node:22-slim",
-        "env_key": "ANTHROPIC_API_KEY",
+        "env_key": None,
         "models": {
             "opus": "claude-opus-4-20250514",
             "sonnet": "claude-sonnet-4-20250514",
@@ -750,6 +750,7 @@ def make_ai_cloud_init() -> str:
           - tmux
           - curl
           - ca-certificates
+          - iptables-persistent
 
         runcmd:
           - systemctl enable --now docker
@@ -762,6 +763,14 @@ def make_ai_cloud_init() -> str:
           # Create workspace mount point
           - mkdir -p /workspace
           - chown dev:dev /workspace
+          # Network isolation (defense-in-depth): restrict outbound to QEMU SLIRP
+          # internal network only. SLIRP restrict=on on host is the primary control;
+          # iptables here prevents lateral movement if SLIRP is misconfigured.
+          - iptables -P OUTPUT DROP
+          - iptables -A OUTPUT -o lo -j ACCEPT
+          - iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+          - iptables -A OUTPUT -d 10.0.2.0/24 -j ACCEPT
+          - iptables-save > /etc/iptables/rules.v4
 
         write_files:
           - path: /etc/docker/daemon.json
@@ -776,27 +785,43 @@ def make_ai_cloud_init() -> str:
 
           - path: /etc/sysctl.d/99-ai-sandbox.conf
             content: |
-              # Restrict network from inside VM
+              # Prevent VM from acting as a router
               net.ipv4.ip_forward=0
+
+          - path: /etc/hosts.d/ai-sandbox
+            content: |
+              # Route Anthropic API through host-side proxy (guestfwd 10.0.2.101:443)
+              10.0.2.101  api.anthropic.com
     """)
 
 
 def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
     """Generate QEMU launch script for the AI sandbox VM."""
-    ollama_forward = ""
+    # Build restricted SLIRP network: SSH + Anthropic API proxy + optional Ollama
+    # restrict=on blocks all outbound traffic; guestfwd creates explicit allowlist
     if "ollama" in ai_providers:
-        ollama_forward = (
-            "  -netdev user,id=net0,"
+        netdev_line = (
+            "  -netdev user,id=net0,restrict=on,"
             "hostfwd=tcp::2222-:22,"
-            "guestfwd=tcp:10.0.2.100:11434-tcp:127.0.0.1:11434 \\"
+            "guestfwd=tcp:10.0.2.100:11434-tcp:127.0.0.1:11434,"
+            "guestfwd=tcp:10.0.2.101:443-tcp:127.0.0.1:4430 \\"
         )
     else:
-        ollama_forward = "  -netdev user,id=net0,hostfwd=tcp::2222-:22 \\"
+        netdev_line = (
+            "  -netdev user,id=net0,restrict=on,"
+            "hostfwd=tcp::2222-:22,"
+            "guestfwd=tcp:10.0.2.101:443-tcp:127.0.0.1:4430 \\"
+        )
 
     return textwrap.dedent(f"""\
         #!/usr/bin/env bash
         # AI Sandbox VM launcher for project: {name}
         # Configurable via environment variables.
+        #
+        # Network isolation: SLIRP restrict=on blocks all outbound traffic.
+        # Allowlist:
+        #   10.0.2.101:443  -> host proxy -> api.anthropic.com:443
+        #   10.0.2.100:11434 -> host:11434 (Ollama, if enabled)
         set -euo pipefail
 
         SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
@@ -811,6 +836,59 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
         VM_DISK="$VM_DIR/{name}-vm.qcow2"
         CLOUD_INIT="$VM_DIR/cloud-init.yaml"
         PIDFILE="$VM_DIR/vm.pid"
+        PROXY_PIDFILE="$VM_DIR/anthropic-proxy.pid"
+
+        start_anthropic_proxy() {{
+            # Start a host-side TCP proxy that forwards to api.anthropic.com:443.
+            # The VM connects via guestfwd (10.0.2.101:443 -> 127.0.0.1:4430).
+            # TLS passes through unmodified so certificate verification succeeds.
+            if [ -f "$PROXY_PIDFILE" ] && kill -0 "$(cat "$PROXY_PIDFILE")" 2>/dev/null; then
+                return 0
+            fi
+            python3 -c "
+import socket, threading, sys
+
+def proxy(client, host, port):
+    try:
+        server = socket.create_connection((host, port), timeout=10)
+    except Exception:
+        client.close()
+        return
+    def pipe(src, dst):
+        try:
+            while True:
+                d = src.recv(4096)
+                if not d:
+                    break
+                dst.sendall(d)
+        except Exception:
+            pass
+        finally:
+            src.close()
+            dst.close()
+    t = threading.Thread(target=pipe, args=(server, client), daemon=True)
+    t.start()
+    pipe(client, server)
+
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', 4430))
+s.listen(10)
+sys.stdout.flush()
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=proxy, args=(c, 'api.anthropic.com', 443), daemon=True).start()
+" &
+            echo $! > "$PROXY_PIDFILE"
+            echo "[ai-sandbox] Anthropic API proxy started on 127.0.0.1:4430 (PID $(cat "$PROXY_PIDFILE"))"
+        }}
+
+        stop_anthropic_proxy() {{
+            if [ -f "$PROXY_PIDFILE" ] && kill -0 "$(cat "$PROXY_PIDFILE")" 2>/dev/null; then
+                kill "$(cat "$PROXY_PIDFILE")"
+                rm -f "$PROXY_PIDFILE"
+            fi
+        }}
 
         create_disk() {{
             if [ ! -f "$VM_DISK" ]; then
@@ -829,6 +907,7 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
                 return 0
             fi
 
+            start_anthropic_proxy
             create_disk
 
             echo "[ai-sandbox] Starting VM (cpus=$AI_VM_CPUS, ram=$AI_VM_RAM)..."
@@ -839,7 +918,7 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
               -m "$AI_VM_RAM" \\
               -drive file="$VM_DISK",format=qcow2 \\
               -drive file="$VM_DIR/seed.iso",format=raw \\
-        {ollama_forward}
+        {netdev_line}
               -device virtio-net-pci,netdev=net0 \\
               -virtfs local,path="$(cd "$SCRIPT_DIR/../.." && pwd)",mount_tag=workspace,security_model=mapped-xattr \\
               -nographic \\
@@ -858,6 +937,7 @@ def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
             else
                 echo "[ai-sandbox] VM not running."
             fi
+            stop_anthropic_proxy
         }}
 
         status_vm() {{
@@ -943,8 +1023,6 @@ def make_ai_vm_compose(
                 "        limits:",
                 "          cpus: '2'",
                 "          memory: 4G",
-                "    environment:",
-                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
                 "",
             ]
         )
@@ -1038,12 +1116,21 @@ def make_ai_claude_settings(
     settings: dict = {
         "permissions": {
             "allow": [
+                "Bash(*)",
                 "Read",
                 "Write",
                 "Edit",
                 "Glob",
                 "Grep",
-                "Bash(*)",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "Agent",
+                "TaskCreate",
+                "TaskGet",
+                "TaskList",
+                "TaskUpdate",
+                "TodoWrite",
             ],
             "deny": [],
         },
@@ -1078,8 +1165,9 @@ def make_ai_docker_compose(
                 "    build: ./claude-code",
                 '    user: "${UID:-1000}:${GID:-1000}"',
                 "    volumes:",
-                "      - ../../:/workspace",
+                "      - ../:/workspace",
                 "      - claude-data:/home/claude",
+                "      - ./claude-code/settings.json:/home/claude/.claude/settings.json:ro",
                 "    working_dir: /workspace",
                 "    stdin_open: true",
                 "    tty: true",
@@ -1093,7 +1181,6 @@ def make_ai_docker_compose(
                 "          cpus: '2'",
                 "          memory: 4G",
                 "    environment:",
-                "      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}",
                 "      - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-Developer}",
                 "      - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
                 "      - GIT_COMMITTER_NAME=${GIT_AUTHOR_NAME:-Developer}",
@@ -1139,7 +1226,7 @@ def make_ai_docker_compose(
                 f"    image: {AI_PROVIDERS_CONFIG['ollama']['image']}",
                 "    volumes:",
                 "      - ollama-models:/root/.ollama",
-                "      - ../../:/workspace",
+                "      - ../:/workspace",
                 "    ports:",
                 '      - "11434:11434"',
                 "    deploy:",
@@ -1907,6 +1994,56 @@ def _run_cmd(cmd: List[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _check_ai_port_mappings(compose_content: str) -> bool:
+    """Return True if no AI containers have host port mappings.
+
+    AI containers (claude-code, openclaw-gateway) must not expose host ports.
+    Service containers (postgres, redis, ollama, etc.) are allowed to have ports.
+    Parses docker-compose.yml per-service using regex (no pyyaml dependency).
+    """
+    AI_SERVICES = {"claude-code", "openclaw-gateway"}
+
+    lines = compose_content.splitlines()
+    in_services = False
+    current_service: str | None = None
+    current_service_lines: list[str] = []
+    services: dict[str, list[str]] = {}
+
+    for line in lines:
+        if line.rstrip() == "services:":
+            in_services = True
+            continue
+
+        if in_services:
+            # A non-indented non-empty line ends the services section
+            if line and not line[0].isspace():
+                if current_service:
+                    services[current_service] = current_service_lines
+                in_services = False
+                current_service = None
+                current_service_lines = []
+                continue
+
+            # Service name: exactly 2-space indent, word chars, colon
+            m = re.match(r"^  ([a-zA-Z][\w-]*):\s*$", line)
+            if m:
+                if current_service:
+                    services[current_service] = current_service_lines
+                current_service = m.group(1)
+                current_service_lines = [line]
+            elif current_service is not None:
+                current_service_lines.append(line)
+
+    if current_service:
+        services[current_service] = current_service_lines
+
+    for service_name, service_lines in services.items():
+        if service_name in AI_SERVICES and "ports:" in "\n".join(service_lines):
+            return False
+
+    return True
+
+
 def validate_project(project_dir: Path) -> bool:
     """Run basic validation checks on the scaffolded project."""
     passed = 0
@@ -1958,8 +2095,8 @@ def validate_project(project_dir: Path) -> bool:
     if compose.exists():
         content = compose.read_text()
         check(
-            "docker-compose.yml: no host port mappings",
-            "ports:" not in content,
+            "docker-compose.yml: AI containers have no host port mappings",
+            _check_ai_port_mappings(content),
         )
 
     # AI config checks (new .ai/ structure)
@@ -2295,6 +2432,12 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_ai_add_mcp(args: argparse.Namespace) -> None:
+    """Handle 'dtl ai add-mcp' subcommand (maps --server → --name)."""
+    args.name = args.server
+    cmd_add_mcp(args)
+
+
 def cmd_ai_attach(args: argparse.Namespace) -> None:
     """Handle 'dtl ai attach'."""
     project_dir = Path(args.project).resolve()
@@ -2376,7 +2519,10 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
         print(f"  make -C {ai_dir} up")
         print(f"  make -C {ai_dir} ssh")
 
-    # Env key reminder
+    # Auth hints
+    if provider == "claude":
+        print("\n  Auth: run 'claude login' inside the container (one-time OAuth).")
+        print("  Token persists in the claude-data volume across restarts.")
     env_key = pconfig.get("env_key")
     if env_key:
         env_val = os.environ.get(env_key, "")
@@ -2612,7 +2758,10 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
     parts.append("")
     parts.append(
         "Implement this feature exactly as specified above. "
-        "Follow all constraints. Commit when done."
+        "Follow all constraints. "
+        "Run linting and tests before committing. "
+        "When finished, commit all changes with a conventional commit message "
+        "(feat: prefix). Do NOT push — the host workflow handles push and PR."
     )
     return "\n".join(parts)
 
@@ -2719,6 +2868,17 @@ def _gh_create_pr(
         if view.returncode == 0:
             return view.stdout.strip()
     return None
+
+
+def _gh_enable_auto_merge(project_dir: Path, branch: str) -> bool:
+    """Enable auto-merge (squash) on a PR. Returns True on success."""
+    result = subprocess.run(
+        ["gh", "pr", "merge", branch, "--auto", "--squash"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def _gh_pr_state(project_dir: Path, branch: str) -> Optional[str]:
@@ -2834,6 +2994,11 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
     if pr_url:
         log.info("PR created: %s", pr_url)
         print(f"\nPR: {pr_url}")
+        if _gh_enable_auto_merge(project_dir, branch):
+            log.info("Auto-merge enabled.")
+            print("Auto-merge: enabled (will merge when CI passes)")
+        else:
+            log.info("Auto-merge not available — manual merge required.")
     else:
         log.info("Failed to create PR — check gh auth status.")
         sys.exit(1)
@@ -3127,6 +3292,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
             if pr_url:
                 log.info("[%s] PR created: %s", project_dir.name, pr_url)
+                if _gh_enable_auto_merge(project_dir, branch):
+                    log.info("[%s] Auto-merge enabled.", project_dir.name)
+                else:
+                    log.info(
+                        "[%s] Auto-merge not available — manual merge required.",
+                        project_dir.name,
+                    )
             else:
                 log.info("[%s] Failed to create PR.", project_dir.name)
                 continue
@@ -3327,6 +3499,8 @@ def main() -> None:
     )
     new_parser.add_argument(
         "--mode",
+        "--isolation",
+        dest="mode",
         default="docker",
         choices=AI_MODES,
         help="AI isolation mode: docker (lightweight) or vm (QEMU/KVM). Default: docker",
@@ -3399,6 +3573,8 @@ def main() -> None:
     )
     ai_attach_parser.add_argument(
         "--mode",
+        "--isolation",
+        dest="mode",
         default="docker",
         choices=AI_MODES,
         help="Isolation mode: docker or vm (default: docker)",
@@ -3436,6 +3612,12 @@ def main() -> None:
         "--project",
         default=".",
         help="Path to the project directory",
+    )
+    ai_start_parser.add_argument(
+        "--isolation",
+        default=None,
+        choices=AI_MODES,
+        help="Override isolation mode from config: docker or vm",
     )
     ai_start_parser.set_defaults(func=cmd_ai_start)
 
@@ -3519,6 +3701,29 @@ def main() -> None:
         help="Show available AI providers and their capabilities",
     )
     ai_list_parser.set_defaults(func=cmd_ai_list_providers)
+
+    # -- ai add-mcp --
+    ai_mcp_parser = ai_subparsers.add_parser(
+        "add-mcp",
+        help="Add an isolated MCP server to an existing AI project",
+    )
+    ai_mcp_parser.add_argument(
+        "--server",
+        required=True,
+        help="MCP server name (e.g. filesystem, github). Known: "
+        + ", ".join(sorted(MCP_KNOWN_PACKAGES)),
+    )
+    ai_mcp_parser.add_argument(
+        "--project",
+        default=".",
+        help="Path to the project directory (default: current directory)",
+    )
+    ai_mcp_parser.add_argument(
+        "--project-path",
+        default="/workspace",
+        help="Mount path for project files inside the container (default: /workspace)",
+    )
+    ai_mcp_parser.set_defaults(func=cmd_ai_add_mcp)
 
     # -- workflow (subcommand group) --
     workflow_parser = subparsers.add_parser(
