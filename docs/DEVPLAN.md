@@ -510,7 +510,7 @@ Reference: FEATURE-REQUESTS.md items #3, #4, #5. Origin: loom's media-pipeline /
 
 **Branch:** `feature/workflow-install-deps-before-test`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Done
 **Requires:** ai
 
 ### Goal

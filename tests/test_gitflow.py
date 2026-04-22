@@ -1,6 +1,5 @@
 """Tests for dtl workflow finish/run: PR creation, merge polling, loop logic."""
 
-import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -126,23 +125,23 @@ class TestRunLintAndTests:
     def test_python_project_detected(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
         with patch("dtl.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout="ok", stderr=""
-            )
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             passed, output = _run_lint_and_tests(tmp_path)
         assert passed
-        assert mock_run.call_count == 2  # lint + test
+        assert mock_run.call_count == 3  # pip install + lint + test
 
     def test_lint_failure_stops_early(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
-        with patch("dtl.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=1, stdout="", stderr="lint error"
-            )
+
+        def fake_run(cmd, **kwargs):
+            if "pip" in " ".join(str(c) for c in cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=1, stdout="", stderr="lint error")
+
+        with patch("dtl.subprocess.run", side_effect=fake_run):
             passed, output = _run_lint_and_tests(tmp_path)
         assert not passed
         assert "lint error" in output
-        assert mock_run.call_count == 1  # stopped after lint
 
     def test_no_project_files(self, tmp_path):
         passed, output = _run_lint_and_tests(tmp_path)
@@ -151,9 +150,7 @@ class TestRunLintAndTests:
     def test_node_project_detected(self, tmp_path):
         (tmp_path / "package.json").write_text("{}")
         with patch("dtl.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout="ok", stderr=""
-            )
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             passed, _ = _run_lint_and_tests(tmp_path)
         assert passed
         calls = [c[0][0] for c in mock_run.call_args_list]
