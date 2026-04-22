@@ -672,6 +672,54 @@ def make_ci_workflow(name: str, stack: dict) -> str:
     """)
 
 
+_CI_YML_SCAFFOLD = textwrap.dedent("""\
+    name: CI
+
+    on:
+      push:
+        branches: [main, develop]
+      pull_request:
+        branches: [main, develop]
+
+    permissions:
+      contents: read
+
+    jobs:
+      lint-and-test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Detect Python source
+            id: pycheck
+            run: |
+              if find . -name "*.py" ! -path "./.git/*" ! -path "./.ai/*" | grep -q .; then
+                echo "found=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "found=false" >> "$GITHUB_OUTPUT"
+              fi
+
+          - uses: actions/setup-python@v5
+            if: steps.pycheck.outputs.found == 'true'
+            with:
+              python-version: "3.12"
+
+          - name: Lint (ruff)
+            if: steps.pycheck.outputs.found == 'true'
+            run: pip install ruff && ruff check .
+
+          - name: Format check (ruff)
+            if: steps.pycheck.outputs.found == 'true'
+            run: ruff format --check .
+
+          - name: Test (pytest)
+            if: steps.pycheck.outputs.found == 'true'
+            run: |
+              pip install pytest
+              pytest --tb=short -q; RET=$?; [ $RET -eq 5 ] && exit 0 || exit $RET
+""")
+
+
 def make_cd_workflow(name: str) -> str:
     """Generate .github/workflows/release.yml for automated GitHub Releases."""
     _ = name  # available for future template use
@@ -2489,6 +2537,43 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
         print(f"  Use 'dtl ai detach --project {project_dir}' first to reconfigure.")
         sys.exit(1)
 
+    # CI workflow requirement — needed to gate 'gh pr merge --auto --squash'
+    scaffold_ci = getattr(args, "scaffold_ci", False)
+    no_ci = getattr(args, "no_ci", False)
+    workflows_dir = project_dir / ".github" / "workflows"
+    has_ci = workflows_dir.is_dir() and any(workflows_dir.glob("*.yml"))
+
+    if not has_ci:
+        if scaffold_ci:
+            workflows_dir.mkdir(parents=True, exist_ok=True)
+            (workflows_dir / "ci.yml").write_text(_CI_YML_SCAFFOLD)
+            print("  Scaffolded CI workflow: .github/workflows/ci.yml")
+        elif not no_ci:
+            print(
+                "Error: no CI workflow found at .github/workflows/*.yml",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print(
+                "CI is required because 'gh pr merge --auto --squash' needs a passing",
+                file=sys.stderr,
+            )
+            print(
+                "status check to gate on. Without CI, the workflow loop stalls waiting",
+                file=sys.stderr,
+            )
+            print("for merge.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Options:", file=sys.stderr)
+            print(
+                "  --scaffold-ci   write a standard .github/workflows/ci.yml and continue",
+                file=sys.stderr,
+            )
+            print(
+                "  --no-ci         skip this check (not recommended)", file=sys.stderr
+            )
+            sys.exit(1)
+
     print(f"Attaching {pconfig['display']} to {project_dir.name}")
     print(f"  Provider: {provider}")
     print(f"  Mode:     {mode}")
@@ -3740,6 +3825,18 @@ def main() -> None:
         "--key-source",
         default="env",
         help="API key source: env (default)",
+    )
+    ai_attach_parser.add_argument(
+        "--scaffold-ci",
+        action="store_true",
+        default=False,
+        help="Write a standard .github/workflows/ci.yml if missing",
+    )
+    ai_attach_parser.add_argument(
+        "--no-ci",
+        action="store_true",
+        default=False,
+        help="Skip the CI workflow requirement check (not recommended)",
     )
     ai_attach_parser.set_defaults(func=cmd_ai_attach)
 
