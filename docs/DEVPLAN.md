@@ -348,7 +348,7 @@ Reference: FEATURE-REQUESTS.md item #10.
 
 **Branch:** `feature/require-ci-workflow`
 **Depends on:** none
-**Status:** Complete
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
