@@ -427,7 +427,7 @@ Reference: FEATURE-REQUESTS.md item #6. User pain point — "AI developer may ge
 
 **Branch:** `feature/workflow-watchdog`
 **Depends on:** workflow-stall-visibility
-**Status:** In Progress
+**Status:** PR Open
 **Requires:** both
 
 ### Goal
