@@ -309,7 +309,7 @@ Reference: FEATURE-REQUESTS.md item #11.
 
 **Branch:** `feature/workflow-stall-visibility`
 **Depends on:** fix-workflow-spin-loop
-**Status:** Not Started
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
