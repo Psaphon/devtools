@@ -271,7 +271,7 @@ Reference: FEATURE-REQUESTS.md item #9. Caused loom's 6-day silent stall (18GB l
 
 **Branch:** `feature/workflow-log-defaults`
 **Depends on:** none
-**Status:** PR Open
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
