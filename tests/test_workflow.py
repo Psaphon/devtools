@@ -387,3 +387,121 @@ class TestCmdWorkflowNext:
         assert "Single file, stdlib-only" in prompt
         assert "## Feature: beta-feature" in prompt
         assert "Beta goal." in prompt
+
+
+# ---------------------------------------------------------------------------
+# cmd_workflow_run dirty-tree spin-loop regression (issue #9)
+# ---------------------------------------------------------------------------
+
+
+class TestCmdWorkflowRunDirtyTreeNoSpin:
+    """Regression test: dirty working tree must not cause a spin loop.
+
+    When all projects have a dirty tree, any_work_done must remain False so
+    the outer while loop exits immediately.  A floor time.sleep(60) must also
+    be present when work IS done, so the loop is rate-limited even if the
+    any_work_done logic were somehow wrong.
+    """
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        """Create a minimal project directory with a DEVPLAN.md."""
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
+        return tmp_path
+
+    def test_dirty_tree_loop_exits_without_spin(self, tmp_path):
+        """Loop exits after one pass when every project has a dirty tree."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path)
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(secs: float) -> None:
+            sleep_calls.append(secs)
+
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl.time.sleep", side_effect=fake_sleep),
+            patch("dtl._setup_workflow_logger") as mock_log_setup,
+        ):
+            mock_logger = MagicMock()
+            mock_log_setup.return_value = mock_logger
+            cmd_workflow_run(args)
+
+        # The loop must have exited — if it spun it would never return.
+        # any_work_done should have stayed False, so the floor sleep (60 s)
+        # was never reached and the loop broke cleanly.
+        floor_sleeps = [s for s in sleep_calls if s == 60]
+        assert floor_sleeps == [], (
+            "Floor sleep should not fire when all projects are skipped (dirty tree); "
+            f"got sleep calls: {sleep_calls}"
+        )
+
+        # Verify the dirty-skip log message fired at least once
+        skip_calls = [
+            c for c in mock_logger.info.call_args_list if "dirty" in str(c).lower()
+        ]
+        assert skip_calls, "Expected at least one 'dirty' skip log message"
+
+    def test_floor_sleep_fires_when_work_is_done(self, tmp_path):
+        """Floor sleep of 60 s fires after a successful work iteration."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path)
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+
+        sleep_calls: list[float] = []
+
+        def fake_sleep(secs: float) -> None:
+            sleep_calls.append(secs)
+
+        # Simulate: first iteration tree is clean (work done), second is all-done
+        dirty_responses = iter(
+            [False]
+        )  # clean on first real check; will raise StopIteration after
+
+        def fake_is_dirty(path):
+            try:
+                return next(dirty_responses)
+            except StopIteration:
+                return False
+
+        # After one branch-create + AI pass, mark all features done so loop exits
+        def fake_update_status(plan_path, name, status):
+            # Write Done for every feature to ensure loop terminates
+            text = plan_path.read_text()
+            import re as _re
+
+            text = _re.sub(r"\*\*Status:\*\* Not Started", "**Status:** Done", text)
+            plan_path.write_text(text)
+
+        with (
+            patch("dtl._git_is_dirty", side_effect=fake_is_dirty),
+            patch("dtl._git_create_branch"),
+            patch("dtl._update_feature_status", side_effect=fake_update_status),
+            patch("dtl.time.sleep", side_effect=fake_sleep),
+            patch("dtl._setup_workflow_logger") as mock_log_setup,
+            patch("dtl.subprocess.run") as mock_subproc,
+            patch("dtl.ai_run"),
+        ):
+            mock_logger = MagicMock()
+            mock_log_setup.return_value = mock_logger
+            mock_subproc.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            cmd_workflow_run(args)
+
+        floor_sleeps = [s for s in sleep_calls if s == 60]
+        assert floor_sleeps, (
+            f"Expected at least one floor sleep(60) after work iteration; "
+            f"got sleep calls: {sleep_calls}"
+        )

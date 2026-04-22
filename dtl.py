@@ -3126,7 +3126,6 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 log.info("[%s] No unstarted features remaining.", project_dir.name)
                 continue
 
-            any_work_done = True
             fail_key = f"{project_dir.name}:{next_feature['name']}"
             branch = next_feature["branch"]
             log.info(
@@ -3158,6 +3157,9 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     consecutive_failures.get(fail_key, 0) + 1
                 )
                 continue
+
+            # All skip gates passed — count this project as having work
+            any_work_done = True
 
             # Update status
             _update_feature_status(plan_path, next_feature["name"], "In Progress")
@@ -3376,6 +3378,10 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
         if not any_work_done:
             log.info("=== All projects complete. Exiting. ===")
             break
+
+        # Floor sleep — belt-and-suspenders to prevent spin if any_work_done
+        # logic is ever wrong (e.g. all projects skipped but flag was set).
+        time.sleep(60)
 
 
 def cmd_workflow_list(args: argparse.Namespace) -> None:
