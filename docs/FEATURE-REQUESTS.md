@@ -2,6 +2,8 @@
 
 Cross-cutting dtl improvements surfaced during other projects' planning. Each entry notes origin and date.
 
+Items here are **backlog** — ideas, open problems, or explicitly parked work. When an item is concrete enough to spec (branch name, acceptance criteria, files), it gets **promoted** to `DEVPLAN.md` and built by `dtl workflow run`. Promoted items keep a stub here for traceability.
+
 ---
 
 ## Captured 2026-04-12 — from loom planning
@@ -22,6 +24,8 @@ Example: `dtl schedule add --tenant loom --window 00:00-05:30 --requires gpu --c
 
 ### 3. Hardware section in PROJECTS-CONTEXT.md
 
+**Status: Promoted to DEVPLAN 2026-04-21** (bundled into `planning-templates-refresh`).
+
 **Problem.** Planning sessions don't know workstation specs. Burns time asking.
 
 **Proposal.** Add a standing Hardware section to PROJECTS-CONTEXT.md template:
@@ -37,17 +41,23 @@ Brainstormer reads this before making stack suggestions. The user's current conf
 
 ### 4. Planning guide addendum — non-code projects
 
+**Status: Promoted to DEVPLAN 2026-04-21** (bundled into `planning-templates-refresh`).
+
 **Problem.** PLANNING-GUIDE.md assumes every feature produces testable code. Media pipelines, asset-curation work, config-heavy projects don't fit.
 
 **Proposal.** Add section: "Non-code features are legitimate. Acceptance criteria can be 'produces expected artifact' rather than 'tests pass.' Features that curate assets (workflow JSONs, prompts, sample inputs) should be explicitly called out."
 
 ### 5. Optional Assets table in DEVPLAN template
 
+**Status: Promoted to DEVPLAN 2026-04-21** (bundled into `planning-templates-refresh`).
+
 **Problem.** Features that produce non-code artifacts (ComfyUI workflow JSONs, prompt templates, reference images) don't fit the "Files to Create or Modify" code-centric table cleanly.
 
 **Proposal.** Add an optional `### Assets` section alongside `### Files to Create or Modify` for features with non-code deliverables.
 
 ### 6. Better loop-break semantics for AI developer
+
+**Status: Promoted to DEVPLAN 2026-04-21** as `ai-dev-loop-break`.
 
 **Problem.** AI developer can loop for hours retrying a broken command. The user called this out as a major pain point.
 
@@ -71,6 +81,8 @@ See separate meta parking-lot note. One-way forward handoff breaks when plans hi
 
 ### 9. `workflow run` spin-loops when every project has dirty tree (BUG)
 
+**Status: Promoted to DEVPLAN 2026-04-21** as `fix-workflow-spin-loop`.
+
 **Problem.** In `dtl.py` around line 3129, `any_work_done = True` is set **before** the dirty-tree check at 3137. If the only project in the run has a dirty tree, the inner `for` loop skips (with `continue`), but `any_work_done` was already flipped to True. The outer `while True` (line 3376) therefore never hits its `break`, and re-enters immediately with no sleep. Over 6 days this generated an 18GB log of `[loom] Working tree is dirty — skipping.`
 
 **Fix options.**
@@ -82,6 +94,8 @@ See separate meta parking-lot note. One-way forward handoff breaks when plans hi
 
 ### 10. Dirty-tree skip is invisible (UX bug)
 
+**Status: Promoted to DEVPLAN 2026-04-21** as `workflow-stall-visibility`.
+
 **Problem.** When the loop skips a project for a dirty tree, the only signal is one log line. The feature stays `Not Started`, no PR is opened, no CI runs — everything looks normal from the outside. The user has no way to know work isn't happening without tailing the log.
 
 **Fix.** On dirty-tree skip:
@@ -90,6 +104,8 @@ See separate meta parking-lot note. One-way forward handoff breaks when plans hi
 - Consider: run `git stash -u` automatically on dirty tree, run the feature, restore after — risky but makes the loop more resilient
 
 ### 11. `dtl workflow run` should document log placement
+
+**Status: Promoted to DEVPLAN 2026-04-21** as `workflow-log-defaults`.
 
 **Problem.** The command has no `--log` flag and no documented default. Users (and PMs!) default to writing a log inside the project directory with `nohup … > .workflow-run.log`, which **creates the exact dirty-tree condition that stalls the loop**. A self-hosting footgun.
 
@@ -100,6 +116,20 @@ See separate meta parking-lot note. One-way forward handoff breaks when plans hi
 
 ### 12. `dtl ai attach` validator should require CI workflow, not just warn
 
+**Status: Promoted to DEVPLAN 2026-04-21** as `require-ci-workflow`.
+
 **Problem.** Validator reports `[!!] CI workflow exists` but proceeds. Without CI, `gh pr merge --auto --squash` has nothing to gate on; the loop stalls at "waiting for merge." Load-bearing, not cosmetic.
 
 **Fix.** Either: (a) scaffold a standard ruff+pytest `ci.yml` when missing, or (b) fail `ai attach` hard if CI is missing and `--no-ci` wasn't passed.
+
+---
+
+## Captured 2026-04-21 — from PM/watchdog discussion
+
+### 13. Cross-project workflow watchdog
+
+**Status: Promoted to DEVPLAN 2026-04-21** as `workflow-watchdog`.
+
+**Problem.** The PM cannot autonomously check on overnight workflow runs between sessions. Silent stalls (like loom's 6-day one) go undetected for days unless the user tails logs manually.
+
+**Proposal.** `dtl watchdog install` scaffolds a user systemd timer that runs `dtl watchdog check` every N hours, detects anomalies (dead process, dirty tree, PR silence, log growth), and notifies via each project's `.ai/notify.py`. Free, runs locally, complements the in-loop stall-visibility feature.
