@@ -387,7 +387,7 @@ Reference: FEATURE-REQUESTS.md item #12. The standard ci.yml pattern is already 
 
 **Branch:** `feature/ai-dev-loop-break`
 **Depends on:** none
-**Status:** Not Started
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal

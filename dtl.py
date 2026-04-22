@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import re
+import select
 import subprocess
 import sys
 import textwrap
@@ -396,6 +397,9 @@ def make_gitignore(stack: dict) -> str:
 
         # AI sandbox
         .ai/config.json
+
+        # AI failure reports (written by dtl ai run on timeout/retry-cap)
+        FAILURE-REPORT.md
     """)
     return common + "\n" + stack["gitignore_extra"]
 
@@ -1891,7 +1895,111 @@ def ai_status(project_dir: Path) -> None:
         _run_cmd(["bash", str(vm_script), "status"])
 
 
-def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> None:
+def _write_failure_report(
+    project_dir: Path,
+    feature_name: str,
+    limit_hit: str,
+    output_lines: list[str],
+) -> None:
+    """Write FAILURE-REPORT.md to the project root on bail-out."""
+    last_200 = output_lines[-200:] if len(output_lines) > 200 else output_lines
+    limit_desc = {
+        "wall_clock": "Wall-clock timeout exceeded",
+        "retry_cap": "AI retry cap exceeded",
+    }.get(limit_hit, limit_hit)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = (
+        f"# AI Failure Report\n\n"
+        f"**Generated:** {ts}  \n"
+        f"**Feature:** {feature_name or '(unknown)'}  \n"
+        f"**Limit hit:** {limit_desc}  \n\n"
+        f"## Last 200 Lines of Output\n\n"
+        f"```\n" + "".join(last_200) + "```\n"
+    )
+    report_path = project_dir / "FAILURE-REPORT.md"
+    report_path.write_text(report)
+
+
+def _run_ai_with_limits(
+    cmd: list[str],
+    env: dict,
+    max_wall_clock: int,
+    max_ai_retries: int,
+) -> tuple[int, list[str]]:
+    """Run a subprocess, streaming output while enforcing wall-clock and retry caps.
+
+    Returns (returncode, output_lines).
+    returncode is 124 on wall-clock timeout, 125 on retry-cap, else the real code.
+    """
+    # Pattern to detect "AI is looping" — Claude Code retrying failed tests
+    retry_re = re.compile(r"tests?\s+failed|retrying", re.IGNORECASE)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+
+    lines: list[str] = []
+    retry_count = 0
+    kill_reason: str | None = None
+    start = time.monotonic()
+
+    while True:
+        elapsed = time.monotonic() - start
+        remaining = max_wall_clock - elapsed
+        if remaining <= 0:
+            kill_reason = "wall_clock"
+            proc.kill()
+            break
+
+        # select with a short poll interval so we catch timeouts promptly
+        try:
+            readable, _, _ = select.select([proc.stdout], [], [], min(remaining, 5.0))
+        except (ValueError, OSError):
+            break
+
+        if readable:
+            line = proc.stdout.readline()
+            if not line:  # EOF — process exited
+                break
+            lines.append(line)
+            print(line, end="", flush=True)
+            if retry_re.search(line):
+                retry_count += 1
+                if max_ai_retries > 0 and retry_count >= max_ai_retries:
+                    kill_reason = "retry_cap"
+                    proc.kill()
+                    break
+        else:
+            # select timed out — process still running, re-check wall clock
+            if proc.poll() is not None:
+                break
+
+    try:
+        proc.stdout.close()
+    except OSError:
+        pass
+    proc.wait()
+
+    if kill_reason is not None:
+        return_code = 124 if kill_reason == "wall_clock" else 125
+        return return_code, lines
+
+    return proc.returncode, lines
+
+
+def ai_run(
+    project_dir: Path,
+    prompt: str,
+    continue_session: bool = False,
+    max_wall_clock: int = 1800,
+    max_ai_retries: int = 3,
+    feature_name: str = "",
+) -> None:
     """Run an autonomous AI session with a prompt."""
     config = _load_ai_config(project_dir)
     provider = config["provider"]
@@ -1920,6 +2028,10 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
             else:
                 print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
+            if max_wall_clock:
+                print(f"[dtl ai run] Wall-clock limit: {max_wall_clock}s")
+            if max_ai_retries:
+                print(f"[dtl ai run] Retry cap: {max_ai_retries}")
             print()
 
             # Run Claude Code in print mode (non-interactive)
@@ -1938,12 +2050,11 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
             cmd.extend(["-p", prompt])
 
             try:
-                result = subprocess.run(
+                exit_code, output_lines = _run_ai_with_limits(
                     cmd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    env={**os.environ},
+                    {**os.environ},
+                    max_wall_clock,
+                    max_ai_retries,
                 )
             except FileNotFoundError:
                 print(
@@ -1952,20 +2063,37 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
                 )
                 sys.exit(127)
 
-            # Print output
-            if result.stdout:
-                print(result.stdout)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
+            # On bail-out: stop the container and write failure report
+            if exit_code in (124, 125):
+                limit_hit = "wall_clock" if exit_code == 124 else "retry_cap"
+                print(
+                    f"\n[dtl ai run] Limit reached ({limit_hit}). "
+                    "Stopping container and writing FAILURE-REPORT.md...",
+                    file=sys.stderr,
+                )
+                subprocess.run(
+                    [
+                        "docker",
+                        "compose",
+                        "-f",
+                        str(compose_file),
+                        "stop",
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                _write_failure_report(
+                    project_dir, feature_name, limit_hit, output_lines
+                )
 
             # Send notification
             _send_notification(
                 ai_dir,
-                result.returncode,
-                result.stdout or result.stderr or "(no output)",
+                exit_code,
+                "".join(output_lines[-10:]) or "(no output)",
             )
 
-            sys.exit(result.returncode)
+            sys.exit(exit_code)
 
         elif provider == "openclaw":
             # OpenClaw is natively autonomous — just start the gateway
@@ -1992,7 +2120,19 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
         run_script = ai_dir / "run.sh"
         if provider == "claude":
             print("[dtl ai run] Running Claude Code in VM...")
-            _run_cmd(["bash", str(run_script), prompt])
+            try:
+                subprocess.run(
+                    ["bash", str(run_script), prompt],
+                    timeout=max_wall_clock if max_wall_clock else None,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                print(
+                    "\n[dtl ai run] Wall-clock timeout reached. Writing FAILURE-REPORT.md...",
+                    file=sys.stderr,
+                )
+                _write_failure_report(project_dir, feature_name, "wall_clock", [])
+                sys.exit(124)
         elif provider == "openclaw":
             print("[dtl ai run] Starting OpenClaw in VM...")
             _run_cmd(["bash", str(run_script), "start"])
@@ -2672,7 +2812,12 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
     ai_run(
-        project_dir, prompt, continue_session=getattr(args, "continue_session", False)
+        project_dir,
+        prompt,
+        continue_session=getattr(args, "continue_session", False),
+        max_wall_clock=getattr(args, "max_wall_clock", 1800),
+        max_ai_retries=getattr(args, "max_ai_retries", 3),
+        feature_name=getattr(args, "feature_name", ""),
     )
 
 
@@ -3242,6 +3387,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
     schedule_time = getattr(args, "schedule", None)
     max_failures = getattr(args, "max_failures", 3)
+    max_wall_clock = getattr(args, "max_wall_clock", 1800)
+    max_ai_retries = getattr(args, "max_ai_retries", 3)
 
     # Resolve log path: explicit --log overrides XDG default
     log_arg = getattr(args, "log", None)
@@ -3404,6 +3551,12 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         str(project_dir),
                         "--prompt",
                         prompt,
+                        "--feature-name",
+                        next_feature["name"],
+                        "--max-wall-clock",
+                        str(max_wall_clock),
+                        "--max-ai-retries",
+                        str(max_ai_retries),
                     ],
                     capture_output=True,
                     text=True,
@@ -3416,15 +3569,28 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     "[%s] No .ai/config.json — running claude directly.",
                     project_dir.name,
                 )
-                result = subprocess.run(
-                    ["claude", "--print", "-p", prompt],
-                    cwd=project_dir,
-                    capture_output=True,
-                    text=True,
-                    env={**os.environ},
-                )
-                ai_exit_code = result.returncode
-                ai_output = result.stdout + result.stderr
+                try:
+                    result = subprocess.run(
+                        ["claude", "--print", "-p", prompt],
+                        cwd=project_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=max_wall_clock if max_wall_clock else None,
+                        env={**os.environ},
+                    )
+                    ai_exit_code = result.returncode
+                    ai_output = result.stdout + result.stderr
+                except subprocess.TimeoutExpired:
+                    log.info(
+                        "[%s] AI wall-clock timeout for %s. Writing FAILURE-REPORT.md.",
+                        project_dir.name,
+                        next_feature["name"],
+                    )
+                    _write_failure_report(
+                        project_dir, next_feature["name"], "wall_clock", []
+                    )
+                    ai_exit_code = 124
+                    ai_output = ""
 
             # Check for auth failure
             if _detect_auth_failure(ai_output):
@@ -3443,9 +3609,19 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_exit_code,
                     next_feature["name"],
                 )
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                # Bail-out codes (wall-clock or retry-cap) pin the failure count
+                # so the next loop iteration marks the feature as Failed immediately.
+                if ai_exit_code in (124, 125):
+                    log.info(
+                        "[%s] Bail-out limit hit for %s — marking as permanently failed.",
+                        project_dir.name,
+                        next_feature["name"],
+                    )
+                    consecutive_failures[fail_key] = max_failures
+                else:
+                    consecutive_failures[fail_key] = (
+                        consecutive_failures.get(fail_key, 0) + 1
+                    )
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
                 continue
 
@@ -3915,6 +4091,31 @@ def main() -> None:
         action="store_true",
         help="Continue the previous conversation instead of starting fresh",
     )
+    ai_run_parser.add_argument(
+        "--max-wall-clock",
+        dest="max_wall_clock",
+        type=int,
+        default=1800,
+        metavar="SECONDS",
+        help="Hard kill the AI session after this many seconds (default: 1800 = 30 min)",
+    )
+    ai_run_parser.add_argument(
+        "--max-ai-retries",
+        dest="max_ai_retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Kill the session after N detected retry loops in AI output "
+            "(default: 3; 0 = disabled)"
+        ),
+    )
+    ai_run_parser.add_argument(
+        "--feature-name",
+        dest="feature_name",
+        default="",
+        help="Feature name to include in FAILURE-REPORT.md (set by workflow run)",
+    )
     ai_run_parser.set_defaults(func=cmd_ai_run)
 
     # -- ai config-notify --
@@ -4064,6 +4265,28 @@ def main() -> None:
             "WARNING: do not set this to a path inside any --projects directory; "
             "an untracked log file makes the git tree dirty and causes the "
             "dirty-tree skip loop."
+        ),
+    )
+    wf_run_parser.add_argument(
+        "--max-wall-clock",
+        dest="max_wall_clock",
+        type=int,
+        default=1800,
+        metavar="SECONDS",
+        help=(
+            "Hard kill each AI session after this many seconds (default: 1800 = 30 min). "
+            "Passed through to 'dtl ai run'."
+        ),
+    )
+    wf_run_parser.add_argument(
+        "--max-ai-retries",
+        dest="max_ai_retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Kill an AI session after N detected retry loops in output "
+            "(default: 3; 0 = disabled). Passed through to 'dtl ai run'."
         ),
     )
     wf_run_parser.set_defaults(func=cmd_workflow_run)
