@@ -53,6 +53,34 @@ When the user says "PM decides" or hasn't expressed a preference, the PM will de
 | Linting (Python) | `ruff check . && ruff format --check .` | Project standard |
 | Linting (Shell) | `shellcheck` | Project standard |
 
+## Hardware
+
+The workstation's hardware determines what is feasible locally (inference speed, VRAM budget, storage headroom) and what must be offloaded to cloud or deferred. Always read this section before proposing ML, media-processing, or compute-heavy features.
+
+| Component | Spec | Notes |
+|-----------|------|-------|
+| GPU | {model, e.g., RTX 2060} | {e.g., CUDA 12.x, used for local inference} |
+| VRAM | {GB} | {max model size at full precision; quantized budget} |
+| RAM | {GB} | {available to host + containers} |
+| CPU | {model / core count} | {relevant for CPU-only inference or build times} |
+| Storage | {size, type} | {/ partition; ephemeral — rebuilds weekly} |
+| Network | {e.g., Tailscale mesh, home gigabit} | {bandwidth for model pulls, API calls} |
+| GPU tenants | {services sharing the GPU} | {e.g., Ollama, ComfyUI — VRAM contention} |
+| Remote access | {e.g., Terminus SSH over Tailscale} | {how the user reaches the machine from phone} |
+
+**Current workstation example** (update when hardware changes):
+
+| Component | Spec | Notes |
+|-----------|------|-------|
+| GPU | NVIDIA RTX 2060 | CUDA 12.x; primary inference device |
+| VRAM | 6 GB | Max ~7B param at Q4; 13B+ must be CPU-offloaded or cloud |
+| RAM | 32 GB DDR4 | Comfortable for Docker Compose stacks + Ollama |
+| CPU | {CPU model} | {fill in} |
+| Storage | {size} SSD | Ephemeral `/home`; persistent state on SECRETS USB or Docker volumes |
+| Network | Home gigabit + Tailscale mesh VPN | Low-latency to Cloudflare; Tailscale for phone/remote access |
+| GPU tenants | Ollama (Qwen 2.5 7B default) | ComfyUI shares VRAM when running — don't run both at full load |
+| Remote access | Terminus SSH over Tailscale | Primary mobile interface; user manages projects from iOS/Android |
+
 ## When to Deviate
 
 Prefer existing patterns, but break the pattern when:
