@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -275,6 +276,9 @@ AI_PROVIDERS = list(AI_PROVIDERS_CONFIG.keys())
 AI_MODES = ["docker", "vm"]
 
 SSH_KEY_PATH = Path.home() / ".ssh" / "ai-sandbox-key"
+
+# Number of consecutive same-reason skips before stall notification is sent.
+WORKFLOW_STALL_THRESHOLD = 3
 
 # ---------------------------------------------------------------------------
 # CLAUDE.md template categories
@@ -2793,6 +2797,86 @@ def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
     return logger
 
 
+def _workflow_state_path(project_dir: Path) -> Path:
+    """Return path to the workflow skip-state JSON file for a project."""
+    xdg_state = os.environ.get("XDG_STATE_HOME", "")
+    state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+    return state_home / "dtl" / f"{project_dir.name}-workflow-state.json"
+
+
+def _read_workflow_state(project_dir: Path) -> dict:
+    """Read existing workflow state from the state file, or return empty dict."""
+    state_path = _workflow_state_path(project_dir)
+    if state_path.exists():
+        try:
+            with open(state_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _write_workflow_state(
+    project_dir: Path,
+    skip_reason: str,
+    consecutive_skips: int,
+) -> None:
+    """Atomically write workflow skip state for a project (temp + rename)."""
+    state_path = _workflow_state_path(project_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now()
+    next_retry = (now + datetime.timedelta(seconds=60)).isoformat(timespec="seconds")
+    state = {
+        "last_check": now.isoformat(timespec="seconds"),
+        "last_skip_reason": skip_reason,
+        "consecutive_skips": consecutive_skips,
+        "next_retry": next_retry,
+    }
+    fd, tmp = tempfile.mkstemp(dir=state_path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        Path(tmp).rename(state_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _maybe_notify_stalled(
+    project_dir: Path,
+    skip_reason: str,
+    consecutive_skips: int,
+    log: logging.Logger,
+) -> None:
+    """Invoke .ai/notify.py with a stalled message after WORKFLOW_STALL_THRESHOLD skips."""
+    if consecutive_skips < WORKFLOW_STALL_THRESHOLD:
+        return
+    notify_script = project_dir / ".ai" / "notify.py"
+    if not notify_script.exists():
+        return
+    message = (
+        f"Workflow stalled for {project_dir.name}: "
+        f"{consecutive_skips} consecutive skips ({skip_reason})"
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(notify_script), "1", message],
+            capture_output=True,
+            timeout=30,
+        )
+        log.info(
+            "[%s] Stall notification sent after %d consecutive skips (%s).",
+            project_dir.name,
+            consecutive_skips,
+            skip_reason,
+        )
+    except Exception as exc:
+        log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
+
+
 def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
     """Run lint and tests in the project. Returns (passed, output)."""
     # Detect stack from files present
@@ -3162,6 +3246,15 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             # Ensure clean tree and on develop
             if _git_is_dirty(project_dir):
                 log.info("[%s] Working tree is dirty — skipping.", project_dir.name)
+                _reason = "dirty_tree"
+                _prev = _read_workflow_state(project_dir)
+                _skip_count = (
+                    _prev.get("consecutive_skips", 0) + 1
+                    if _prev.get("last_skip_reason") == _reason
+                    else 1
+                )
+                _write_workflow_state(project_dir, _reason, _skip_count)
+                _maybe_notify_stalled(project_dir, _reason, _skip_count, log)
                 continue
 
             subprocess.run(
@@ -3183,10 +3276,20 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 consecutive_failures[fail_key] = (
                     consecutive_failures.get(fail_key, 0) + 1
                 )
+                _reason = "branch_create_failed"
+                _prev = _read_workflow_state(project_dir)
+                _skip_count = (
+                    _prev.get("consecutive_skips", 0) + 1
+                    if _prev.get("last_skip_reason") == _reason
+                    else 1
+                )
+                _write_workflow_state(project_dir, _reason, _skip_count)
+                _maybe_notify_stalled(project_dir, _reason, _skip_count, log)
                 continue
 
             # All skip gates passed — count this project as having work
             any_work_done = True
+            _write_workflow_state(project_dir, "", 0)
 
             # Update status
             _update_feature_status(plan_path, next_feature["name"], "In Progress")
@@ -3430,6 +3533,22 @@ def cmd_workflow_list(args: argparse.Namespace) -> None:
     for f in features:
         print(f"{f['name']:<{name_width}}  {f['status']:<14}  {f['branch']}")
     print()
+
+
+def cmd_workflow_status(args: argparse.Namespace) -> None:
+    """Handle 'dtl workflow status'."""
+    project_dir = Path(args.project).resolve()
+    state_path = _workflow_state_path(project_dir)
+    if not state_path.exists():
+        print(f"No workflow state found for {project_dir.name}.")
+        return
+    with open(state_path) as f:
+        state = json.load(f)
+    print(f"Project:           {project_dir.name}")
+    print(f"Last check:        {state.get('last_check', 'unknown')}")
+    print(f"Last skip reason:  {state.get('last_skip_reason', 'unknown')}")
+    print(f"Consecutive skips: {state.get('consecutive_skips', 0)}")
+    print(f"Next retry:        {state.get('next_retry', 'unknown')}")
 
 
 def cmd_workflow_next(args: argparse.Namespace) -> None:
@@ -3851,6 +3970,18 @@ def main() -> None:
         ),
     )
     wf_run_parser.set_defaults(func=cmd_workflow_run)
+
+    # -- workflow status --
+    wf_status_parser = workflow_subparsers.add_parser(
+        "status",
+        help="Print the current workflow skip state for a project",
+    )
+    wf_status_parser.add_argument(
+        "--project",
+        required=True,
+        help="Path to the project directory",
+    )
+    wf_status_parser.set_defaults(func=cmd_workflow_status)
 
     # -- Parse and dispatch --
     args = parser.parse_args()

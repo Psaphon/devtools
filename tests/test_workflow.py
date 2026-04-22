@@ -13,8 +13,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dtl import (
     _build_ai_prompt,
     _git_is_dirty,
+    _maybe_notify_stalled,
     _parse_devplan,
+    _read_workflow_state,
     _update_feature_status,
+    _workflow_state_path,
+    _write_workflow_state,
 )
 
 # ---------------------------------------------------------------------------
@@ -653,3 +657,196 @@ class TestCmdWorkflowRunLogPath:
         ):
             # Should not raise SystemExit
             cmd_workflow_run(args)
+
+
+# ---------------------------------------------------------------------------
+# Workflow stall visibility: state file writes and stall notification
+# ---------------------------------------------------------------------------
+
+
+class TestWriteWorkflowState:
+    def test_writes_json_with_required_fields(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "myproject"
+        project_dir.mkdir()
+
+        _write_workflow_state(project_dir, "dirty_tree", 2)
+
+        state_path = _workflow_state_path(project_dir)
+        assert state_path.exists()
+        state = _read_workflow_state(project_dir)
+        assert state["last_skip_reason"] == "dirty_tree"
+        assert state["consecutive_skips"] == 2
+        assert "last_check" in state
+        assert "next_retry" in state
+
+    def test_atomic_write_uses_temp_then_rename(self, tmp_path, monkeypatch):
+        """No partial file is left behind; state file appears atomically."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        _write_workflow_state(project_dir, "dirty_tree", 1)
+
+        state_path = _workflow_state_path(project_dir)
+        # No leftover .tmp- files
+        tmp_files = list(state_path.parent.glob(".tmp-*"))
+        assert tmp_files == []
+        assert state_path.exists()
+
+    def test_read_returns_empty_dict_when_no_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        assert _read_workflow_state(project_dir) == {}
+
+    def test_consecutive_skips_accumulate_across_writes(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        for i in range(1, 4):
+            _write_workflow_state(project_dir, "dirty_tree", i)
+            assert _read_workflow_state(project_dir)["consecutive_skips"] == i
+
+
+class TestMaybeNotifyStalled:
+    def test_no_notify_below_threshold(self, tmp_path):
+        from dtl import WORKFLOW_STALL_THRESHOLD
+
+        project_dir = tmp_path / "proj"
+        (project_dir / ".ai").mkdir(parents=True)
+        notify_script = project_dir / ".ai" / "notify.py"
+        notify_script.write_text("# fake")
+
+        calls = []
+        with patch("dtl.subprocess.run", side_effect=lambda *a, **kw: calls.append(a)):
+            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD - 1, MagicMock())
+
+        assert calls == []
+
+    def test_notify_called_at_threshold(self, tmp_path):
+        from dtl import WORKFLOW_STALL_THRESHOLD
+
+        project_dir = tmp_path / "proj"
+        (project_dir / ".ai").mkdir(parents=True)
+        notify_script = project_dir / ".ai" / "notify.py"
+        notify_script.write_text("# fake")
+
+        calls = []
+        with patch("dtl.subprocess.run", side_effect=lambda *a, **kw: calls.append(a) or MagicMock(returncode=0)):
+            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD, MagicMock())
+
+        assert len(calls) == 1
+        assert "notify.py" in str(calls[0])
+
+    def test_no_notify_when_script_absent(self, tmp_path):
+        from dtl import WORKFLOW_STALL_THRESHOLD
+
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        calls = []
+        with patch("dtl.subprocess.run", side_effect=lambda *a, **kw: calls.append(a)):
+            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD + 5, MagicMock())
+
+        assert calls == []
+
+
+class TestWorkflowStallVisibilityIntegration:
+    """Simulated dirty-tree skip x3 triggers exactly one notify call."""
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
+        ai_dir = tmp_path / ".ai"
+        ai_dir.mkdir(parents=True)
+        (ai_dir / "notify.py").write_text("# fake notify")
+        return tmp_path
+
+    def _run_once(self, project_dir: Path, notify_calls: list, state_dir: Path) -> None:
+        from dtl import cmd_workflow_run
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.log = None
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if any("notify.py" in str(c) for c in cmd):
+                notify_calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl.time.sleep"),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+        ):
+            cmd_workflow_run(args)
+
+    def test_dirty_tree_skip_x3_triggers_one_notify_call(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+        project_dir = self._make_project(tmp_path / "myproject")
+
+        notify_calls: list = []
+        for _ in range(3):
+            self._run_once(project_dir, notify_calls, state_dir)
+
+        assert len(notify_calls) == 1, (
+            f"Expected exactly 1 notify call after 3 consecutive skips; got {notify_calls}"
+        )
+
+    def test_state_file_written_on_each_skip(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+        project_dir = self._make_project(tmp_path / "myproject")
+
+        notify_calls: list = []
+        for i in range(1, 4):
+            self._run_once(project_dir, notify_calls, state_dir)
+            state = _read_workflow_state(project_dir)
+            assert state["consecutive_skips"] == i
+            assert state["last_skip_reason"] == "dirty_tree"
+
+
+class TestCmdWorkflowStatus:
+    def _make_project(self, tmp_path: Path) -> Path:
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
+        return tmp_path
+
+    def test_prints_no_state_when_file_absent(self, tmp_path, monkeypatch, capsys):
+        from dtl import cmd_workflow_status
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "proj")
+
+        args = MagicMock()
+        args.project = str(project_dir)
+        cmd_workflow_status(args)
+
+        out = capsys.readouterr().out
+        assert "No workflow state" in out
+
+    def test_prints_state_when_file_present(self, tmp_path, monkeypatch, capsys):
+        from dtl import cmd_workflow_status
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "proj")
+
+        _write_workflow_state(project_dir, "dirty_tree", 2)
+
+        args = MagicMock()
+        args.project = str(project_dir)
+        cmd_workflow_status(args)
+
+        out = capsys.readouterr().out
+        assert "dirty_tree" in out
+        assert "2" in out
+        assert "proj" in out
