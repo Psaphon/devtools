@@ -226,3 +226,280 @@ Add VM-based isolation option for AI sandboxes using QEMU/KVM, providing hardwar
 - Depends on QEMU/KVM being installed (`qemu-system-x86`, `libvirt-daemon-system`)
 - Cloud image (~600MB) must be pre-downloaded to USB during `download-all-packages.sh`
 - This is a larger feature — consider splitting VM scaffolding and VM runtime into separate branches if needed
+
+---
+
+## Feature: fix-workflow-spin-loop
+
+**Branch:** `feature/fix-workflow-spin-loop`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Fix the bug in `dtl workflow run` where a dirty working tree causes the outer `while True` loop to spin without sleep, generating multi-GB logs. Root cause: `any_work_done = True` is set before the dirty-tree check, so the outer loop never hits its `break`.
+
+### Acceptance Criteria
+
+- [ ] `any_work_done = True` is set **only** after all skip gates pass (dirty tree, branch-create failure, AI-run failure) — not before
+- [ ] A floor `time.sleep(60)` is added at the bottom of the outer `while True` loop as belt-and-suspenders, regardless of work state
+- [ ] New test in `tests/test_workflow.py` simulates a project with a dirty tree and asserts the loop exits after one pass (no spin) OR sleeps between iterations (rate-limited)
+- [ ] Log output for a dirty-tree-only run contains at most one skip message per project per minute (not thousands)
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Reorder `any_work_done` assignment and add floor sleep in `cmd_workflow_run` |
+| `tests/test_workflow.py` | Modify | Add dirty-tree spin-loop regression test |
+
+### Key Decisions
+
+- Prefer fixing ordering (`any_work_done = True` only after all gates) AND adding floor sleep. Defense in depth; either alone is fragile.
+- Floor sleep value: 60 seconds. Matches the existing PR-merge poll interval.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #9. Caused loom's 6-day silent stall (18GB log of `Working tree is dirty — skipping.`).
+
+---
+
+## Feature: workflow-log-defaults
+
+**Branch:** `feature/workflow-log-defaults`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+`dtl workflow run` should write its own log to an XDG-compliant location by default, outside any project under `--projects`. Writing the log into a project is a footgun: the untracked log file makes the tree dirty and the loop skips the project forever.
+
+### Acceptance Criteria
+
+- [ ] `dtl workflow run` writes its log to `~/.local/state/dtl/<first-project-name>-workflow.log` by default (creates the directory if missing)
+- [ ] `--log PATH` flag overrides the default
+- [ ] If `--log PATH` resolves to a location inside any project in `--projects`, exit with a clear error: `refusing to write log inside a project directory; this would cause the dirty-tree skip loop`
+- [ ] `dtl workflow run --help` documents the default and the footgun
+- [ ] Test covers: default path creation, `--log` override, rejection of in-project log path
+- [ ] Lint clean, tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `--log` arg, default computation, in-project rejection in `cmd_workflow_run` |
+| `tests/test_workflow.py` | Modify | Test default, override, and rejection |
+
+### Key Decisions
+
+- XDG path: `$XDG_STATE_HOME` or `~/.local/state`, then `dtl/`, then `<project>-workflow.log`.
+- In-project rejection uses `Path.resolve()` and `is_relative_to()` check against each project.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #11.
+
+---
+
+## Feature: workflow-stall-visibility
+
+**Branch:** `feature/workflow-stall-visibility`
+**Depends on:** fix-workflow-spin-loop
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+When `dtl workflow run` skips a project (dirty tree, branch-create failure, or other non-fatal skip), the skip is currently invisible to anyone not tailing the log. Make it observable via a state file and a notification after N consecutive skips.
+
+### Acceptance Criteria
+
+- [ ] On every skip, `dtl` writes `~/.local/state/dtl/<project>-workflow-state.json` with `{last_check, last_skip_reason, consecutive_skips, next_retry}`
+- [ ] After 3 consecutive skips of the same reason, invoke the project's `.ai/notify.py` (if present) with a `stalled` message
+- [ ] State file is atomically written (temp + rename)
+- [ ] `dtl workflow status --project <path>` prints the current state in a human-readable form
+- [ ] Test: simulated dirty-tree skip x3 triggers one notify call
+- [ ] Lint clean, tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Emit state file, call notify.py, add `workflow status` subcommand |
+| `tests/test_workflow.py` | Modify | Test state file writes and notification trigger |
+
+### Key Decisions
+
+- State lives alongside logs in `~/.local/state/dtl/`, not in the project (avoids the dirty-tree footgun we're trying to fix).
+- Notification uses the existing `.ai/notify.py` primitive — do not add a new notification mechanism.
+- 3-skip threshold is a constant in `dtl.py`, not configurable in v1.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #10.
+
+---
+
+## Feature: require-ci-workflow
+
+**Branch:** `feature/require-ci-workflow`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+`dtl ai attach` currently warns when `.github/workflows/ci.yml` is missing but proceeds. Without CI, `gh pr merge --auto --squash` has nothing to gate on, and the workflow loop stalls at "waiting for merge." Promote CI from advisory to required, with a scaffold option.
+
+### Acceptance Criteria
+
+- [ ] `dtl ai attach` fails hard if no `.github/workflows/*.yml` exists, unless `--no-ci` is passed
+- [ ] `dtl ai attach --scaffold-ci` writes a standard `.github/workflows/ci.yml` (ruff check + ruff format check + pytest) if missing
+- [ ] Scaffolded CI tolerates pre-pyproject state: conditional steps that skip ruff/pytest when no Python source exists yet
+- [ ] Scaffolded CI runs on PR and push to `develop` and `main`
+- [ ] Error message explains why CI is required (auto-merge gating) and how to bypass (`--no-ci`) or scaffold (`--scaffold-ci`)
+- [ ] Test: attach on project without CI fails; with `--scaffold-ci` succeeds and writes file; with `--no-ci` succeeds without writing
+- [ ] Lint clean, tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Promote CI check to required; add `--scaffold-ci` and `--no-ci` flags; inline the ci.yml template |
+| `tests/test_ai_attach.py` | Modify or Create | Cover the three CI paths |
+
+### Key Decisions
+
+- CI template is inlined into `dtl.py` (stdlib-only constraint — no file reads from installed path).
+- Default behavior is `fail` rather than `warn`: force the user to choose.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #12. The standard ci.yml pattern is already in use at `~/Projects/loom/.github/workflows/ci.yml` and morning-brief — use that as the reference.
+
+---
+
+## Feature: ai-dev-loop-break
+
+**Branch:** `feature/ai-dev-loop-break`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+The AI developer inside `dtl ai run` can burn hours retrying a broken command or stuck test. Wrap AI invocations with retry caps and wall-clock timeouts, and emit a structured failure report on giving up.
+
+### Acceptance Criteria
+
+- [ ] `dtl ai run` accepts `--max-wall-clock SECONDS` (default 1800 = 30 min per feature) — hard kill on exceed
+- [ ] `dtl ai run` accepts `--max-ai-retries N` (default 3) — counts failed "tests failed, retrying" loops inside one feature
+- [ ] When either limit is hit: container is stopped, a `FAILURE-REPORT.md` is written to the project root with last 200 log lines + which limit was hit + feature name
+- [ ] `FAILURE-REPORT.md` is gitignored by default (add to dtl's scaffolded `.gitignore` template if not already)
+- [ ] `dtl workflow run` picks up the failure, marks feature status as `Failed`, and proceeds to next feature (reusing existing `consecutive_failures` logic)
+- [ ] Test: simulated AI hang exits via wall-clock timer; simulated loop hits retry cap
+- [ ] Lint clean, tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Wrap AI subprocess with timeout + retry counter; write FAILURE-REPORT.md on bail |
+| `tests/test_ai_run.py` | Modify or Create | Cover timeout and retry-cap paths |
+
+### Key Decisions
+
+- Timeout wraps the subprocess, not the model call — we don't inspect AI output for "stuck" heuristics (unreliable).
+- Failure report is `FAILURE-REPORT.md` in project root, gitignored — easily findable but doesn't pollute commits.
+- Retry counting: parse AI stdout for `tests failed, retrying` or similar heuristic markers; if not detectable reliably, skip the retry cap and rely only on wall-clock.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #6. User pain point — "AI developer may get stuck retrying broken renders."
+
+---
+
+## Feature: workflow-watchdog
+
+**Branch:** `feature/workflow-watchdog`
+**Depends on:** workflow-stall-visibility
+**Status:** Not Started
+**Requires:** both
+
+### Goal
+
+A locally-scheduled watchdog that periodically checks all `dtl`-managed projects for stalls, absent PR activity, and anomalous log growth, then notifies on anomaly. Free (systemd user timer), complements (not replaces) the in-loop stall visibility.
+
+### Acceptance Criteria
+
+- [ ] `dtl watchdog install --projects PATH[,PATH…]` writes `~/.config/systemd/user/dtl-watchdog.{service,timer}` and prints activation commands
+- [ ] Default timer interval: 2 hours, overridable via `--interval MINUTES`
+- [ ] Service runs `dtl watchdog check --projects <paths>` which emits a pass/fail summary
+- [ ] Check detects: (a) `dtl workflow run` process absent when DEVPLAN has Not Started features; (b) dirty tree older than 24h; (c) no PR activity in 48h when Not Started features exist; (d) log growth > 100MB/day in `~/.local/state/dtl/`
+- [ ] On any anomaly, invokes every project's `.ai/notify.py` with a structured message
+- [ ] `dtl watchdog status` prints last run result and next scheduled run
+- [ ] [HUMAN] Install the timer via `systemctl --user enable --now dtl-watchdog.timer`
+- [ ] Test: fixture projects exercising each anomaly type trigger exactly one notify call
+- [ ] Lint clean, tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `watchdog` subcommand group: `install`, `check`, `status` |
+| `templates/dtl-watchdog.service.tmpl` | Create | Service unit template (inline in dtl.py if stdlib-only constraint forces it) |
+| `templates/dtl-watchdog.timer.tmpl` | Create | Timer template (same note) |
+| `tests/test_watchdog.py` | Create | Anomaly detection tests with fixture projects |
+
+### Key Decisions
+
+- Unit templates are inlined into `dtl.py` if the stdlib-only / single-file constraint demands it — check convention of existing templates.
+- Anomaly thresholds (24h dirty, 48h PR silence, 100MB/day log) are constants for v1, not configurable.
+- Notifications reuse each project's `.ai/notify.py` — do not add a new notification system.
+
+### Notes
+
+Complements the in-loop stall visibility (`workflow-stall-visibility`) — that one emits state; this one watches state and notifies humans. Both feed into the user's phone via `notify.py`.
+
+---
+
+## Feature: planning-templates-refresh
+
+**Branch:** `feature/planning-templates-refresh`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Three small additions to dtl's planning templates that make non-code and asset-heavy projects (like loom) fit the PM flow without awkward workarounds.
+
+### Acceptance Criteria
+
+- [ ] `templates/PLANNING-GUIDE.md` gets a new section titled "Non-code features" explaining that acceptance criteria can be "produces expected artifact" rather than "tests pass"
+- [ ] `templates/DEVPLAN.md` gets an optional `### Assets` section in the per-feature block, documented as "use when a feature produces non-code deliverables (workflow JSONs, prompts, reference images, etc.)"
+- [ ] `templates/PROJECTS-CONTEXT.md` gets a standing `## Hardware` section with placeholders for GPU, VRAM, RAM, CPU, storage, network, GPU tenants, and a filled example for the current workstation (RTX 2060 6GB, 32GB RAM, Tailscale, Terminus SSH)
+- [ ] All three templates remain internally consistent (no broken cross-links, no duplicate sections)
+- [ ] No code changes to `dtl.py` — template-only feature
+- [ ] Lint clean (no tests this feature; templates aren't lintable by ruff)
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `templates/PLANNING-GUIDE.md` | Modify | Add "Non-code features" section |
+| `templates/DEVPLAN.md` | Modify | Add optional Assets section |
+| `templates/PROJECTS-CONTEXT.md` | Modify or Create | Add Hardware section with example |
+
+### Key Decisions
+
+- Bundle three template changes into one feature — each is too small to be its own PR and they share the same reviewer attention.
+- No `dtl.py` changes means no tests; the acceptance is "does a reader understand how to use the new sections."
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md items #3, #4, #5. Origin: loom's media-pipeline / asset-JSON / hardware-aware planning.
