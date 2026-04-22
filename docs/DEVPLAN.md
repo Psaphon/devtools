@@ -233,7 +233,7 @@ Add VM-based isolation option for AI sandboxes using QEMU/KVM, providing hardwar
 
 **Branch:** `feature/fix-workflow-spin-loop`
 **Depends on:** none
-**Status:** In Progress
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
