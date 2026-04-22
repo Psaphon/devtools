@@ -281,6 +281,11 @@ SSH_KEY_PATH = Path.home() / ".ssh" / "ai-sandbox-key"
 # Number of consecutive same-reason skips before stall notification is sent.
 WORKFLOW_STALL_THRESHOLD = 3
 
+# Watchdog anomaly thresholds (v1 constants — not user-configurable).
+WATCHDOG_DIRTY_HOURS: int = 24  # dirty tree older than this triggers anomaly
+WATCHDOG_PR_IDLE_HOURS: int = 48  # no PR activity for this long triggers anomaly
+WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers anomaly
+
 # ---------------------------------------------------------------------------
 # CLAUDE.md template categories
 # ---------------------------------------------------------------------------
@@ -3107,6 +3112,285 @@ def _maybe_notify_stalled(
         log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
 
 
+# ---------------------------------------------------------------------------
+# Watchdog helpers
+# ---------------------------------------------------------------------------
+
+
+def _dtl_state_dir() -> Path:
+    """Return the XDG state directory used by dtl (~/.local/state/dtl)."""
+    xdg_state = os.environ.get("XDG_STATE_HOME", "")
+    state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+    return state_home / "dtl"
+
+
+def _watchdog_state_path() -> Path:
+    """Return path to the watchdog run-state JSON file."""
+    return _dtl_state_dir() / "watchdog-state.json"
+
+
+def _watchdog_read_state() -> dict:
+    """Read existing watchdog state, or return empty dict."""
+    p = _watchdog_state_path()
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _watchdog_write_state(state: dict) -> None:
+    """Atomically write watchdog state (temp + rename)."""
+    p = _watchdog_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".tmp-watchdog-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        Path(tmp).rename(p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
+    """Anomaly A: 'dtl workflow run' absent when DEVPLAN has Not Started features."""
+    plan_path = project_dir / "docs" / "DEVPLAN.md"
+    if not plan_path.exists():
+        return None
+    _, features = _parse_devplan(plan_path.read_text())
+    not_started = [f for f in features if f["status"] == "Not Started"]
+    if not not_started:
+        return None
+
+    # Check whether a matching 'dtl workflow run' process exists.
+    try:
+        result = subprocess.run(
+            ["ps", "aux"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        project_str = str(project_dir)
+        for line in result.stdout.splitlines():
+            if "workflow" in line and "run" in line and project_str in line:
+                return None  # process found — no anomaly
+    except Exception:
+        pass
+
+    return (
+        f"{project_dir.name}: {len(not_started)} Not Started feature(s) "
+        f"but no 'dtl workflow run' process detected"
+    )
+
+
+def _watchdog_check_dirty_age(project_dir: Path) -> Optional[str]:
+    """Anomaly B: dirty working tree whose most-recent change is older than WATCHDOG_DIRTY_HOURS."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # Find the most-recent mtime among all dirty files.
+    latest_mtime = 0.0
+    for line in lines:
+        # porcelain format: "XY filename" — handle renames ("old -> new")
+        fname = line[3:].strip().split(" -> ")[-1].strip('"')
+        try:
+            mtime = (project_dir / fname).stat().st_mtime
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+        except OSError:
+            pass
+
+    if latest_mtime == 0.0:
+        return None
+
+    age_hours = (time.time() - latest_mtime) / 3600.0
+    if age_hours >= WATCHDOG_DIRTY_HOURS:
+        return (
+            f"{project_dir.name}: dirty working tree, "
+            f"most recent change {age_hours:.0f}h ago "
+            f"(threshold: {WATCHDOG_DIRTY_HOURS}h)"
+        )
+    return None
+
+
+def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
+    """Anomaly C: no open-PR activity for WATCHDOG_PR_IDLE_HOURS when Not Started features exist."""
+    plan_path = project_dir / "docs" / "DEVPLAN.md"
+    if not plan_path.exists():
+        return None
+    _, features = _parse_devplan(plan_path.read_text())
+    not_started = [f for f in features if f["status"] == "Not Started"]
+    if not not_started:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--json", "number,updatedAt", "--state", "open"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return None  # gh unavailable or not a GitHub repo — skip
+        prs: list[dict] = json.loads(result.stdout or "[]")
+    except Exception:
+        return None
+
+    if not prs:
+        # No open PRs but features are In Progress — flag as possible stall.
+        in_progress = [f for f in features if f["status"] == "In Progress"]
+        if not in_progress:
+            return None
+        return f"{project_dir.name}: features 'In Progress' but no open PRs found"
+
+    # Find the most-recently-updated PR and check its age.
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        hours=WATCHDOG_PR_IDLE_HOURS
+    )
+    most_recent: Optional[datetime.datetime] = None
+    for pr in prs:
+        updated_str = pr.get("updatedAt", "")
+        try:
+            updated = datetime.datetime.fromisoformat(
+                updated_str.replace("Z", "+00:00")
+            )
+            if most_recent is None or updated > most_recent:
+                most_recent = updated
+        except (ValueError, AttributeError):
+            pass
+
+    if most_recent is not None and most_recent < cutoff:
+        idle_hours = (
+            datetime.datetime.now(datetime.timezone.utc) - most_recent
+        ).total_seconds() / 3600.0
+        return (
+            f"{project_dir.name}: no PR activity for {idle_hours:.0f}h "
+            f"(threshold: {WATCHDOG_PR_IDLE_HOURS}h) with Not Started features"
+        )
+    return None
+
+
+def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
+    """Anomaly D: dtl log growth > WATCHDOG_LOG_GROWTH_MB_DAY MB/day.
+
+    Returns (anomaly_message_or_None, current_total_bytes).
+    """
+    state_dir = _dtl_state_dir()
+    total_bytes = 0
+    if state_dir.exists():
+        for entry in state_dir.iterdir():
+            if entry.is_file() and entry.suffix in (".log", ".txt", ".json"):
+                try:
+                    total_bytes += entry.stat().st_size
+                except OSError:
+                    pass
+
+    anomaly: Optional[str] = None
+    prev_bytes: int = prev_state.get("log_size_bytes", 0)
+    prev_ts_str: str = prev_state.get("log_size_timestamp", "")
+    if prev_ts_str and prev_bytes >= 0:
+        try:
+            prev_ts = datetime.datetime.fromisoformat(prev_ts_str)
+            elapsed_hours = (datetime.datetime.now() - prev_ts).total_seconds() / 3600.0
+            if elapsed_hours > 0:
+                growth_bytes = max(0, total_bytes - prev_bytes)
+                growth_mb_per_day = (growth_bytes / (1024 * 1024)) / (
+                    elapsed_hours / 24.0
+                )
+                if growth_mb_per_day > WATCHDOG_LOG_GROWTH_MB_DAY:
+                    anomaly = (
+                        f"dtl log growth {growth_mb_per_day:.1f} MB/day "
+                        f"exceeds threshold ({WATCHDOG_LOG_GROWTH_MB_DAY} MB/day)"
+                    )
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    return anomaly, total_bytes
+
+
+def _watchdog_notify_project(
+    project_dir: Path,
+    anomalies: list[str],
+    log: logging.Logger,
+) -> None:
+    """Invoke a project's .ai/notify.py once with all anomaly details."""
+    if not anomalies:
+        return
+    notify_script = project_dir / ".ai" / "notify.py"
+    if not notify_script.exists():
+        log.info(
+            "[%s] No .ai/notify.py found; skipping notification.", project_dir.name
+        )
+        return
+    message = f"[dtl watchdog] Anomalies detected in {project_dir.name}:\n" + "\n".join(
+        f"  • {a}" for a in anomalies
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(notify_script), "1", message],
+            capture_output=True,
+            timeout=30,
+        )
+        log.info(
+            "[%s] Watchdog notification sent (%d anomaly/anomalies).",
+            project_dir.name,
+            len(anomalies),
+        )
+    except Exception as exc:
+        log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
+
+
+def _make_watchdog_service(projects_str: str) -> str:
+    """Generate systemd service unit content for the dtl watchdog."""
+    python_exe = sys.executable
+    script_path = Path(sys.argv[0]).resolve()
+    return textwrap.dedent(
+        f"""\
+        [Unit]
+        Description=dtl workflow watchdog
+        After=network.target
+
+        [Service]
+        Type=oneshot
+        ExecStart={python_exe} {script_path} watchdog check --projects {projects_str}
+        StandardOutput=journal
+        StandardError=journal
+        """
+    )
+
+
+def _make_watchdog_timer(interval_minutes: int) -> str:
+    """Generate systemd timer unit content for the dtl watchdog."""
+    return textwrap.dedent(
+        f"""\
+        [Unit]
+        Description=dtl workflow watchdog timer
+
+        [Timer]
+        OnBootSec=5min
+        OnUnitActiveSec={interval_minutes}min
+        Unit=dtl-watchdog.service
+
+        [Install]
+        WantedBy=timers.target
+        """
+    )
+
+
 def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
     """Run lint and tests in the project. Returns (passed, output)."""
     # Detect stack from files present
@@ -3775,6 +4059,143 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
         time.sleep(60)
 
 
+# ---------------------------------------------------------------------------
+# Watchdog commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_watchdog_install(args: argparse.Namespace) -> None:
+    """Handle 'dtl watchdog install'."""
+    projects = [str(Path(p).resolve()) for p in args.projects.split(",")]
+    projects_str = ",".join(projects)
+    interval_minutes: int = args.interval
+
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+
+    service_path = unit_dir / "dtl-watchdog.service"
+    timer_path = unit_dir / "dtl-watchdog.timer"
+
+    service_path.write_text(_make_watchdog_service(projects_str))
+    timer_path.write_text(_make_watchdog_timer(interval_minutes))
+
+    print(f"Wrote {service_path}")
+    print(f"Wrote {timer_path}")
+    print()
+    print("Activate with:")
+    print("  systemctl --user daemon-reload")
+    print("  systemctl --user enable --now dtl-watchdog.timer")
+
+
+def cmd_watchdog_check(args: argparse.Namespace) -> None:
+    """Handle 'dtl watchdog check'."""
+    project_dirs = [Path(p).resolve() for p in args.projects.split(",")]
+
+    log = logging.getLogger("dtl.watchdog")
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+
+    prev_state = _watchdog_read_state()
+    now_str = datetime.datetime.now().isoformat(timespec="seconds")
+    all_anomalies: list[str] = []
+
+    # Check D: log growth — evaluated once, globally.
+    log_anomaly, current_log_bytes = _watchdog_check_log_growth(prev_state)
+    if log_anomaly:
+        all_anomalies.append(log_anomaly)
+        log.info("ANOMALY D: %s", log_anomaly)
+
+    # Per-project checks.
+    for project_dir in project_dirs:
+        if not project_dir.exists():
+            log.info("Project dir not found: %s — skipping.", project_dir)
+            continue
+
+        project_anomalies: list[str] = []
+
+        anomaly_a = _watchdog_check_missing_runner(project_dir)
+        if anomaly_a:
+            project_anomalies.append(anomaly_a)
+            log.info("ANOMALY A: %s", anomaly_a)
+
+        anomaly_b = _watchdog_check_dirty_age(project_dir)
+        if anomaly_b:
+            project_anomalies.append(anomaly_b)
+            log.info("ANOMALY B: %s", anomaly_b)
+
+        anomaly_c = _watchdog_check_pr_activity(project_dir)
+        if anomaly_c:
+            project_anomalies.append(anomaly_c)
+            log.info("ANOMALY C: %s", anomaly_c)
+
+        if project_anomalies:
+            all_anomalies.extend(project_anomalies)
+            _watchdog_notify_project(project_dir, project_anomalies, log)
+
+    if all_anomalies:
+        print(f"FAIL — {len(all_anomalies)} anomaly/anomalies detected:")
+        for a in all_anomalies:
+            print(f"  • {a}")
+    else:
+        print("PASS — no anomalies detected.")
+
+    _watchdog_write_state(
+        {
+            "last_run": now_str,
+            "last_result": "FAIL" if all_anomalies else "PASS",
+            "last_anomalies": all_anomalies,
+            "log_size_bytes": current_log_bytes,
+            "log_size_timestamp": now_str,
+        }
+    )
+
+
+def cmd_watchdog_status(args: argparse.Namespace) -> None:
+    """Handle 'dtl watchdog status'."""
+    state = _watchdog_read_state()
+    if not state:
+        print("No watchdog state found. Run 'dtl watchdog check' first.")
+        return
+
+    print(f"Last run:    {state.get('last_run', 'unknown')}")
+    print(f"Last result: {state.get('last_result', 'unknown')}")
+    anomalies = state.get("last_anomalies", [])
+    if anomalies:
+        print("Anomalies:")
+        for a in anomalies:
+            print(f"  • {a}")
+
+    # Attempt to show next scheduled run from systemd.
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "list-timers",
+                "dtl-watchdog.timer",
+                "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if "dtl-watchdog" in line:
+                    print(f"\nNext scheduled run (systemd):\n  {line.strip()}")
+                    break
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Workflow commands
+# ---------------------------------------------------------------------------
+
+
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow list'."""
     plan_path = Path(args.plan).resolve()
@@ -4175,6 +4596,54 @@ def main() -> None:
     )
     ai_mcp_parser.set_defaults(func=cmd_ai_add_mcp)
 
+    # -- watchdog (subcommand group) --
+    watchdog_parser = subparsers.add_parser(
+        "watchdog",
+        help="Locally-scheduled watchdog for dtl-managed project health",
+    )
+    watchdog_subparsers = watchdog_parser.add_subparsers(dest="watchdog_command")
+
+    # -- watchdog install --
+    wd_install_parser = watchdog_subparsers.add_parser(
+        "install",
+        help=(
+            "Write ~/.config/systemd/user/dtl-watchdog.{service,timer} "
+            "and print activation commands"
+        ),
+    )
+    wd_install_parser.add_argument(
+        "--projects",
+        required=True,
+        help="Comma-separated project directories to monitor",
+    )
+    wd_install_parser.add_argument(
+        "--interval",
+        type=int,
+        default=120,
+        metavar="MINUTES",
+        help="Timer interval in minutes (default: 120)",
+    )
+    wd_install_parser.set_defaults(func=cmd_watchdog_install)
+
+    # -- watchdog check --
+    wd_check_parser = watchdog_subparsers.add_parser(
+        "check",
+        help="Run anomaly checks across monitored projects and emit pass/fail summary",
+    )
+    wd_check_parser.add_argument(
+        "--projects",
+        required=True,
+        help="Comma-separated project directories to check",
+    )
+    wd_check_parser.set_defaults(func=cmd_watchdog_check)
+
+    # -- watchdog status --
+    wd_status_parser = watchdog_subparsers.add_parser(
+        "status",
+        help="Print last watchdog run result and next scheduled run",
+    )
+    wd_status_parser.set_defaults(func=cmd_watchdog_status)
+
     # -- workflow (subcommand group) --
     workflow_parser = subparsers.add_parser(
         "workflow",
@@ -4319,6 +4788,12 @@ def main() -> None:
     if args.command == "workflow":
         if not getattr(args, "workflow_command", None):
             workflow_parser.print_help()
+            sys.exit(1)
+
+    # Handle 'watchdog' subcommand group
+    if args.command == "watchdog":
+        if not getattr(args, "watchdog_command", None):
+            watchdog_parser.print_help()
             sys.exit(1)
 
     args.func(args)

@@ -427,7 +427,7 @@ Reference: FEATURE-REQUESTS.md item #6. User pain point — "AI developer may ge
 
 **Branch:** `feature/workflow-watchdog`
 **Depends on:** workflow-stall-visibility
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** both
 
 ### Goal
@@ -436,15 +436,15 @@ A locally-scheduled watchdog that periodically checks all `dtl`-managed projects
 
 ### Acceptance Criteria
 
-- [ ] `dtl watchdog install --projects PATH[,PATH…]` writes `~/.config/systemd/user/dtl-watchdog.{service,timer}` and prints activation commands
-- [ ] Default timer interval: 2 hours, overridable via `--interval MINUTES`
-- [ ] Service runs `dtl watchdog check --projects <paths>` which emits a pass/fail summary
-- [ ] Check detects: (a) `dtl workflow run` process absent when DEVPLAN has Not Started features; (b) dirty tree older than 24h; (c) no PR activity in 48h when Not Started features exist; (d) log growth > 100MB/day in `~/.local/state/dtl/`
-- [ ] On any anomaly, invokes every project's `.ai/notify.py` with a structured message
-- [ ] `dtl watchdog status` prints last run result and next scheduled run
+- [x] `dtl watchdog install --projects PATH[,PATH…]` writes `~/.config/systemd/user/dtl-watchdog.{service,timer}` and prints activation commands
+- [x] Default timer interval: 2 hours, overridable via `--interval MINUTES`
+- [x] Service runs `dtl watchdog check --projects <paths>` which emits a pass/fail summary
+- [x] Check detects: (a) `dtl workflow run` process absent when DEVPLAN has Not Started features; (b) dirty tree older than 24h; (c) no PR activity in 48h when Not Started features exist; (d) log growth > 100MB/day in `~/.local/state/dtl/`
+- [x] On any anomaly, invokes every project's `.ai/notify.py` with a structured message
+- [x] `dtl watchdog status` prints last run result and next scheduled run
 - [ ] [HUMAN] Install the timer via `systemctl --user enable --now dtl-watchdog.timer`
-- [ ] Test: fixture projects exercising each anomaly type trigger exactly one notify call
-- [ ] Lint clean, tests pass
+- [x] Test: fixture projects exercising each anomaly type trigger exactly one notify call
+- [x] Lint clean, tests pass
 
 ### Files to Create or Modify
 
