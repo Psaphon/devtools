@@ -471,7 +471,7 @@ Complements the in-loop stall visibility (`workflow-stall-visibility`) — that 
 
 **Branch:** `feature/planning-templates-refresh`
 **Depends on:** none
-**Status:** Not Started
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal

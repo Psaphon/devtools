@@ -78,6 +78,25 @@ Each `## Feature:` block maps 1:1 to a git branch and gets fed to an autonomous 
 - **Human-only features still need structure.** Use Key Decisions to document *why*. Add a note in Notes that no files are created. Skip the Files table. Don't end with "All tests pass" (nothing to test).
 - **Always end the plan with a docs/readme feature.** The AI writes better READMEs when all the code exists.
 
+## Non-code features
+
+Some features don't produce code — they produce **artifacts**: workflow JSONs, prompt files, reference images, trained LoRA weights, audio samples, composite renders, etc. These are valid features and should appear in the DEVPLAN like any other, but the acceptance criteria and structure differ slightly.
+
+**Acceptance criteria for artifact-producing features:**
+
+Instead of "All tests pass", use **"produces expected artifact"** as the terminal criterion. Be specific about what "expected" means: file name, format, rough size, or a checksum if deterministic.
+
+Examples:
+- `[ ] Produces `outputs/workflow_base.json` loadable by ComfyUI without errors`
+- `[ ] Reference image `assets/hero_ref.png` matches approved composition (verify manually)`
+- `[ ] LoRA checkpoint `models/lora_v1.safetensors` < 300 MB`
+
+**Use the `### Assets` section** (see DEVPLAN.md template) to list non-code deliverables — their location, format, and what they're for. This replaces or supplements the Files table when outputs aren't source files.
+
+**Lint still applies** where there's lintable content (e.g., JSON schema validation, shellcheck on generation scripts). If nothing is lintable, replace "Lint clean" with a specific manual verification step.
+
+**`Requires:` field** — artifact features are usually `human` or `both`. If an AI can generate the artifact autonomously (e.g., rendering a ComfyUI workflow via API), use `ai`. If a human must approve or produce a creative asset, use `human`.
+
 ## Handoff Protocol
 
 When the user signals they're done planning, print both documents in full inside fenced code blocks, clearly labeled:

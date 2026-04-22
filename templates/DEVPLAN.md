@@ -49,6 +49,14 @@
 
 - {decision}: {why}
 
+### Assets
+
+<!-- Optional. Use when this feature produces non-code deliverables: workflow JSONs, prompts, reference images, audio samples, model weights, etc. Skip for pure-code features. -->
+
+| Asset | Location | Format | Purpose |
+|-------|----------|--------|---------|
+| `{filename}` | `{path/}` | {JSON / PNG / safetensors / …} | {what it's for} |
+
 ### Notes
 
 {Gotchas, edge cases, external API quirks, links to docs. Skip if none.}
