@@ -16,6 +16,7 @@ from dtl import (
     _maybe_notify_stalled,
     _parse_devplan,
     _read_workflow_state,
+    _run_lint_and_tests,
     _update_feature_status,
     _workflow_state_path,
     _write_workflow_state,
@@ -722,7 +723,9 @@ class TestMaybeNotifyStalled:
 
         calls = []
         with patch("dtl.subprocess.run", side_effect=lambda *a, **kw: calls.append(a)):
-            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD - 1, MagicMock())
+            _maybe_notify_stalled(
+                project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD - 1, MagicMock()
+            )
 
         assert calls == []
 
@@ -735,8 +738,13 @@ class TestMaybeNotifyStalled:
         notify_script.write_text("# fake")
 
         calls = []
-        with patch("dtl.subprocess.run", side_effect=lambda *a, **kw: calls.append(a) or MagicMock(returncode=0)):
-            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD, MagicMock())
+        with patch(
+            "dtl.subprocess.run",
+            side_effect=lambda *a, **kw: calls.append(a) or MagicMock(returncode=0),
+        ):
+            _maybe_notify_stalled(
+                project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD, MagicMock()
+            )
 
         assert len(calls) == 1
         assert "notify.py" in str(calls[0])
@@ -749,7 +757,9 @@ class TestMaybeNotifyStalled:
 
         calls = []
         with patch("dtl.subprocess.run", side_effect=lambda *a, **kw: calls.append(a)):
-            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD + 5, MagicMock())
+            _maybe_notify_stalled(
+                project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD + 5, MagicMock()
+            )
 
         assert calls == []
 
@@ -850,3 +860,81 @@ class TestCmdWorkflowStatus:
         assert "dirty_tree" in out
         assert "2" in out
         assert "proj" in out
+
+
+# ---------------------------------------------------------------------------
+# _run_lint_and_tests: pip install step
+# ---------------------------------------------------------------------------
+
+
+class TestRunLintAndTestsPipInstall:
+    """Unit tests for the editable install step in _run_lint_and_tests."""
+
+    def test_pyproject_present_triggers_pip_install(self, tmp_path):
+        """When pyproject.toml exists, pip install is invoked before tests."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        pip_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "pip" in cmd:
+                pip_calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("dtl.subprocess.run", side_effect=fake_run):
+            _run_lint_and_tests(tmp_path)
+
+        assert pip_calls, "Expected at least one pip install call"
+        assert any("pip" in " ".join(c) for c in pip_calls)
+
+    def test_no_pyproject_skips_pip_install(self, tmp_path):
+        """When no pyproject.toml, pip install is never called."""
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+
+        pip_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if "pip" in " ".join(str(c) for c in cmd):
+                pip_calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("dtl.subprocess.run", side_effect=fake_run):
+            _run_lint_and_tests(tmp_path)
+
+        assert pip_calls == [], f"Expected no pip calls, got: {pip_calls}"
+
+    def test_pip_failure_returns_failed_with_output(self, tmp_path):
+        """When pip install fails (both dev and plain), gate returns failed with output."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        def fake_run(cmd, **kwargs):
+            if "pip" in " ".join(str(c) for c in cmd):
+                return MagicMock(returncode=1, stdout="", stderr="pip error: no module")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("dtl.subprocess.run", side_effect=fake_run):
+            passed, output = _run_lint_and_tests(tmp_path)
+
+        assert not passed
+        assert "pip error" in output
+
+    def test_dev_extra_failure_falls_back_to_plain_install(self, tmp_path):
+        """If .[dev] install fails, falls back to plain editable install."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        call_count = {"n": 0}
+
+        def fake_run(cmd, **kwargs):
+            if "pip" in " ".join(str(c) for c in cmd):
+                call_count["n"] += 1
+                # First pip call (.[dev]) fails, second (plain) succeeds
+                if call_count["n"] == 1:
+                    return MagicMock(returncode=1, stdout="", stderr="no extra 'dev'")
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("dtl.subprocess.run", side_effect=fake_run):
+            passed, output = _run_lint_and_tests(tmp_path)
+
+        assert call_count["n"] == 2, "Expected fallback to second pip install"
+        assert passed

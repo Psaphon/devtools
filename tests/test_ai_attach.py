@@ -66,4 +66,6 @@ def test_attach_with_no_ci_skips_check(tmp_path):
     args = _make_args(project, no_ci=True)
     cmd_ai_attach(args)  # should not raise SystemExit(1)
 
-    assert not ci_path.exists(), "CI workflow should NOT be written when --no-ci is passed"
+    assert not ci_path.exists(), (
+        "CI workflow should NOT be written when --no-ci is passed"
+    )

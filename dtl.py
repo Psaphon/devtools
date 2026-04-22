@@ -3411,6 +3411,22 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
 
     output_parts = []
 
+    if (project_dir / "pyproject.toml").exists():
+        pip_cmd = [sys.executable, "-m", "pip", "install", "-e", ".[dev]", "--quiet"]
+        pip_result = subprocess.run(
+            pip_cmd, cwd=project_dir, capture_output=True, text=True
+        )
+        if pip_result.returncode != 0:
+            pip_cmd = [sys.executable, "-m", "pip", "install", "-e", ".", "--quiet"]
+            pip_result = subprocess.run(
+                pip_cmd, cwd=project_dir, capture_output=True, text=True
+            )
+        output_parts.append(
+            f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}"
+        )
+        if pip_result.returncode != 0:
+            return False, "\n".join(output_parts)
+
     if lint_cmd:
         result = subprocess.run(
             lint_cmd, cwd=project_dir, capture_output=True, text=True
