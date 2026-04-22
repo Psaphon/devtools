@@ -503,3 +503,44 @@ Three small additions to dtl's planning templates that make non-code and asset-h
 ### Notes
 
 Reference: FEATURE-REQUESTS.md items #3, #4, #5. Origin: loom's media-pipeline / asset-JSON / hardware-aware planning.
+
+---
+
+## Feature: workflow-install-deps-before-test
+
+**Branch:** `feature/workflow-install-deps-before-test`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make `dtl workflow finish`'s local lint/test gate install the project's declared dependencies before running pytest, so src-layout Python projects with declared deps (numpy, httpx, etc.) pass the gate. Without this, the AI's commit is rejected even when CI would pass.
+
+### Acceptance Criteria
+
+- [ ] When `pyproject.toml` exists in the project, `_run_lint_and_tests` runs `pip install -e ".[dev]"` before pytest, falling back to `pip install -e .` if the `dev` extra is missing
+- [ ] Install runs quietly (`--quiet`) so the output log isn't spammed on cache hits
+- [ ] Install failures surface clearly: if `pip install` fails, lint/test gate returns failed with the pip output captured
+- [ ] Existing projects without `pyproject.toml` (old stacks) are unaffected — no install attempt
+- [ ] A new unit test covers: (a) pyproject detected → install invoked; (b) no pyproject → install skipped; (c) pip failure → gate reports failed
+- [ ] Lint clean (`ruff check . && ruff format --check .`)
+- [ ] All tests pass (`pytest tests/`)
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | `_run_lint_and_tests` around line 3394–3415: add editable install step when `pyproject.toml` is present |
+| `tests/test_workflow.py` | Modify or Create | Unit test for the new install step |
+
+### Key Decisions
+
+- `pip install -e ".[dev]"` (not `pip install .`) — editable matches CI and keeps test-time src edits live.
+- Use the same Python interpreter that runs pytest — don't introduce a venv; dtl runs on the host.
+- `--quiet` output but capture stderr so failures are not silent.
+- Fallback to `pip install -e .` preserves compatibility with projects that don't declare a `dev` extra.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #16. Origin: loom night 1 — both scaffold and song-analysis failed the gate with `ModuleNotFoundError` despite correct code; CI (which does editable-install) would have passed. Scaffold was rescued with a manual PR + a `tests/conftest.py` sys.path shim; this feature removes the need for that workaround.
