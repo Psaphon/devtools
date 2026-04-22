@@ -2780,7 +2780,9 @@ def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
     logger.addHandler(stderr_handler)
 
     if log_path is None:
-        log_dir = Path.home() / ".local" / "share" / "dtl"
+        xdg_state = os.environ.get("XDG_STATE_HOME", "")
+        state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+        log_dir = state_home / "dtl"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "workflow.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3071,7 +3073,32 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
     schedule_time = getattr(args, "schedule", None)
     max_failures = getattr(args, "max_failures", 3)
-    log = _setup_workflow_logger()
+
+    # Resolve log path: explicit --log overrides XDG default
+    log_arg = getattr(args, "log", None)
+    if log_arg is not None:
+        log_path = Path(log_arg).resolve()
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME", "")
+        state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+        log_path = state_home / "dtl" / f"{projects[0].name}-workflow.log"
+
+    # Reject log paths inside any project directory to prevent dirty-tree skip loop
+    for proj in projects:
+        try:
+            log_path.relative_to(proj)
+            print(
+                f"error: refusing to write log inside a project directory; "
+                f"this would cause the dirty-tree skip loop\n"
+                f"  log path : {log_path}\n"
+                f"  project  : {proj}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except ValueError:
+            pass
+
+    log = _setup_workflow_logger(log_path)
 
     # Wait for scheduled time if specified
     if schedule_time:
@@ -3809,6 +3836,19 @@ def main() -> None:
         type=int,
         default=3,
         help="Skip a feature after this many consecutive failures (default: 3)",
+    )
+    wf_run_parser.add_argument(
+        "--log",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for the workflow log file. "
+            "Default: $XDG_STATE_HOME/dtl/<first-project-name>-workflow.log "
+            "(typically ~/.local/state/dtl/<project>-workflow.log). "
+            "WARNING: do not set this to a path inside any --projects directory; "
+            "an untracked log file makes the git tree dirty and causes the "
+            "dirty-tree skip loop."
+        ),
     )
     wf_run_parser.set_defaults(func=cmd_workflow_run)
 

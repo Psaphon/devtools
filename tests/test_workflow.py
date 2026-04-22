@@ -505,3 +505,151 @@ class TestCmdWorkflowRunDirtyTreeNoSpin:
             f"Expected at least one floor sleep(60) after work iteration; "
             f"got sleep calls: {sleep_calls}"
         )
+
+
+# ---------------------------------------------------------------------------
+# cmd_workflow_run log path defaults and validation
+# ---------------------------------------------------------------------------
+
+
+class TestCmdWorkflowRunLogPath:
+    """Tests for --log default, override, and in-project rejection."""
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
+        return tmp_path
+
+    def test_default_log_path_uses_xdg_state_home(self, tmp_path, monkeypatch):
+        """Default log goes to $XDG_STATE_HOME/dtl/<project>-workflow.log."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path / "myproject")
+        state_dir = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.log = None
+
+        captured_log_path: list[Path] = []
+
+        def fake_setup_logger(log_path=None):
+            captured_log_path.append(log_path)
+            return MagicMock()
+
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl._setup_workflow_logger", side_effect=fake_setup_logger),
+            patch("dtl.time.sleep"),
+        ):
+            cmd_workflow_run(args)
+
+        assert len(captured_log_path) == 1
+        lp = captured_log_path[0]
+        assert lp == state_dir / "dtl" / "myproject-workflow.log"
+
+    def test_default_log_path_fallback_without_xdg(self, tmp_path, monkeypatch):
+        """Without XDG_STATE_HOME, default falls back to ~/.local/state/dtl/."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path / "proj")
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.log = None
+
+        captured_log_path: list[Path] = []
+
+        def fake_setup_logger(log_path=None):
+            captured_log_path.append(log_path)
+            return MagicMock()
+
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl._setup_workflow_logger", side_effect=fake_setup_logger),
+            patch("dtl.time.sleep"),
+        ):
+            cmd_workflow_run(args)
+
+        assert len(captured_log_path) == 1
+        lp = captured_log_path[0]
+        expected = Path.home() / ".local" / "state" / "dtl" / "proj-workflow.log"
+        assert lp == expected
+
+    def test_log_override_passes_custom_path(self, tmp_path, monkeypatch):
+        """--log PATH passes the resolved custom path to _setup_workflow_logger."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path / "proj")
+        custom_log = tmp_path / "custom" / "run.log"
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.log = str(custom_log)
+
+        captured_log_path: list[Path] = []
+
+        def fake_setup_logger(log_path=None):
+            captured_log_path.append(log_path)
+            return MagicMock()
+
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl._setup_workflow_logger", side_effect=fake_setup_logger),
+            patch("dtl.time.sleep"),
+        ):
+            cmd_workflow_run(args)
+
+        assert len(captured_log_path) == 1
+        assert captured_log_path[0] == custom_log.resolve()
+
+    def test_log_inside_project_exits_with_error(self, tmp_path, capsys):
+        """--log pointing inside a project directory must exit with code 1."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path / "proj")
+        in_project_log = project_dir / "workflow.log"
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.log = str(in_project_log)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_workflow_run(args)
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "dirty-tree skip loop" in err
+
+    def test_default_log_outside_project_does_not_exit(self, tmp_path, monkeypatch):
+        """Default XDG log path (outside all projects) should not trigger rejection."""
+        from dtl import cmd_workflow_run
+
+        project_dir = self._make_project(tmp_path / "proj")
+        state_dir = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.log = None
+
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl.time.sleep"),
+        ):
+            # Should not raise SystemExit
+            cmd_workflow_run(args)
