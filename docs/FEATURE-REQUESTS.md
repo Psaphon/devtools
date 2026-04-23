@@ -202,3 +202,32 @@ No `pip install -e ".[dev]"` step. Two failure modes for a src-layout project:
 **Fix.** Before invoking pytest when `pyproject.toml` exists, run `pip install -e ".[dev]"` (fall back to `pip install -e .` if the `dev` extra is missing). Should be quiet on cache-hit second runs — pip is idempotent. Consider keeping a `--no-install` escape hatch for CI or sandboxed runs.
 
 **CI is unaffected.** The scaffolded `.github/workflows/ci.yml` already does `pip install -e ".[dev]"` before pytest, so the PR CI passes. The local dtl gate is the only place this bites.
+
+---
+
+## Captured 2026-04-23 — from loom night 2 post-mortem
+
+### 17. `pip install -e` in `_run_lint_and_tests` hits PEP 668 on system Python (BUG)
+
+**Severity: High.** The fix from #16 (PR #21) unblocks one failure mode but introduces another on Debian/Ubuntu system Python (PEP 668 "externally-managed environment"). Loom night 2: 0/9 features merged, same gate failure on the *install* step instead of the *test* step.
+
+**Problem.** PR #21 added `pip install -e ".[dev]" --quiet` at `dtl.py:3415`. On Ubuntu 25.10 (the workstation's stock image), `/usr/bin/pip` is marked externally-managed per PEP 668 and refuses installs into system site-packages without a flag. pip exits non-zero, `_run_lint_and_tests` returns failed, the gate rejects the AI's (correct) commit.
+
+**Observed.** Loom song-analysis AI committed `40b9237` locally — code is fine. Then the gate hit:
+
+```
+error: externally-managed-environment
+× This environment is externally managed
+hint: See PEP 668 for the detailed specification.
+```
+
+No push, no PR, status ended at "Done" locally but never became "Merged". (Clean exit — the spin-loop fix from #9 did its job and the workflow did not loop.)
+
+**Fix options.**
+1. **`--break-system-packages`** — add the flag to both `pip install -e ".[dev]"` and the `.` fallback. Safe on this ephemeral weekly-rebuild workstation; system Python is disposable. Smallest diff.
+2. **Per-project venv** — create `.dtl-venv/` at project root on first run, use its `python -m pip install` and `python -m pytest`. More correct, but heavier — also slower on first run and needs cleanup hooks.
+3. **Detect and combine** — try the plain command first; if it fails with "externally-managed-environment" in stderr, retry with `--break-system-packages`. Gives compatibility across hosts.
+
+Recommend option 1 given the ephemeral-workstation constraint. Revisit if dtl ever ships to a long-lived host.
+
+**Bootstrap note.** This is the second iteration of a self-hosting fix. Each time we add capability to the gate, we discover an environment assumption baked into the tool. Keep a short list of "environment assumptions the gate makes" near this code so future fixes don't regress.

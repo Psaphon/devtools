@@ -2,7 +2,7 @@
 
 This file summarizes the repos in User's `~/Projects` directory and the cross-cutting conventions they share. Use it when proposing stacks or features during planning sessions. Prefer existing patterns unless there's a clear reason to deviate.
 
-**Last updated:** 2026-04-09
+**Last updated:** 2026-04-23
 
 ## Active Projects
 
@@ -10,6 +10,7 @@ This file summarizes the repos in User's `~/Projects` directory and the cross-cu
 |---------|---------|-------|
 | **devtools** | CLI scaffolder and AI dev orchestrator (`dtl`) | Python 3.11, stdlib-only, single-file |
 | **morning-brief** | Automated daily news dashboard pipeline | Python 3.11, async httpx, SQLite, Ollama (Qwen 2.5 7B), Jinja2, Rich, Click, Cloudflare Pages |
+| **loom** | Overnight music-video pipeline (ComfyUI + ffmpeg) | Python 3.11, Click, httpx (async), librosa, ffmpeg subprocess, TOML, systemd timer |
 | **usb-autoinstall-public** | Ephemeral security workstation USB installer | Bash, shellcheck, Ubuntu 25.10 autoinstall, 4-partition USB |
 | **ollama** | Local LLM management (separate from morning-brief) | Ollama runtime |
 | **water-monitor-infra** | Water quality monitoring infrastructure | TBD |
@@ -30,9 +31,20 @@ This file summarizes the repos in User's `~/Projects` directory and the cross-cu
 
 **Remote access** — Tailscale mesh VPN. Phone access via Terminus SSH over Tailscale. the user manages projects from his phone via claude.ai and SSH terminal.
 
-**Scheduling** — systemd user units (`.service` + `.timer`) for batch jobs. `dtl workflow run --schedule HH:MM` for overnight autonomous development, typically 02:00 for off-peak electricity.
+**Scheduling** — systemd user units (`.service` + `.timer`) for batch jobs. `dtl workflow run --schedule HH:MM` for overnight autonomous development, typically 02:00 for off-peak electricity. GPU tenants share the 00:00–05:30 window: loom (00:00–05:30), morning-brief (starts 05:30).
 
 **Hosting** — Cloudflare Pages for static sites, Cloudflare Workers for auth-gated APIs. Free tier is sufficient.
+
+**Planning artifacts — DEVPLAN vs FEATURE-REQUESTS** — every project's `docs/` holds two planning documents with distinct roles:
+
+- **`DEVPLAN.md`** — committed, concrete work queue. Each `## Feature:` has a branch name, acceptance criteria, file list, and a `Status:` field. `dtl workflow run` picks the next `Status: Not Started` feature and builds it.
+- **`FEATURE-REQUESTS.md`** — backlog: ideas, open problems, parked items. Entries start here. When concrete enough to spec (branch name + files + acceptance criteria), they get **promoted** to `DEVPLAN.md` and marked "Promoted to DEVPLAN {date}" in the backlog stub.
+
+Don't conflate them. A loose idea belongs in FEATURE-REQUESTS; a shippable branch belongs in DEVPLAN.
+
+**Workflow supervision** — `dtl watchdog install` scaffolds a systemd user timer that runs anomaly detection (dead process, dirty-tree stall, PR silence, log growth) every N hours and notifies via each project's `.ai/notify.py`. Use this instead of tailing logs manually.
+
+**Off-workstation access** — the user manages projects primarily from iOS via Terminus SSH over Tailscale. Overnight workflow runs should be launchable and observable from the phone (logs readable, PR activity visible via `gh` CLI).
 
 ## Default Stack Choices
 
