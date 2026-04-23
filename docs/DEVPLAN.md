@@ -510,7 +510,7 @@ Reference: FEATURE-REQUESTS.md items #3, #4, #5. Origin: loom's media-pipeline /
 
 **Branch:** `feature/workflow-install-deps-before-test`
 **Depends on:** none
-**Status:** Done
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
@@ -544,3 +544,42 @@ Make `dtl workflow finish`'s local lint/test gate install the project's declared
 ### Notes
 
 Reference: FEATURE-REQUESTS.md item #16. Origin: loom night 1 — both scaffold and song-analysis failed the gate with `ModuleNotFoundError` despite correct code; CI (which does editable-install) would have passed. Scaffold was rescued with a manual PR + a `tests/conftest.py` sys.path shim; this feature removes the need for that workaround.
+
+---
+
+## Feature: workflow-install-deps-pep668
+
+**Branch:** `feature/workflow-install-deps-pep668`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make the editable-install step added in PR #21 tolerate PEP 668 "externally-managed" environments (Debian/Ubuntu system Python). Without this, every Python project on the ephemeral workstation fails the local gate on install — blocking every src-layout project from shipping, regardless of whether its code is correct.
+
+### Acceptance Criteria
+
+- [ ] `pip install -e ".[dev]"` in `_run_lint_and_tests` (dtl.py:3414–3428) passes `--break-system-packages` to bypass PEP 668 rejection
+- [ ] Same flag applied to the `.` fallback install
+- [ ] Existing behavior on non-PEP-668 hosts (e.g., CI runners, venvs) is unchanged — `--break-system-packages` is a no-op outside externally-managed environments
+- [ ] Unit test: given a mock pip invocation, the command string includes `--break-system-packages`
+- [ ] A short comment in code cites PEP 668 + ephemeral-workstation rationale so the flag isn't mistaken for a hack
+- [ ] All tests pass (`pytest tests/`)
+- [ ] Lint clean (`ruff check . && ruff format --check .`)
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `--break-system-packages` to both pip commands in `_run_lint_and_tests` (lines ~3415 and ~3420) |
+| `tests/test_workflow.py` | Modify | Assert the pip command includes the flag |
+
+### Key Decisions
+
+- `--break-system-packages` chosen over per-project venv because the workstation is ephemeral (rebuilt weekly from USB); system Python is disposable. Venv would add first-run latency and cleanup surface without a durable benefit in this environment.
+- Flag is applied unconditionally, not conditionally on detecting PEP 668. Unconditional is idempotent and simpler; pip ignores the flag on hosts that don't enforce PEP 668.
+
+### Notes
+
+Reference: FEATURE-REQUESTS.md item #17. Origin: loom night 2 — `workflow-install-deps-before-test` (PR #21) ran cleanly at the logic level but pip refused to install into system site-packages with `error: externally-managed-environment`. Clean exit, no spin-loop (#9 fix held), but zero features merged. This is the follow-up fix to unblock Python projects on this workstation.
