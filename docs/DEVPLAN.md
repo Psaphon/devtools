@@ -551,7 +551,7 @@ Reference: FEATURE-REQUESTS.md item #16. Origin: loom night 1 — both scaffold 
 
 **Branch:** `feature/workflow-install-deps-pep668`
 **Depends on:** none
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** ai
 
 ### Goal
