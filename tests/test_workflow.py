@@ -886,6 +886,9 @@ class TestRunLintAndTestsPipInstall:
 
         assert pip_calls, "Expected at least one pip install call"
         assert any("pip" in " ".join(c) for c in pip_calls)
+        assert any("--break-system-packages" in c for c in pip_calls), (
+            "pip command must include --break-system-packages (PEP 668 / ephemeral workstation)"
+        )
 
     def test_no_pyproject_skips_pip_install(self, tmp_path):
         """When no pyproject.toml, pip install is never called."""
