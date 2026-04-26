@@ -583,3 +583,89 @@ Make the editable-install step added in PR #21 tolerate PEP 668 "externally-mana
 ### Notes
 
 Reference: FEATURE-REQUESTS.md item #17. Origin: loom night 2 — `workflow-install-deps-before-test` (PR #21) ran cleanly at the logic level but pip refused to install into system site-packages with `error: externally-managed-environment`. Clean exit, no spin-loop (#9 fix held), but zero features merged. This is the follow-up fix to unblock Python projects on this workstation.
+
+---
+
+## Feature: prompt-hygiene-pr-suffix
+
+**Branch:** `feature/prompt-hygiene-pr-suffix`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Stop the AI from emitting `(#N)` PR-number suffixes in commit subjects. GitHub appends one automatically on squash-merge, so an AI-authored commit subject ending in `(#N)` produces a duplicate suffix on `develop` (`feat: foo (#4) (#4)`). Verified live in `loom@a5d3a32`.
+
+The fix is a one-line addition to the AI prompt explaining that GitHub adds the PR-number suffix on squash, and the AI must not include one.
+
+### Acceptance Criteria
+
+- [ ] `_build_ai_prompt` (dtl.py:2990–3005) appends a sentence telling the AI not to include a `(#N)` PR-number suffix in commit subjects (GitHub adds it on squash-merge)
+- [ ] Existing `_build_ai_prompt` tests in `tests/test_workflow.py:192–212` still pass
+- [ ] One new test asserts the warning string is present in the returned prompt
+- [ ] Lint clean (`ruff check . && ruff format --check .`)
+- [ ] All tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Append the no-PR-suffix instruction to `_build_ai_prompt` (lines ~2998–3004) |
+| `tests/test_workflow.py` | Modify | Add a test asserting `_build_ai_prompt` output contains the no-suffix warning |
+
+### Key Decisions
+
+- Warning lives in the prompt string, not as a post-commit rewrite step. Cheaper, no commit history mutation, and the AI learns the rule rather than having dtl silently fix it.
+- The wording must explicitly say *why* (squash-merge appends it). The AI mimics what it sees in `git log`, where every prior commit ends in `(#N)`. Without the *why*, the rule looks arbitrary and risks being ignored when the AI is uncertain.
+
+### Notes
+
+Origin: loom night 3 (2026-04-24) feature/comfyui-client AI commit `29bfe0c` had subject `feat: async ComfyUI client — submit, poll, fetch outputs (#4)`. Squash-merged on 2026-04-26 as `a5d3a32 feat: async ComfyUI client ... (#4) (#4)`. The duplication is a feedback loop: each squash-merged commit reinforces the AI's belief that suffixes belong in subjects.
+
+Cross-reference: AI prompt design feedback in PM memory has long emphasized "Do NOT push" and "include exact commit msg" — this adds "do NOT include `(#N)`" to that list.
+
+---
+
+## Feature: scheduled-run-freshness
+
+**Branch:** `feature/scheduled-run-freshness`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make `dtl workflow run --schedule HH:MM` execute against the current on-disk `dtl.py` at fire time, not the in-memory copy from process start. Today, a process launched at 15:00 with `--schedule 02:00` will run the 02:00 work using whatever `dtl.py` was on disk at 15:00 — even if dtl was updated overnight. This caused loom night 3 to fail PEP 668 even after devtools merged the fix at 01:02.
+
+The fix uses **subprocess delegation**: when `--schedule` is set, the parent process sleeps until the target time, then spawns a fresh `subprocess.run([sys.executable, sys.argv[0], "workflow", "run", "--projects", ...])` *without* `--schedule`. The child reads disk-current `dtl.py` at exec time. Parent waits for child and exits with the child's return code.
+
+### Acceptance Criteria
+
+- [ ] When `--schedule HH:MM` is set, `cmd_workflow_run` (dtl.py:3707) sleeps until target, then `subprocess.run`s a fresh invocation of itself **without** `--schedule`, forwarding all other args (`--projects`, `--max-failures`, `--max-wall-clock`, `--max-ai-retries`, `--log` if present)
+- [ ] Parent process exits with the child's returncode
+- [ ] When `--schedule` is *not* set, behavior is unchanged (no subprocess; runs in-process as today)
+- [ ] One new test in `tests/test_workflow.py` patches `subprocess.run` and asserts: (a) called with `[sys.executable, sys.argv[0], "workflow", "run", "--projects", ...]` (b) `--schedule` is NOT in the child argv (c) parent exits with the patched returncode
+- [ ] Existing `cmd_workflow_run` tests still pass
+- [ ] Lint clean
+- [ ] All tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | After the `time.sleep(wait_secs)` in `cmd_workflow_run` (line ~3754), short-circuit into `subprocess.run` of self without `--schedule`; return the child's exit code |
+| `tests/test_workflow.py` | Modify | New test class for `--schedule` subprocess delegation |
+
+### Key Decisions
+
+- **Subprocess over `os.execv`**: parent stays alive as a sentinel, can log "spawning child at HH:MM", and the child's exit code is observable to the parent. `execv` would replace the parent — simpler, but loses the spawn log line and conflates parent/child state.
+- **Subprocess over `importlib.reload`**: dtl.py is single-file stdlib-only; reload semantics for `__main__` are awkward and reload-ed modules can keep references to old globals. A fresh subprocess is unambiguous.
+- **No env-var hack** (e.g., `DTL_SKIP_SCHEDULE=1`): the child simply doesn't pass `--schedule`. Argparse already rejects unknown args; no magic.
+- **Schedule semantics preserved**: parent still does the `time.sleep` — only the actual workflow execution moves to the child. Tomorrow's overnight run remains a single user-visible process tree (parent + one child).
+
+### Notes
+
+Origin: loom night 3 (2026-04-24). Devtools workflow scheduled 01:00, loom workflow scheduled 02:00, both processes launched 15:32 the prior day. Devtools fix landed at 01:02; loom hit the same PEP 668 error at 02:03 because its in-memory `dtl.py` predated the fix. With this freshness fix, the devtools merge at 01:02 would automatically benefit the 02:00 loom child, eliminating the cross-project ordering hazard.
+
+Diagnostic confirmation: `loom-workflow-night3.log` shows `02:00:00 [loom] Starting feature: comfyui-client` followed by `02:03:34 [loom] Lint/tests failed... error: externally-managed-environment` — same error already fixed in devtools/dtl.py on disk by 01:02.
