@@ -1,196 +1,113 @@
 <!--
-  HANDOFF-BRIEF.md — session-to-session continuity artifact
+  HANDOFF-BRIEF.md — session-to-session continuity artifact.
 
-  The outgoing PM produces an instance of this at the END of every session.
-  The incoming PM (Claude, Codex, GPT-5, or any other agent) receives it as
-  their starting state and uses it to resume work without user onboarding.
+  The outgoing PM produces an instance of this at the end of each session.
+  The incoming PM reads it FIRST, runs Verify Before Acting, then proceeds.
 
-  Rules:
+  Rules for writing one:
+  - Lead with the lead. The TL;DR section is the only thing that's guaranteed
+    to be read in full. Bury nothing important after it.
   - Pure markdown. No tool-specific (TodoWrite, memory/, mcp__*) references.
   - Absolute file paths only. Specific PIDs, log paths, commit SHAs.
-  - The brief is a SNAPSHOT — it can go stale within hours. The incoming PM
-    MUST verify key claims before acting (see "Verify before acting" below).
+  - Prefer cutting to padding. Anything derivable from `git log`, the current
+    repo state, or CLAUDE.md does NOT belong here. Brief is a delta + snapshot.
+  - "Awaiting User Decision" is a separate section by design — items there
+    must NEVER appear in "Action Items", because the next PM will execute them.
   - Delete this comment block when producing an instance.
 -->
 
 # PM Handoff Brief — {YYYY-MM-DD HH:MM} {timezone}
 
-**Outgoing PM session id:** {optional — e.g., conversation hash or user label}
-**Next scheduled event:** {e.g., `dtl workflow run` at 02:00 local on /home/comp/Projects/loom, or "none"}
+## TL;DR
 
----
-
-## Read First (in this order)
-
-1. `/home/comp/Projects/CLAUDE.md` — your role, workflow, rules.
-2. `/home/comp/Projects/.claude/rules/gitflow.md` and `.claude/rules/security.md` — hard constraints.
-3. `/home/comp/Projects/devtools/templates/PROJECTS-CONTEXT.md` — workstation specs, cross-project conventions.
-4. This brief, from the top.
+{1-3 lines. The single most important fact + the most urgent action (if any). If something failed overnight, lead with that. If everything is healthy and idle, say so.}
 
 ---
 
 ## Verify Before Acting
 
-Any claim below with a timestamp is a snapshot. If more than a few hours have passed, verify before taking action. Minimum verification:
+The brief goes stale fast. Run these and reconcile against the rest of the document. If anything contradicts, trust what you observe.
 
 ```bash
-# What workflow processes are alive right now?
-pgrep -af 'python3.*dtl.py workflow run'
-
-# Per project: is the tree clean? any open PRs?
-for p in ~/Projects/*/; do
-  [ -d "$p/.git" ] || continue
-  name=$(basename "$p")
-  echo "=== $name ==="
-  cd "$p" && git status --porcelain && git log --oneline -1
+pgrep -af 'python3.*dtl.py workflow run' || echo "no workflow processes"
+for p in ~/Projects/*/; do [ -d "$p/.git" ] || continue; n=$(basename "$p"); cd "$p"
+  echo "=== $n ==="; git status --porcelain; echo "branch: $(git branch --show-current)"; git log --oneline -1
 done
-gh pr list --state open -R Psaphon/loom
-gh pr list --state open -R Psaphon/devtools
-gh pr list --state open -R Psaphon/morning-brief
-
-# Any workflow logs grown recently?
+for r in Psaphon/loom Psaphon/devtools Psaphon/morning-brief; do
+  echo "=== $r ==="; gh pr list -R "$r" --state open
+done
 ls -lah ~/.local/state/*.log 2>/dev/null
+systemctl --user list-timers --no-pager | grep -E 'dtl|NEXT'
 ```
-
-If any fact contradicts the brief, trust what you observe and flag the discrepancy to the user.
 
 ---
 
-## Projects At A Glance
+## Status
 
-| Project | Current Branch | Tree | Open PRs | Active Workflow | Next Unblocked Feature |
-|---------|----------------|------|----------|-----------------|------------------------|
-| loom | {develop} | {clean/dirty} | {list #s or none} | {PID + schedule or none} | {feature-name or "none — DEVPLAN empty"} |
-| devtools | | | | | |
-| morning-brief | | | | | |
-| {others} | | | | | |
+| Project | Branch | Tree | Open PRs | Next Unblocked Feature |
+|---------|--------|------|----------|------------------------|
+| loom | {develop} | {clean} | {none / #N} | {feature-name or "—"} |
+| devtools | | | | |
+| morning-brief | | | | |
 
 ---
 
 ## Background Processes
 
-| PID | Command | Log path | Scheduled start | Notes |
-|-----|---------|----------|-----------------|-------|
-| {pid} | `dtl workflow run --projects ...` | `~/.local/state/...log` | {HH:MM or "running"} | {what it's doing} |
+If none, say "None scheduled" and skip the table.
 
-If there are zombie processes from previous days, **kill them before launching anything new** — they hold the git index and cause mysterious stash/checkout failures.
+| PID | Command | Log path | Fires at | Notes |
+|-----|---------|----------|----------|-------|
+| {pid} | `dtl workflow run --projects ...` | `~/.local/state/...log` | {HH:MM} | {what it's doing} |
 
----
-
-## Last Session Summary
-
-**Session date:** {YYYY-MM-DD}
-**Duration:** {rough estimate}
-
-What happened (chronological, prose, keep under 300 words):
-
-- {change 1}
-- {change 2}
-
-What merged (PRs):
-
-- #{num} — {title} — {project}
-- ...
-
-What failed or got stuck:
-
-- {item} — {why}
+Watchdog: {`active` / `not installed`}. Next fire: {HH:MM, from `systemctl --user list-timers`}.
 
 ---
 
-## Overnight Run Results (if applicable)
+## Action Items
 
-If a workflow was scheduled overnight, report its results here. If none was scheduled, delete this section.
+Ordered by priority. Each item must be executable without asking the user.
 
-**Started:** {HH:MM}
-**Exited:** {HH:MM or still running}
-**Features attempted:** {N}
-**Features merged:** {N}
+### Critical — {one-line title}
+**What:** {description, 1-2 sentences}
+**Why:** {impact}
+**Do:** {concrete command or steps}
 
-Per feature:
-- `{feature-name}`: {merged #PR / failed at {stage} / in progress}
+### High — {one-line title}
+{...}
 
-If anything failed, include the first 10 lines of the error from the log.
+### Medium — {one-line title}
+{...}
 
----
-
-## Open Issues Requiring Action
-
-Prioritize by severity. For each:
-
-### {Critical | High | Medium | Low} — {one-line title}
-
-**What:** {description}
-**Why it matters:** {impact}
-**Suggested action:** {concrete next step with command if applicable}
-**Blocked on:** {user input / nothing — ready to execute}
+(If no action items, write "None — handoff is informational only.")
 
 ---
 
-## Items Awaiting User Input
+## Awaiting User Decision
 
-Things the incoming PM should not resolve unilaterally:
+Items the next PM must NOT execute. Each must give the user enough context to decide.
 
-- {item with enough context for user to decide}
+- {item with options A/B/C and tradeoffs} — {context}
 
----
-
-## Parked / Low Priority
-
-Mentioned here so the incoming PM doesn't re-file them:
-
-- {item} — parked reason
+(If none, write "None.")
 
 ---
 
-## Immediate Next Steps For The Incoming PM
+## Notes
 
-Ordered list of concrete actions. Aim for the PM to be productive within 5 minutes of reading this.
+Surgical facts the next PM may not derive from the repo. Skip anything that's already in `CLAUDE.md` or a project's `CLAUDE.md`.
 
-1. {Action}: `{command or file to read}`
-2. {Action}: ...
-3. {Action}: ...
-
----
-
-## Project-Specific Notes Worth Remembering
-
-Short, surgical facts the next PM may not derive from reading the repo:
-
-- **{project}**: {fact, e.g., "src-layout; `tests/conftest.py` has a sys.path shim because dtl's install step was broken before PR #21"}
-- ...
+- **{project}**: {non-obvious fact, e.g., "src-layout; conftest.py has a sys.path shim — don't delete"}
+- **Infra**: {e.g., "PEP 668 system Python — pip needs --break-system-packages"}
 
 ---
 
-## Known Infrastructure Quirks
-
-Ephemeral-workstation-specific or bootstrap-specific landmines:
-
-- **PEP 668** on system Python: `pip install` needs `--break-system-packages` or a venv.
-- **Ollama GPU tenancy**: stop before heavy VRAM tasks.
-- **ComfyUI**: external service; loom assumes it's running but does not manage it.
-- (add project-specific quirks as they emerge)
-
----
-
-## Files Referenced In This Brief
-
-So the incoming PM can pre-load context:
-
-- `/home/comp/Projects/{project}/docs/DEVPLAN.md`
-- `/home/comp/Projects/{project}/docs/FEATURE-REQUESTS.md`
-- `/home/comp/Projects/devtools/dtl.py:{line-range}` — {what's there}
-- {other paths}
-
----
-
-## End of brief
-
-If you (incoming PM) can answer these without re-asking the user, the brief did its job:
-
-1. What's the single most important thing to verify first?
-2. Is any workflow process running right now, and what is it doing?
-3. What was the last merge, and what's the next unblocked feature?
-4. Is there a user decision outstanding?
-
-If you can't answer any of these from the brief, the outgoing PM failed — flag it and proceed with caution.
+<!--
+  Self-test before handing this off: can the incoming PM answer these from
+  the brief alone, without re-asking the user?
+    1. What's the single most important verify-first fact?
+    2. Is anything running right now?
+    3. Last merge, next unblocked feature, per project?
+    4. Any user decision outstanding?
+  If you can't answer all four from your own brief, fix it before posting.
+-->
