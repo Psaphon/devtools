@@ -669,3 +669,58 @@ The fix uses **subprocess delegation**: when `--schedule` is set, the parent pro
 Origin: loom night 3 (2026-04-24). Devtools workflow scheduled 01:00, loom workflow scheduled 02:00, both processes launched 15:32 the prior day. Devtools fix landed at 01:02; loom hit the same PEP 668 error at 02:03 because its in-memory `dtl.py` predated the fix. With this freshness fix, the devtools merge at 01:02 would automatically benefit the 02:00 loom child, eliminating the cross-project ordering hazard.
 
 Diagnostic confirmation: `loom-workflow-night3.log` shows `02:00:00 [loom] Starting feature: comfyui-client` followed by `02:03:34 [loom] Lint/tests failed... error: externally-managed-environment` — same error already fixed in devtools/dtl.py on disk by 01:02.
+
+---
+
+## Feature: preflight-auto-merge-check
+
+**Branch:** `feature/preflight-auto-merge-check`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Add a preflight check at the start of `dtl workflow run` that detects whether each target project's GitHub repo has `allow_auto_merge=true`. Behavior on a failed check depends on `--schedule`:
+
+- **With `--schedule`:** refuse to start. Log a clear error naming the affected repo(s) and exit non-zero before sleeping. A scheduled run on a repo without auto-merge stalls the polling loop indefinitely overnight (no human awake to merge).
+- **Without `--schedule`:** print a one-shot warning banner naming the repo(s) and continue. The existing manual-merge polling loop already handles human-merged PRs correctly — the user is interactive and merges via the GitHub app.
+
+This closes the night-4 stall pattern on `Psaphon/loom`, where the scheduled 02:30 run sat 14h on PR #6 because `allow_auto_merge` cannot be enabled on private repos under a Free-plan account (the API silently no-ops the PATCH).
+
+### Acceptance Criteria
+
+- [ ] New helper `_preflight_auto_merge(project_dir: Path) -> Optional[bool]` calls `gh api repos/<owner>/<name> --jq .allow_auto_merge` and returns the boolean. Returns `None` (skip) if the remote is not a GitHub URL or `gh` is unavailable.
+- [ ] Owner/name parsed from `git remote get-url origin`; reuse any existing dtl utility for this — do not duplicate parsing.
+- [ ] At the top of `cmd_workflow_run` (dtl.py line ~3707, before the schedule sleep), iterate each `--projects` path; collect those where preflight returns `False`.
+- [ ] If any returned `False` AND `--schedule` is set: log the offending repos, the recommended fixes ("upgrade to GitHub Pro for private repos, or run without --schedule"), and exit non-zero before any sleep.
+- [ ] If any returned `False` AND `--schedule` is NOT set: log a clear one-shot WARNING banner naming the repos and noting "PRs require manual merge via GitHub app". Continue execution.
+- [ ] Returned `None` (skipped repos) does not block — log a single info line.
+- [ ] Two new tests in `tests/test_workflow.py`: (a) preflight + `--schedule` + a fixture with `allow_auto_merge=False` exits non-zero and `time.sleep` is never called; (b) preflight without `--schedule` + same fixture proceeds and the warning banner is in captured logs.
+- [ ] Existing `cmd_workflow_run` and scheduled-run-freshness subprocess-delegation tests still pass.
+- [ ] Lint clean (`ruff check . && ruff format --check .`).
+- [ ] All tests pass.
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_preflight_auto_merge` helper; call it at top of `cmd_workflow_run`; gate `--schedule` on result |
+| `tests/test_workflow.py` | Modify | Two new tests covering `--schedule` rejection and warning-banner paths |
+
+### Key Decisions
+
+- **GitHub API is the source of truth.** `allow_auto_merge` is a server-side property — only `gh api` can read it accurately. Do not infer from local config or cache the value.
+- **`--schedule` is the line.** Without `--schedule`, the user is interactive and can merge from the GitHub mobile app. The polling loop already handles human-merged PRs (verified live on loom PR #6, which was human-merged after a 14h wait and the workflow correctly resumed). With `--schedule`, the user is asleep and a stall is silent — refuse the run.
+- **Do NOT auto-enable `allow_auto_merge`.** On Free-plan + private repos, GitHub silently no-ops `PATCH allow_auto_merge=true` — the PATCH returns 200, the field stays `false`. Pretending we fixed it is worse than refusing to start. Surface the constraint, don't paper over it.
+- **Skip cleanly when `gh` or remote is unsuitable.** Local-only repos and non-GitHub remotes should not be blocked by the preflight — return `None` and proceed.
+
+### Notes
+
+Origin: loom night 4 (2026-04-27). Scheduled 02:30 run on `Psaphon/loom` produced PR #6, which `gh pr merge --auto --squash` could not queue ("Auto-merge not available — manual merge required"). The polling loop sat 14h until human merge at 17:32 EDT.
+
+Why GitHub blocks the setting: `allow_auto_merge` requires GitHub Pro on private repos. Free-plan accounts can enable it freely on public repos. The `Psaphon` account holds three public repos with `allow_auto_merge=true` (devtools, morning-brief, Prompt-Fishing) and one private repo where the setting cannot be enabled (loom). Branch protection has the same gate — it returns 403 with the upgrade message.
+
+Until Psaphon upgrades to GitHub Pro (~$4/mo), private-repo development uses interactive `dtl workflow run` (no `--schedule`). The user merges PRs from the GitHub mobile app as they appear.
+
+Cross-reference: night-4 brief misdiagnosed this as "auto-merge wasn't enabled on loom" — implying a setting flip would fix it. The actual constraint is plan + visibility, not setting state. This feature makes that distinction explicit at runtime.
