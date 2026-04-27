@@ -41,9 +41,11 @@ import json
 import logging
 import os
 import re
+import select
 import subprocess
 import sys
 import textwrap
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -276,6 +278,14 @@ AI_MODES = ["docker", "vm"]
 
 SSH_KEY_PATH = Path.home() / ".ssh" / "ai-sandbox-key"
 
+# Number of consecutive same-reason skips before stall notification is sent.
+WORKFLOW_STALL_THRESHOLD = 3
+
+# Watchdog anomaly thresholds (v1 constants — not user-configurable).
+WATCHDOG_DIRTY_HOURS: int = 24  # dirty tree older than this triggers anomaly
+WATCHDOG_PR_IDLE_HOURS: int = 48  # no PR activity for this long triggers anomaly
+WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers anomaly
+
 # ---------------------------------------------------------------------------
 # CLAUDE.md template categories
 # ---------------------------------------------------------------------------
@@ -392,6 +402,9 @@ def make_gitignore(stack: dict) -> str:
 
         # AI sandbox
         .ai/config.json
+
+        # AI failure reports (written by dtl ai run on timeout/retry-cap)
+        FAILURE-REPORT.md
     """)
     return common + "\n" + stack["gitignore_extra"]
 
@@ -666,6 +679,54 @@ def make_ci_workflow(name: str, stack: dict) -> str:
                 env:
                   GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
     """)
+
+
+_CI_YML_SCAFFOLD = textwrap.dedent("""\
+    name: CI
+
+    on:
+      push:
+        branches: [main, develop]
+      pull_request:
+        branches: [main, develop]
+
+    permissions:
+      contents: read
+
+    jobs:
+      lint-and-test:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Detect Python source
+            id: pycheck
+            run: |
+              if find . -name "*.py" ! -path "./.git/*" ! -path "./.ai/*" | grep -q .; then
+                echo "found=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "found=false" >> "$GITHUB_OUTPUT"
+              fi
+
+          - uses: actions/setup-python@v5
+            if: steps.pycheck.outputs.found == 'true'
+            with:
+              python-version: "3.12"
+
+          - name: Lint (ruff)
+            if: steps.pycheck.outputs.found == 'true'
+            run: pip install ruff && ruff check .
+
+          - name: Format check (ruff)
+            if: steps.pycheck.outputs.found == 'true'
+            run: ruff format --check .
+
+          - name: Test (pytest)
+            if: steps.pycheck.outputs.found == 'true'
+            run: |
+              pip install pytest
+              pytest --tb=short -q; RET=$?; [ $RET -eq 5 ] && exit 0 || exit $RET
+""")
 
 
 def make_cd_workflow(name: str) -> str:
@@ -1839,7 +1900,111 @@ def ai_status(project_dir: Path) -> None:
         _run_cmd(["bash", str(vm_script), "status"])
 
 
-def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> None:
+def _write_failure_report(
+    project_dir: Path,
+    feature_name: str,
+    limit_hit: str,
+    output_lines: list[str],
+) -> None:
+    """Write FAILURE-REPORT.md to the project root on bail-out."""
+    last_200 = output_lines[-200:] if len(output_lines) > 200 else output_lines
+    limit_desc = {
+        "wall_clock": "Wall-clock timeout exceeded",
+        "retry_cap": "AI retry cap exceeded",
+    }.get(limit_hit, limit_hit)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = (
+        f"# AI Failure Report\n\n"
+        f"**Generated:** {ts}  \n"
+        f"**Feature:** {feature_name or '(unknown)'}  \n"
+        f"**Limit hit:** {limit_desc}  \n\n"
+        f"## Last 200 Lines of Output\n\n"
+        f"```\n" + "".join(last_200) + "```\n"
+    )
+    report_path = project_dir / "FAILURE-REPORT.md"
+    report_path.write_text(report)
+
+
+def _run_ai_with_limits(
+    cmd: list[str],
+    env: dict,
+    max_wall_clock: int,
+    max_ai_retries: int,
+) -> tuple[int, list[str]]:
+    """Run a subprocess, streaming output while enforcing wall-clock and retry caps.
+
+    Returns (returncode, output_lines).
+    returncode is 124 on wall-clock timeout, 125 on retry-cap, else the real code.
+    """
+    # Pattern to detect "AI is looping" — Claude Code retrying failed tests
+    retry_re = re.compile(r"tests?\s+failed|retrying", re.IGNORECASE)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+
+    lines: list[str] = []
+    retry_count = 0
+    kill_reason: str | None = None
+    start = time.monotonic()
+
+    while True:
+        elapsed = time.monotonic() - start
+        remaining = max_wall_clock - elapsed
+        if remaining <= 0:
+            kill_reason = "wall_clock"
+            proc.kill()
+            break
+
+        # select with a short poll interval so we catch timeouts promptly
+        try:
+            readable, _, _ = select.select([proc.stdout], [], [], min(remaining, 5.0))
+        except (ValueError, OSError):
+            break
+
+        if readable:
+            line = proc.stdout.readline()
+            if not line:  # EOF — process exited
+                break
+            lines.append(line)
+            print(line, end="", flush=True)
+            if retry_re.search(line):
+                retry_count += 1
+                if max_ai_retries > 0 and retry_count >= max_ai_retries:
+                    kill_reason = "retry_cap"
+                    proc.kill()
+                    break
+        else:
+            # select timed out — process still running, re-check wall clock
+            if proc.poll() is not None:
+                break
+
+    try:
+        proc.stdout.close()
+    except OSError:
+        pass
+    proc.wait()
+
+    if kill_reason is not None:
+        return_code = 124 if kill_reason == "wall_clock" else 125
+        return return_code, lines
+
+    return proc.returncode, lines
+
+
+def ai_run(
+    project_dir: Path,
+    prompt: str,
+    continue_session: bool = False,
+    max_wall_clock: int = 1800,
+    max_ai_retries: int = 3,
+    feature_name: str = "",
+) -> None:
     """Run an autonomous AI session with a prompt."""
     config = _load_ai_config(project_dir)
     provider = config["provider"]
@@ -1868,6 +2033,10 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
             else:
                 print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
+            if max_wall_clock:
+                print(f"[dtl ai run] Wall-clock limit: {max_wall_clock}s")
+            if max_ai_retries:
+                print(f"[dtl ai run] Retry cap: {max_ai_retries}")
             print()
 
             # Run Claude Code in print mode (non-interactive)
@@ -1886,12 +2055,11 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
             cmd.extend(["-p", prompt])
 
             try:
-                result = subprocess.run(
+                exit_code, output_lines = _run_ai_with_limits(
                     cmd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    env={**os.environ},
+                    {**os.environ},
+                    max_wall_clock,
+                    max_ai_retries,
                 )
             except FileNotFoundError:
                 print(
@@ -1900,20 +2068,37 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
                 )
                 sys.exit(127)
 
-            # Print output
-            if result.stdout:
-                print(result.stdout)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
+            # On bail-out: stop the container and write failure report
+            if exit_code in (124, 125):
+                limit_hit = "wall_clock" if exit_code == 124 else "retry_cap"
+                print(
+                    f"\n[dtl ai run] Limit reached ({limit_hit}). "
+                    "Stopping container and writing FAILURE-REPORT.md...",
+                    file=sys.stderr,
+                )
+                subprocess.run(
+                    [
+                        "docker",
+                        "compose",
+                        "-f",
+                        str(compose_file),
+                        "stop",
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                _write_failure_report(
+                    project_dir, feature_name, limit_hit, output_lines
+                )
 
             # Send notification
             _send_notification(
                 ai_dir,
-                result.returncode,
-                result.stdout or result.stderr or "(no output)",
+                exit_code,
+                "".join(output_lines[-10:]) or "(no output)",
             )
 
-            sys.exit(result.returncode)
+            sys.exit(exit_code)
 
         elif provider == "openclaw":
             # OpenClaw is natively autonomous — just start the gateway
@@ -1940,7 +2125,19 @@ def ai_run(project_dir: Path, prompt: str, continue_session: bool = False) -> No
         run_script = ai_dir / "run.sh"
         if provider == "claude":
             print("[dtl ai run] Running Claude Code in VM...")
-            _run_cmd(["bash", str(run_script), prompt])
+            try:
+                subprocess.run(
+                    ["bash", str(run_script), prompt],
+                    timeout=max_wall_clock if max_wall_clock else None,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                print(
+                    "\n[dtl ai run] Wall-clock timeout reached. Writing FAILURE-REPORT.md...",
+                    file=sys.stderr,
+                )
+                _write_failure_report(project_dir, feature_name, "wall_clock", [])
+                sys.exit(124)
         elif provider == "openclaw":
             print("[dtl ai run] Starting OpenClaw in VM...")
             _run_cmd(["bash", str(run_script), "start"])
@@ -2485,6 +2682,43 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
         print(f"  Use 'dtl ai detach --project {project_dir}' first to reconfigure.")
         sys.exit(1)
 
+    # CI workflow requirement — needed to gate 'gh pr merge --auto --squash'
+    scaffold_ci = getattr(args, "scaffold_ci", False)
+    no_ci = getattr(args, "no_ci", False)
+    workflows_dir = project_dir / ".github" / "workflows"
+    has_ci = workflows_dir.is_dir() and any(workflows_dir.glob("*.yml"))
+
+    if not has_ci:
+        if scaffold_ci:
+            workflows_dir.mkdir(parents=True, exist_ok=True)
+            (workflows_dir / "ci.yml").write_text(_CI_YML_SCAFFOLD)
+            print("  Scaffolded CI workflow: .github/workflows/ci.yml")
+        elif not no_ci:
+            print(
+                "Error: no CI workflow found at .github/workflows/*.yml",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print(
+                "CI is required because 'gh pr merge --auto --squash' needs a passing",
+                file=sys.stderr,
+            )
+            print(
+                "status check to gate on. Without CI, the workflow loop stalls waiting",
+                file=sys.stderr,
+            )
+            print("for merge.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Options:", file=sys.stderr)
+            print(
+                "  --scaffold-ci   write a standard .github/workflows/ci.yml and continue",
+                file=sys.stderr,
+            )
+            print(
+                "  --no-ci         skip this check (not recommended)", file=sys.stderr
+            )
+            sys.exit(1)
+
     print(f"Attaching {pconfig['display']} to {project_dir.name}")
     print(f"  Provider: {provider}")
     print(f"  Mode:     {mode}")
@@ -2583,7 +2817,12 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
     ai_run(
-        project_dir, prompt, continue_session=getattr(args, "continue_session", False)
+        project_dir,
+        prompt,
+        continue_session=getattr(args, "continue_session", False),
+        max_wall_clock=getattr(args, "max_wall_clock", 1800),
+        max_ai_retries=getattr(args, "max_ai_retries", 3),
+        feature_name=getattr(args, "feature_name", ""),
     )
 
 
@@ -2761,7 +3000,10 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
         "Follow all constraints. "
         "Run linting and tests before committing. "
         "When finished, commit all changes with a conventional commit message "
-        "(feat: prefix). Do NOT push — the host workflow handles push and PR."
+        "(feat: prefix). Do NOT push — the host workflow handles push and PR. "
+        "Do NOT include a (#N) PR-number suffix in the commit subject — "
+        "GitHub appends one automatically on squash-merge, so including one "
+        "here produces a duplicate suffix (e.g. feat: foo (#4) (#4))."
     )
     return "\n".join(parts)
 
@@ -2780,7 +3022,9 @@ def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
     logger.addHandler(stderr_handler)
 
     if log_path is None:
-        log_dir = Path.home() / ".local" / "share" / "dtl"
+        xdg_state = os.environ.get("XDG_STATE_HOME", "")
+        state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+        log_dir = state_home / "dtl"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "workflow.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2789,6 +3033,365 @@ def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
     logger.addHandler(file_handler)
 
     return logger
+
+
+def _workflow_state_path(project_dir: Path) -> Path:
+    """Return path to the workflow skip-state JSON file for a project."""
+    xdg_state = os.environ.get("XDG_STATE_HOME", "")
+    state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+    return state_home / "dtl" / f"{project_dir.name}-workflow-state.json"
+
+
+def _read_workflow_state(project_dir: Path) -> dict:
+    """Read existing workflow state from the state file, or return empty dict."""
+    state_path = _workflow_state_path(project_dir)
+    if state_path.exists():
+        try:
+            with open(state_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _write_workflow_state(
+    project_dir: Path,
+    skip_reason: str,
+    consecutive_skips: int,
+) -> None:
+    """Atomically write workflow skip state for a project (temp + rename)."""
+    state_path = _workflow_state_path(project_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now()
+    next_retry = (now + datetime.timedelta(seconds=60)).isoformat(timespec="seconds")
+    state = {
+        "last_check": now.isoformat(timespec="seconds"),
+        "last_skip_reason": skip_reason,
+        "consecutive_skips": consecutive_skips,
+        "next_retry": next_retry,
+    }
+    fd, tmp = tempfile.mkstemp(dir=state_path.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        Path(tmp).rename(state_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _maybe_notify_stalled(
+    project_dir: Path,
+    skip_reason: str,
+    consecutive_skips: int,
+    log: logging.Logger,
+) -> None:
+    """Invoke .ai/notify.py with a stalled message after WORKFLOW_STALL_THRESHOLD skips."""
+    if consecutive_skips < WORKFLOW_STALL_THRESHOLD:
+        return
+    notify_script = project_dir / ".ai" / "notify.py"
+    if not notify_script.exists():
+        return
+    message = (
+        f"Workflow stalled for {project_dir.name}: "
+        f"{consecutive_skips} consecutive skips ({skip_reason})"
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(notify_script), "1", message],
+            capture_output=True,
+            timeout=30,
+        )
+        log.info(
+            "[%s] Stall notification sent after %d consecutive skips (%s).",
+            project_dir.name,
+            consecutive_skips,
+            skip_reason,
+        )
+    except Exception as exc:
+        log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
+
+
+# ---------------------------------------------------------------------------
+# Watchdog helpers
+# ---------------------------------------------------------------------------
+
+
+def _dtl_state_dir() -> Path:
+    """Return the XDG state directory used by dtl (~/.local/state/dtl)."""
+    xdg_state = os.environ.get("XDG_STATE_HOME", "")
+    state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+    return state_home / "dtl"
+
+
+def _watchdog_state_path() -> Path:
+    """Return path to the watchdog run-state JSON file."""
+    return _dtl_state_dir() / "watchdog-state.json"
+
+
+def _watchdog_read_state() -> dict:
+    """Read existing watchdog state, or return empty dict."""
+    p = _watchdog_state_path()
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _watchdog_write_state(state: dict) -> None:
+    """Atomically write watchdog state (temp + rename)."""
+    p = _watchdog_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".tmp-watchdog-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        Path(tmp).rename(p)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
+    """Anomaly A: 'dtl workflow run' absent when DEVPLAN has Not Started features."""
+    plan_path = project_dir / "docs" / "DEVPLAN.md"
+    if not plan_path.exists():
+        return None
+    _, features = _parse_devplan(plan_path.read_text())
+    not_started = [f for f in features if f["status"] == "Not Started"]
+    if not not_started:
+        return None
+
+    # Check whether a matching 'dtl workflow run' process exists.
+    try:
+        result = subprocess.run(
+            ["ps", "aux"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        project_str = str(project_dir)
+        for line in result.stdout.splitlines():
+            if "workflow" in line and "run" in line and project_str in line:
+                return None  # process found — no anomaly
+    except Exception:
+        pass
+
+    return (
+        f"{project_dir.name}: {len(not_started)} Not Started feature(s) "
+        f"but no 'dtl workflow run' process detected"
+    )
+
+
+def _watchdog_check_dirty_age(project_dir: Path) -> Optional[str]:
+    """Anomaly B: dirty working tree whose most-recent change is older than WATCHDOG_DIRTY_HOURS."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # Find the most-recent mtime among all dirty files.
+    latest_mtime = 0.0
+    for line in lines:
+        # porcelain format: "XY filename" — handle renames ("old -> new")
+        fname = line[3:].strip().split(" -> ")[-1].strip('"')
+        try:
+            mtime = (project_dir / fname).stat().st_mtime
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+        except OSError:
+            pass
+
+    if latest_mtime == 0.0:
+        return None
+
+    age_hours = (time.time() - latest_mtime) / 3600.0
+    if age_hours >= WATCHDOG_DIRTY_HOURS:
+        return (
+            f"{project_dir.name}: dirty working tree, "
+            f"most recent change {age_hours:.0f}h ago "
+            f"(threshold: {WATCHDOG_DIRTY_HOURS}h)"
+        )
+    return None
+
+
+def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
+    """Anomaly C: no open-PR activity for WATCHDOG_PR_IDLE_HOURS when Not Started features exist."""
+    plan_path = project_dir / "docs" / "DEVPLAN.md"
+    if not plan_path.exists():
+        return None
+    _, features = _parse_devplan(plan_path.read_text())
+    not_started = [f for f in features if f["status"] == "Not Started"]
+    if not not_started:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--json", "number,updatedAt", "--state", "open"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return None  # gh unavailable or not a GitHub repo — skip
+        prs: list[dict] = json.loads(result.stdout or "[]")
+    except Exception:
+        return None
+
+    if not prs:
+        # No open PRs but features are In Progress — flag as possible stall.
+        in_progress = [f for f in features if f["status"] == "In Progress"]
+        if not in_progress:
+            return None
+        return f"{project_dir.name}: features 'In Progress' but no open PRs found"
+
+    # Find the most-recently-updated PR and check its age.
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        hours=WATCHDOG_PR_IDLE_HOURS
+    )
+    most_recent: Optional[datetime.datetime] = None
+    for pr in prs:
+        updated_str = pr.get("updatedAt", "")
+        try:
+            updated = datetime.datetime.fromisoformat(
+                updated_str.replace("Z", "+00:00")
+            )
+            if most_recent is None or updated > most_recent:
+                most_recent = updated
+        except (ValueError, AttributeError):
+            pass
+
+    if most_recent is not None and most_recent < cutoff:
+        idle_hours = (
+            datetime.datetime.now(datetime.timezone.utc) - most_recent
+        ).total_seconds() / 3600.0
+        return (
+            f"{project_dir.name}: no PR activity for {idle_hours:.0f}h "
+            f"(threshold: {WATCHDOG_PR_IDLE_HOURS}h) with Not Started features"
+        )
+    return None
+
+
+def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
+    """Anomaly D: dtl log growth > WATCHDOG_LOG_GROWTH_MB_DAY MB/day.
+
+    Returns (anomaly_message_or_None, current_total_bytes).
+    """
+    state_dir = _dtl_state_dir()
+    total_bytes = 0
+    if state_dir.exists():
+        for entry in state_dir.iterdir():
+            if entry.is_file() and entry.suffix in (".log", ".txt", ".json"):
+                try:
+                    total_bytes += entry.stat().st_size
+                except OSError:
+                    pass
+
+    anomaly: Optional[str] = None
+    prev_bytes: int = prev_state.get("log_size_bytes", 0)
+    prev_ts_str: str = prev_state.get("log_size_timestamp", "")
+    if prev_ts_str and prev_bytes >= 0:
+        try:
+            prev_ts = datetime.datetime.fromisoformat(prev_ts_str)
+            elapsed_hours = (datetime.datetime.now() - prev_ts).total_seconds() / 3600.0
+            if elapsed_hours > 0:
+                growth_bytes = max(0, total_bytes - prev_bytes)
+                growth_mb_per_day = (growth_bytes / (1024 * 1024)) / (
+                    elapsed_hours / 24.0
+                )
+                if growth_mb_per_day > WATCHDOG_LOG_GROWTH_MB_DAY:
+                    anomaly = (
+                        f"dtl log growth {growth_mb_per_day:.1f} MB/day "
+                        f"exceeds threshold ({WATCHDOG_LOG_GROWTH_MB_DAY} MB/day)"
+                    )
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    return anomaly, total_bytes
+
+
+def _watchdog_notify_project(
+    project_dir: Path,
+    anomalies: list[str],
+    log: logging.Logger,
+) -> None:
+    """Invoke a project's .ai/notify.py once with all anomaly details."""
+    if not anomalies:
+        return
+    notify_script = project_dir / ".ai" / "notify.py"
+    if not notify_script.exists():
+        log.info(
+            "[%s] No .ai/notify.py found; skipping notification.", project_dir.name
+        )
+        return
+    message = f"[dtl watchdog] Anomalies detected in {project_dir.name}:\n" + "\n".join(
+        f"  • {a}" for a in anomalies
+    )
+    try:
+        subprocess.run(
+            [sys.executable, str(notify_script), "1", message],
+            capture_output=True,
+            timeout=30,
+        )
+        log.info(
+            "[%s] Watchdog notification sent (%d anomaly/anomalies).",
+            project_dir.name,
+            len(anomalies),
+        )
+    except Exception as exc:
+        log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
+
+
+def _make_watchdog_service(projects_str: str) -> str:
+    """Generate systemd service unit content for the dtl watchdog."""
+    python_exe = sys.executable
+    script_path = Path(sys.argv[0]).resolve()
+    return textwrap.dedent(
+        f"""\
+        [Unit]
+        Description=dtl workflow watchdog
+        After=network.target
+
+        [Service]
+        Type=oneshot
+        ExecStart={python_exe} {script_path} watchdog check --projects {projects_str}
+        StandardOutput=journal
+        StandardError=journal
+        """
+    )
+
+
+def _make_watchdog_timer(interval_minutes: int) -> str:
+    """Generate systemd timer unit content for the dtl watchdog."""
+    return textwrap.dedent(
+        f"""\
+        [Unit]
+        Description=dtl workflow watchdog timer
+
+        [Timer]
+        OnBootSec=5min
+        OnUnitActiveSec={interval_minutes}min
+        Unit=dtl-watchdog.service
+
+        [Install]
+        WantedBy=timers.target
+        """
+    )
 
 
 def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
@@ -2810,6 +3413,44 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
         test_cmd = ["cargo", "test"]
 
     output_parts = []
+
+    if (project_dir / "pyproject.toml").exists():
+        # --break-system-packages bypasses PEP 668 rejection on Debian/Ubuntu system
+        # Python. Safe here: the ephemeral USB workstation's system Python is rebuilt
+        # weekly, so installing into site-packages has no durable downside. The flag
+        # is a no-op on venvs and CI runners that don't enforce PEP 668.
+        pip_cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-e",
+            ".[dev]",
+            "--quiet",
+            "--break-system-packages",
+        ]
+        pip_result = subprocess.run(
+            pip_cmd, cwd=project_dir, capture_output=True, text=True
+        )
+        if pip_result.returncode != 0:
+            pip_cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-e",
+                ".",
+                "--quiet",
+                "--break-system-packages",
+            ]
+            pip_result = subprocess.run(
+                pip_cmd, cwd=project_dir, capture_output=True, text=True
+            )
+        output_parts.append(
+            f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}"
+        )
+        if pip_result.returncode != 0:
+            return False, "\n".join(output_parts)
 
     if lint_cmd:
         result = subprocess.run(
@@ -3071,7 +3712,34 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
     schedule_time = getattr(args, "schedule", None)
     max_failures = getattr(args, "max_failures", 3)
-    log = _setup_workflow_logger()
+    max_wall_clock = getattr(args, "max_wall_clock", 1800)
+    max_ai_retries = getattr(args, "max_ai_retries", 3)
+
+    # Resolve log path: explicit --log overrides XDG default
+    log_arg = getattr(args, "log", None)
+    if log_arg is not None:
+        log_path = Path(log_arg).resolve()
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME", "")
+        state_home = Path(xdg_state) if xdg_state else Path.home() / ".local" / "state"
+        log_path = state_home / "dtl" / f"{projects[0].name}-workflow.log"
+
+    # Reject log paths inside any project directory to prevent dirty-tree skip loop
+    for proj in projects:
+        try:
+            log_path.relative_to(proj)
+            print(
+                f"error: refusing to write log inside a project directory; "
+                f"this would cause the dirty-tree skip loop\n"
+                f"  log path : {log_path}\n"
+                f"  project  : {proj}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except ValueError:
+            pass
+
+    log = _setup_workflow_logger(log_path)
 
     # Wait for scheduled time if specified
     if schedule_time:
@@ -3087,6 +3755,27 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             wait_secs / 60,
         )
         time.sleep(wait_secs)
+
+        # Spawn a fresh child process so it reads the current on-disk dtl.py
+        log.info("Spawning fresh dtl child process (--schedule satisfied).")
+        child_argv = [
+            sys.executable,
+            sys.argv[0],
+            "workflow",
+            "run",
+            "--projects",
+            args.projects,
+            "--max-failures",
+            str(max_failures),
+            "--max-wall-clock",
+            str(max_wall_clock),
+            "--max-ai-retries",
+            str(max_ai_retries),
+        ]
+        if log_arg is not None:
+            child_argv += ["--log", log_arg]
+        result = subprocess.run(child_argv)
+        sys.exit(result.returncode)
 
     log.info("=== dtl workflow run starting ===")
     log.info("Projects: %s", ", ".join(str(p) for p in projects))
@@ -3126,7 +3815,6 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 log.info("[%s] No unstarted features remaining.", project_dir.name)
                 continue
 
-            any_work_done = True
             fail_key = f"{project_dir.name}:{next_feature['name']}"
             branch = next_feature["branch"]
             log.info(
@@ -3136,6 +3824,15 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             # Ensure clean tree and on develop
             if _git_is_dirty(project_dir):
                 log.info("[%s] Working tree is dirty — skipping.", project_dir.name)
+                _reason = "dirty_tree"
+                _prev = _read_workflow_state(project_dir)
+                _skip_count = (
+                    _prev.get("consecutive_skips", 0) + 1
+                    if _prev.get("last_skip_reason") == _reason
+                    else 1
+                )
+                _write_workflow_state(project_dir, _reason, _skip_count)
+                _maybe_notify_stalled(project_dir, _reason, _skip_count, log)
                 continue
 
             subprocess.run(
@@ -3157,7 +3854,20 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 consecutive_failures[fail_key] = (
                     consecutive_failures.get(fail_key, 0) + 1
                 )
+                _reason = "branch_create_failed"
+                _prev = _read_workflow_state(project_dir)
+                _skip_count = (
+                    _prev.get("consecutive_skips", 0) + 1
+                    if _prev.get("last_skip_reason") == _reason
+                    else 1
+                )
+                _write_workflow_state(project_dir, _reason, _skip_count)
+                _maybe_notify_stalled(project_dir, _reason, _skip_count, log)
                 continue
+
+            # All skip gates passed — count this project as having work
+            any_work_done = True
+            _write_workflow_state(project_dir, "", 0)
 
             # Update status
             _update_feature_status(plan_path, next_feature["name"], "In Progress")
@@ -3187,6 +3897,12 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         str(project_dir),
                         "--prompt",
                         prompt,
+                        "--feature-name",
+                        next_feature["name"],
+                        "--max-wall-clock",
+                        str(max_wall_clock),
+                        "--max-ai-retries",
+                        str(max_ai_retries),
                     ],
                     capture_output=True,
                     text=True,
@@ -3199,15 +3915,28 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     "[%s] No .ai/config.json — running claude directly.",
                     project_dir.name,
                 )
-                result = subprocess.run(
-                    ["claude", "--print", "-p", prompt],
-                    cwd=project_dir,
-                    capture_output=True,
-                    text=True,
-                    env={**os.environ},
-                )
-                ai_exit_code = result.returncode
-                ai_output = result.stdout + result.stderr
+                try:
+                    result = subprocess.run(
+                        ["claude", "--print", "-p", prompt],
+                        cwd=project_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=max_wall_clock if max_wall_clock else None,
+                        env={**os.environ},
+                    )
+                    ai_exit_code = result.returncode
+                    ai_output = result.stdout + result.stderr
+                except subprocess.TimeoutExpired:
+                    log.info(
+                        "[%s] AI wall-clock timeout for %s. Writing FAILURE-REPORT.md.",
+                        project_dir.name,
+                        next_feature["name"],
+                    )
+                    _write_failure_report(
+                        project_dir, next_feature["name"], "wall_clock", []
+                    )
+                    ai_exit_code = 124
+                    ai_output = ""
 
             # Check for auth failure
             if _detect_auth_failure(ai_output):
@@ -3226,9 +3955,19 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_exit_code,
                     next_feature["name"],
                 )
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                # Bail-out codes (wall-clock or retry-cap) pin the failure count
+                # so the next loop iteration marks the feature as Failed immediately.
+                if ai_exit_code in (124, 125):
+                    log.info(
+                        "[%s] Bail-out limit hit for %s — marking as permanently failed.",
+                        project_dir.name,
+                        next_feature["name"],
+                    )
+                    consecutive_failures[fail_key] = max_failures
+                else:
+                    consecutive_failures[fail_key] = (
+                        consecutive_failures.get(fail_key, 0) + 1
+                    )
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
                 continue
 
@@ -3377,6 +4116,147 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             log.info("=== All projects complete. Exiting. ===")
             break
 
+        # Floor sleep — belt-and-suspenders to prevent spin if any_work_done
+        # logic is ever wrong (e.g. all projects skipped but flag was set).
+        time.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# Watchdog commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_watchdog_install(args: argparse.Namespace) -> None:
+    """Handle 'dtl watchdog install'."""
+    projects = [str(Path(p).resolve()) for p in args.projects.split(",")]
+    projects_str = ",".join(projects)
+    interval_minutes: int = args.interval
+
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+
+    service_path = unit_dir / "dtl-watchdog.service"
+    timer_path = unit_dir / "dtl-watchdog.timer"
+
+    service_path.write_text(_make_watchdog_service(projects_str))
+    timer_path.write_text(_make_watchdog_timer(interval_minutes))
+
+    print(f"Wrote {service_path}")
+    print(f"Wrote {timer_path}")
+    print()
+    print("Activate with:")
+    print("  systemctl --user daemon-reload")
+    print("  systemctl --user enable --now dtl-watchdog.timer")
+
+
+def cmd_watchdog_check(args: argparse.Namespace) -> None:
+    """Handle 'dtl watchdog check'."""
+    project_dirs = [Path(p).resolve() for p in args.projects.split(",")]
+
+    log = logging.getLogger("dtl.watchdog")
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+
+    prev_state = _watchdog_read_state()
+    now_str = datetime.datetime.now().isoformat(timespec="seconds")
+    all_anomalies: list[str] = []
+
+    # Check D: log growth — evaluated once, globally.
+    log_anomaly, current_log_bytes = _watchdog_check_log_growth(prev_state)
+    if log_anomaly:
+        all_anomalies.append(log_anomaly)
+        log.info("ANOMALY D: %s", log_anomaly)
+
+    # Per-project checks.
+    for project_dir in project_dirs:
+        if not project_dir.exists():
+            log.info("Project dir not found: %s — skipping.", project_dir)
+            continue
+
+        project_anomalies: list[str] = []
+
+        anomaly_a = _watchdog_check_missing_runner(project_dir)
+        if anomaly_a:
+            project_anomalies.append(anomaly_a)
+            log.info("ANOMALY A: %s", anomaly_a)
+
+        anomaly_b = _watchdog_check_dirty_age(project_dir)
+        if anomaly_b:
+            project_anomalies.append(anomaly_b)
+            log.info("ANOMALY B: %s", anomaly_b)
+
+        anomaly_c = _watchdog_check_pr_activity(project_dir)
+        if anomaly_c:
+            project_anomalies.append(anomaly_c)
+            log.info("ANOMALY C: %s", anomaly_c)
+
+        if project_anomalies:
+            all_anomalies.extend(project_anomalies)
+            _watchdog_notify_project(project_dir, project_anomalies, log)
+
+    if all_anomalies:
+        print(f"FAIL — {len(all_anomalies)} anomaly/anomalies detected:")
+        for a in all_anomalies:
+            print(f"  • {a}")
+    else:
+        print("PASS — no anomalies detected.")
+
+    _watchdog_write_state(
+        {
+            "last_run": now_str,
+            "last_result": "FAIL" if all_anomalies else "PASS",
+            "last_anomalies": all_anomalies,
+            "log_size_bytes": current_log_bytes,
+            "log_size_timestamp": now_str,
+        }
+    )
+
+
+def cmd_watchdog_status(args: argparse.Namespace) -> None:
+    """Handle 'dtl watchdog status'."""
+    state = _watchdog_read_state()
+    if not state:
+        print("No watchdog state found. Run 'dtl watchdog check' first.")
+        return
+
+    print(f"Last run:    {state.get('last_run', 'unknown')}")
+    print(f"Last result: {state.get('last_result', 'unknown')}")
+    anomalies = state.get("last_anomalies", [])
+    if anomalies:
+        print("Anomalies:")
+        for a in anomalies:
+            print(f"  • {a}")
+
+    # Attempt to show next scheduled run from systemd.
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "list-timers",
+                "dtl-watchdog.timer",
+                "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if "dtl-watchdog" in line:
+                    print(f"\nNext scheduled run (systemd):\n  {line.strip()}")
+                    break
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Workflow commands
+# ---------------------------------------------------------------------------
+
 
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow list'."""
@@ -3397,6 +4277,22 @@ def cmd_workflow_list(args: argparse.Namespace) -> None:
     for f in features:
         print(f"{f['name']:<{name_width}}  {f['status']:<14}  {f['branch']}")
     print()
+
+
+def cmd_workflow_status(args: argparse.Namespace) -> None:
+    """Handle 'dtl workflow status'."""
+    project_dir = Path(args.project).resolve()
+    state_path = _workflow_state_path(project_dir)
+    if not state_path.exists():
+        print(f"No workflow state found for {project_dir.name}.")
+        return
+    with open(state_path) as f:
+        state = json.load(f)
+    print(f"Project:           {project_dir.name}")
+    print(f"Last check:        {state.get('last_check', 'unknown')}")
+    print(f"Last skip reason:  {state.get('last_skip_reason', 'unknown')}")
+    print(f"Consecutive skips: {state.get('consecutive_skips', 0)}")
+    print(f"Next retry:        {state.get('next_retry', 'unknown')}")
 
 
 def cmd_workflow_next(args: argparse.Namespace) -> None:
@@ -3589,6 +4485,18 @@ def main() -> None:
         default="env",
         help="API key source: env (default)",
     )
+    ai_attach_parser.add_argument(
+        "--scaffold-ci",
+        action="store_true",
+        default=False,
+        help="Write a standard .github/workflows/ci.yml if missing",
+    )
+    ai_attach_parser.add_argument(
+        "--no-ci",
+        action="store_true",
+        default=False,
+        help="Skip the CI workflow requirement check (not recommended)",
+    )
     ai_attach_parser.set_defaults(func=cmd_ai_attach)
 
     # -- ai detach --
@@ -3666,6 +4574,31 @@ def main() -> None:
         action="store_true",
         help="Continue the previous conversation instead of starting fresh",
     )
+    ai_run_parser.add_argument(
+        "--max-wall-clock",
+        dest="max_wall_clock",
+        type=int,
+        default=1800,
+        metavar="SECONDS",
+        help="Hard kill the AI session after this many seconds (default: 1800 = 30 min)",
+    )
+    ai_run_parser.add_argument(
+        "--max-ai-retries",
+        dest="max_ai_retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Kill the session after N detected retry loops in AI output "
+            "(default: 3; 0 = disabled)"
+        ),
+    )
+    ai_run_parser.add_argument(
+        "--feature-name",
+        dest="feature_name",
+        default="",
+        help="Feature name to include in FAILURE-REPORT.md (set by workflow run)",
+    )
     ai_run_parser.set_defaults(func=cmd_ai_run)
 
     # -- ai config-notify --
@@ -3724,6 +4657,54 @@ def main() -> None:
         help="Mount path for project files inside the container (default: /workspace)",
     )
     ai_mcp_parser.set_defaults(func=cmd_ai_add_mcp)
+
+    # -- watchdog (subcommand group) --
+    watchdog_parser = subparsers.add_parser(
+        "watchdog",
+        help="Locally-scheduled watchdog for dtl-managed project health",
+    )
+    watchdog_subparsers = watchdog_parser.add_subparsers(dest="watchdog_command")
+
+    # -- watchdog install --
+    wd_install_parser = watchdog_subparsers.add_parser(
+        "install",
+        help=(
+            "Write ~/.config/systemd/user/dtl-watchdog.{service,timer} "
+            "and print activation commands"
+        ),
+    )
+    wd_install_parser.add_argument(
+        "--projects",
+        required=True,
+        help="Comma-separated project directories to monitor",
+    )
+    wd_install_parser.add_argument(
+        "--interval",
+        type=int,
+        default=120,
+        metavar="MINUTES",
+        help="Timer interval in minutes (default: 120)",
+    )
+    wd_install_parser.set_defaults(func=cmd_watchdog_install)
+
+    # -- watchdog check --
+    wd_check_parser = watchdog_subparsers.add_parser(
+        "check",
+        help="Run anomaly checks across monitored projects and emit pass/fail summary",
+    )
+    wd_check_parser.add_argument(
+        "--projects",
+        required=True,
+        help="Comma-separated project directories to check",
+    )
+    wd_check_parser.set_defaults(func=cmd_watchdog_check)
+
+    # -- watchdog status --
+    wd_status_parser = watchdog_subparsers.add_parser(
+        "status",
+        help="Print last watchdog run result and next scheduled run",
+    )
+    wd_status_parser.set_defaults(func=cmd_watchdog_status)
 
     # -- workflow (subcommand group) --
     workflow_parser = subparsers.add_parser(
@@ -3804,7 +4785,54 @@ def main() -> None:
         default=3,
         help="Skip a feature after this many consecutive failures (default: 3)",
     )
+    wf_run_parser.add_argument(
+        "--log",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path for the workflow log file. "
+            "Default: $XDG_STATE_HOME/dtl/<first-project-name>-workflow.log "
+            "(typically ~/.local/state/dtl/<project>-workflow.log). "
+            "WARNING: do not set this to a path inside any --projects directory; "
+            "an untracked log file makes the git tree dirty and causes the "
+            "dirty-tree skip loop."
+        ),
+    )
+    wf_run_parser.add_argument(
+        "--max-wall-clock",
+        dest="max_wall_clock",
+        type=int,
+        default=1800,
+        metavar="SECONDS",
+        help=(
+            "Hard kill each AI session after this many seconds (default: 1800 = 30 min). "
+            "Passed through to 'dtl ai run'."
+        ),
+    )
+    wf_run_parser.add_argument(
+        "--max-ai-retries",
+        dest="max_ai_retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Kill an AI session after N detected retry loops in output "
+            "(default: 3; 0 = disabled). Passed through to 'dtl ai run'."
+        ),
+    )
     wf_run_parser.set_defaults(func=cmd_workflow_run)
+
+    # -- workflow status --
+    wf_status_parser = workflow_subparsers.add_parser(
+        "status",
+        help="Print the current workflow skip state for a project",
+    )
+    wf_status_parser.add_argument(
+        "--project",
+        required=True,
+        help="Path to the project directory",
+    )
+    wf_status_parser.set_defaults(func=cmd_workflow_status)
 
     # -- Parse and dispatch --
     args = parser.parse_args()
@@ -3822,6 +4850,12 @@ def main() -> None:
     if args.command == "workflow":
         if not getattr(args, "workflow_command", None):
             workflow_parser.print_help()
+            sys.exit(1)
+
+    # Handle 'watchdog' subcommand group
+    if args.command == "watchdog":
+        if not getattr(args, "watchdog_command", None):
+            watchdog_parser.print_help()
             sys.exit(1)
 
     args.func(args)
