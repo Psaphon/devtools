@@ -3000,7 +3000,10 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
         "Follow all constraints. "
         "Run linting and tests before committing. "
         "When finished, commit all changes with a conventional commit message "
-        "(feat: prefix). Do NOT push — the host workflow handles push and PR."
+        "(feat: prefix). Do NOT push — the host workflow handles push and PR. "
+        "Do NOT include a (#N) PR-number suffix in the commit subject — "
+        "GitHub appends one automatically on squash-merge, so including one "
+        "here produces a duplicate suffix (e.g. feat: foo (#4) (#4))."
     )
     return "\n".join(parts)
 
