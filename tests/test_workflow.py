@@ -211,6 +211,12 @@ class TestBuildAiPrompt:
         prompt = _build_ai_prompt("", features[1])
         assert "## Feature: beta-feature" in prompt
 
+    def test_no_pr_suffix_warning_present(self):
+        constraints, features = _parse_devplan(SAMPLE_PLAN)
+        prompt = _build_ai_prompt(constraints, features[1])
+        assert "(#N) PR-number suffix" in prompt
+        assert "squash-merge" in prompt
+
 
 # ---------------------------------------------------------------------------
 # _git_is_dirty

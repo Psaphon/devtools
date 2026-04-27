@@ -590,7 +590,7 @@ Reference: FEATURE-REQUESTS.md item #17. Origin: loom night 2 — `workflow-inst
 
 **Branch:** `feature/prompt-hygiene-pr-suffix`
 **Depends on:** none
-**Status:** Not Started
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
