@@ -631,7 +631,7 @@ Cross-reference: AI prompt design feedback in PM memory has long emphasized "Do 
 
 **Branch:** `feature/scheduled-run-freshness`
 **Depends on:** none
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** ai
 
 ### Goal

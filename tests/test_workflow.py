@@ -947,3 +947,60 @@ class TestRunLintAndTestsPipInstall:
 
         assert call_count["n"] == 2, "Expected fallback to second pip install"
         assert passed
+
+
+# ---------------------------------------------------------------------------
+# cmd_workflow_run --schedule subprocess delegation
+# ---------------------------------------------------------------------------
+
+
+class TestCmdWorkflowRunScheduleSubprocess:
+    """When --schedule is set, cmd_workflow_run sleeps then delegates to a fresh subprocess."""
+
+    def test_schedule_delegates_to_subprocess(self, tmp_path, monkeypatch):
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "myproject"
+        project_dir.mkdir()
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = "02:00"
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        fake_result = MagicMock()
+        fake_result.returncode = 42
+
+        subprocess_calls: list[list[str]] = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            subprocess_calls.append(list(cmd))
+            return fake_result
+
+        with (
+            patch("dtl.time.sleep"),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_workflow_run(args)
+
+        assert len(subprocess_calls) == 1, (
+            f"Expected exactly one subprocess.run call; got {subprocess_calls}"
+        )
+        child_argv = subprocess_calls[0]
+        assert child_argv[0] == sys.executable
+        assert child_argv[1] == sys.argv[0]
+        assert "workflow" in child_argv
+        assert "run" in child_argv
+        assert "--projects" in child_argv
+        assert "--schedule" not in child_argv, (
+            "--schedule must NOT be forwarded to the child process"
+        )
+        assert exc_info.value.code == 42, (
+            f"Parent must exit with child's returncode; got {exc_info.value.code}"
+        )

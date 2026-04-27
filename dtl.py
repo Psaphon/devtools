@@ -3756,6 +3756,27 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
         )
         time.sleep(wait_secs)
 
+        # Spawn a fresh child process so it reads the current on-disk dtl.py
+        log.info("Spawning fresh dtl child process (--schedule satisfied).")
+        child_argv = [
+            sys.executable,
+            sys.argv[0],
+            "workflow",
+            "run",
+            "--projects",
+            args.projects,
+            "--max-failures",
+            str(max_failures),
+            "--max-wall-clock",
+            str(max_wall_clock),
+            "--max-ai-retries",
+            str(max_ai_retries),
+        ]
+        if log_arg is not None:
+            child_argv += ["--log", log_arg]
+        result = subprocess.run(child_argv)
+        sys.exit(result.returncode)
+
     log.info("=== dtl workflow run starting ===")
     log.info("Projects: %s", ", ".join(str(p) for p in projects))
 
