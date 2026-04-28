@@ -676,7 +676,7 @@ Diagnostic confirmation: `loom-workflow-night3.log` shows `02:00:00 [loom] Start
 
 **Branch:** `feature/preflight-auto-merge-check`
 **Depends on:** none
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** ai
 
 ### Goal
