@@ -3707,6 +3707,60 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
             log.info("Could not check PR state — will retry.")
 
 
+def _preflight_auto_merge(project_dir: Path) -> Optional[bool]:
+    """Check whether the GitHub repo for project_dir has allow_auto_merge enabled.
+
+    Returns:
+        True  — allow_auto_merge is enabled
+        False — allow_auto_merge is explicitly disabled
+        None  — check skipped (not a GitHub remote, gh unavailable, or any error)
+    """
+    # Get the remote URL
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        remote_url = result.stdout.strip()
+    except Exception:
+        return None
+
+    # Parse owner/name from GitHub remote URLs
+    # Supports https://github.com/owner/name(.git) and git@github.com:owner/name(.git)
+    import re as _re
+
+    match = _re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote_url)
+    if not match:
+        return None  # not a GitHub remote
+
+    owner, name = match.group(1), match.group(2)
+
+    # Query GitHub API
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{owner}/{name}", "--jq", ".allow_auto_merge"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return None  # gh unavailable or API error
+        value = result.stdout.strip()
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        return None  # unexpected output
+    except Exception:
+        return None
+
+
 def cmd_workflow_run(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow run' — the full autonomous loop."""
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
@@ -3740,6 +3794,43 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             pass
 
     log = _setup_workflow_logger(log_path)
+
+    # Preflight: check allow_auto_merge on each project's GitHub repo
+    failed_repos: list[str] = []
+    for proj in projects:
+        result = _preflight_auto_merge(proj)
+        if result is None:
+            log.info(
+                "[%s] Preflight auto-merge check skipped (not a GitHub remote or gh unavailable).",
+                proj.name,
+            )
+        elif result is False:
+            failed_repos.append(proj.name)
+        # result is True: no action needed
+
+    if failed_repos:
+        if schedule_time:
+            log.error(
+                "Preflight FAILED: allow_auto_merge is not enabled on: %s",
+                ", ".join(failed_repos),
+            )
+            log.error(
+                "A scheduled run cannot proceed — without auto-merge, PRs stall "
+                "overnight with no human available to merge them."
+            )
+            log.error(
+                "Recommended fixes:\n"
+                "  • Upgrade to GitHub Pro to enable auto-merge on private repos.\n"
+                "  • Or run without --schedule (interactive mode) and merge PRs "
+                "manually via the GitHub app."
+            )
+            sys.exit(1)
+        else:
+            log.warning(
+                "WARNING: allow_auto_merge is not enabled on: %s. "
+                "PRs require manual merge via the GitHub app.",
+                ", ".join(failed_repos),
+            )
 
     # Wait for scheduled time if specified
     if schedule_time:

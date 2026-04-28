@@ -985,6 +985,7 @@ class TestCmdWorkflowRunScheduleSubprocess:
             patch("dtl.time.sleep"),
             patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
             patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl._preflight_auto_merge", return_value=None),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 cmd_workflow_run(args)
@@ -1003,4 +1004,91 @@ class TestCmdWorkflowRunScheduleSubprocess:
         )
         assert exc_info.value.code == 42, (
             f"Parent must exit with child's returncode; got {exc_info.value.code}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _preflight_auto_merge: scheduled-run rejection and warning-banner paths
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightAutoMerge:
+    """Preflight check: --schedule exits non-zero; interactive prints warning."""
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
+        return tmp_path
+
+    def test_schedule_exits_nonzero_when_auto_merge_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """With --schedule and allow_auto_merge=False, cmd_workflow_run exits non-zero
+        and time.sleep is never called."""
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "myproject")
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = "02:00"
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        sleep_calls: list = []
+
+        with (
+            patch("dtl._preflight_auto_merge", return_value=False),
+            patch("dtl.time.sleep", side_effect=lambda s: sleep_calls.append(s)),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_workflow_run(args)
+
+        assert exc_info.value.code != 0, (
+            "Expected non-zero exit when allow_auto_merge=False and --schedule is set"
+        )
+        assert sleep_calls == [], (
+            f"time.sleep must not be called before the preflight exits; got {sleep_calls}"
+        )
+
+    def test_no_schedule_logs_warning_and_continues(self, tmp_path, monkeypatch):
+        """Without --schedule and allow_auto_merge=False, cmd_workflow_run logs a
+        WARNING banner naming the repo and continues execution (does not exit)."""
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "myproject")
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        mock_logger = MagicMock()
+
+        with (
+            patch("dtl._preflight_auto_merge", return_value=False),
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl.time.sleep"),
+            patch("dtl._setup_workflow_logger", return_value=mock_logger),
+        ):
+            # Must NOT raise SystemExit
+            cmd_workflow_run(args)
+
+        warning_calls = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if "allow_auto_merge" in str(c) or "manual merge" in str(c).lower()
+        ]
+        assert warning_calls, (
+            "Expected a warning log about allow_auto_merge / manual merge; "
+            f"warning calls: {mock_logger.warning.call_args_list}"
         )
