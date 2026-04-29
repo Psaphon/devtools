@@ -724,3 +724,61 @@ Why GitHub blocks the setting: `allow_auto_merge` requires GitHub Pro on private
 Until Psaphon upgrades to GitHub Pro (~$4/mo), private-repo development uses interactive `dtl workflow run` (no `--schedule`). The user merges PRs from the GitHub mobile app as they appear.
 
 Cross-reference: night-4 brief misdiagnosed this as "auto-merge wasn't enabled on loom" — implying a setting flip would fix it. The actual constraint is plan + visibility, not setting state. This feature makes that distinction explicit at runtime.
+
+---
+
+## Feature: ai-failure-snapshot
+
+**Branch:** `feature/ai-failure-snapshot`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+When the AI subprocess in `dtl workflow run` exits non-zero, capture a triage bundle to `~/.local/state/dtl/` so the next PM session can diagnose without spelunking through a half-implemented branch. Today, on AI exit-code-1 the workflow marks the feature failed and moves on (or refuses on dirty tree); the dirty paths and the AI's last-N stderr lines are scattered across the project and the workflow log.
+
+A triage bundle gives the next PM one place to look.
+
+### Acceptance Criteria
+
+- [ ] On AI subprocess non-zero exit in `cmd_workflow_run`, write `~/.local/state/dtl/<project>-<feature>-failure-<UTC-iso>.md` containing:
+  - Project path, feature name, branch name, AI exit code, wall-clock duration
+  - Last 200 lines of AI stdout/stderr (combined, in order, prefixed with stream name)
+  - `git status --porcelain` snapshot at the moment of failure
+  - `git diff --stat develop..HEAD` and the full `git diff develop..HEAD` (capped at 5000 lines, with a "truncated" marker if exceeded)
+  - List of untracked files (relative paths only — no contents)
+- [ ] Snapshot is written *before* any cleanup or branch-state change, so the captured `git status` matches the AI's view at exit
+- [ ] If the snapshot directory does not exist, create it (mode 0700)
+- [ ] If snapshot write fails (disk full, permissions), log the failure but do not propagate — the workflow's existing failure handling continues uninterrupted
+- [ ] Snapshot path is logged as a single `INFO` line to the workflow log: `failure snapshot written: <path>`
+- [ ] `dtl workflow status --project <path>` (existing subcommand from `workflow-stall-visibility`) prints the most recent failure snapshot path for the project, if any
+- [ ] Two new tests in `tests/test_workflow.py`: (a) simulated AI exit-1 produces a snapshot file with all required sections; (b) snapshot write failure does not raise out of `cmd_workflow_run`
+- [ ] Existing AI-failure / dirty-tree / consecutive-failure tests still pass
+- [ ] Lint clean (`ruff check . && ruff format --check .`)
+- [ ] All tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_write_failure_snapshot(project, feature, ai_log_lines)` helper; call it from the AI-exit-non-zero branch in `cmd_workflow_run`; extend `cmd_workflow_status` to surface latest snapshot path |
+| `tests/test_workflow.py` | Modify | Two new tests: snapshot content + snapshot-write-failure tolerance |
+
+### Key Decisions
+
+- **Snapshot lives in `~/.local/state/dtl/`, not the project directory.** Same rationale as `workflow-log-defaults` and `workflow-stall-visibility` — never write into a project root, the dirty-tree skip loop is a footgun.
+- **Markdown over JSON.** A PM (human or LLM) reads this on incident; a markdown report is grep-able, copy-paste-friendly, and renders on phone. JSON adds parsing burden without a consumer.
+- **Capture stdout/stderr combined and ordered, not separately.** The diagnostic value is the *sequence* — what the AI said before it died. Splitting streams reverses that.
+- **Cap the diff at 5000 lines, mark when truncated.** Pathological cases (vendored deps, large generated files) shouldn't blow up the snapshot. 5000 lines covers >99% of feature-sized diffs and keeps the file <1MB.
+- **Untracked file *list*, not contents.** Untracked files might include large binaries, secrets-shaped fixtures, or personal scratch. Filenames let the PM read what they want; embedding contents inflates the snapshot and risks leaking sensitive material.
+- **Snapshot-write failure is non-fatal.** The original failure (AI exit-1) is what matters; a snapshot failure on top would mask it.
+
+### Notes
+
+Origin: loom night 4 (2026-04-27). The `diffusion-stylize` AI returned exit code 1 mid-feature; the workflow's retry refused on a dirty tree and exited. Triage the next morning required reading `git status`, opening four dirty files, running the test suite manually, and inferring from the lint output that the AI was 95% done but tripped on `ruff check`. With this snapshot, that morning would have been one file read instead of seven.
+
+Open question (resolve in implementation): how to capture AI stdout/stderr. The current `dtl ai run` subprocess wiring may already tee to the workflow log; if so, extracting last-200 from that log is cheaper than re-buffering. If stdout/stderr are not currently captured, this feature requires adding a ring buffer in the subprocess wrapper. Worth a quick read of the existing `_run_ai` (or equivalent) before settling the approach.
+
+Cross-reference: this complements `workflow-stall-visibility` (state file on every skip) and `ai-dev-loop-break` (FAILURE-REPORT.md on retry-cap or wall-clock kill). Those cover *successful refusal* and *self-detected stuck-loop*. This covers the *AI exited but produced uncommitted work* case — which is what actually happened on loom night 4.
+
