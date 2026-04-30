@@ -1925,6 +1925,132 @@ def _write_failure_report(
     report_path.write_text(report)
 
 
+def _write_failure_snapshot(
+    project_dir: Path,
+    feature: dict,
+    branch: str,
+    ai_exit_code: int,
+    duration_secs: float,
+    ai_output: str,
+    log: "logging.Logger",
+) -> Optional[Path]:
+    """Write a triage bundle to ~/.local/state/dtl/ on AI non-zero exit.
+
+    Returns the snapshot path on success, None on failure.  Never raises.
+    """
+    try:
+        state_dir = _dtl_state_dir()
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        iso_ts = now_utc.strftime("%Y%m%dT%H%M%SZ")
+        snapshot_path = (
+            state_dir / f"{project_dir.name}-{feature['name']}-failure-{iso_ts}.md"
+        )
+
+        # Last 200 combined lines (already interleaved in ai_output)
+        all_lines = ai_output.splitlines(keepends=True)
+        last_lines = all_lines[-200:] if len(all_lines) > 200 else all_lines
+        last_block = "".join(last_lines)
+
+        # git status --porcelain
+        git_status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        git_status = git_status_result.stdout
+
+        # git diff --stat develop..HEAD
+        diff_stat_result = subprocess.run(
+            ["git", "diff", "--stat", "develop..HEAD"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        diff_stat = diff_stat_result.stdout
+
+        # git diff develop..HEAD (capped at 5000 lines)
+        diff_result = subprocess.run(
+            ["git", "diff", "develop..HEAD"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        diff_lines = diff_result.stdout.splitlines(keepends=True)
+        diff_truncated = len(diff_lines) > 5000
+        diff_body = "".join(diff_lines[:5000])
+
+        # Untracked files (relative paths only)
+        untracked_result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        untracked = untracked_result.stdout.strip()
+
+        duration_str = f"{int(duration_secs // 60)}m {int(duration_secs % 60)}s"
+        ts_display = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        lines = [
+            "# AI Failure Snapshot\n\n",
+            f"**Generated:** {ts_display}  \n",
+            f"**Project:** {project_dir}  \n",
+            f"**Feature:** {feature['name']}  \n",
+            f"**Branch:** {branch}  \n",
+            f"**AI exit code:** {ai_exit_code}  \n",
+            f"**Wall-clock duration:** {duration_str}  \n\n",
+            "## Last 200 Lines of AI Output\n\n",
+            "```\n",
+            last_block,
+            "```\n\n",
+            "## Git Status\n\n",
+            "```\n",
+            git_status,
+            "```\n\n",
+            "## Diff Stat (develop..HEAD)\n\n",
+            "```\n",
+            diff_stat,
+            "```\n\n",
+            "## Full Diff (develop..HEAD)\n\n",
+            "```diff\n",
+            diff_body,
+        ]
+        if diff_truncated:
+            lines.append("\n[... diff truncated at 5000 lines ...]\n")
+        lines.append("```\n\n")
+        lines.append("## Untracked Files\n\n")
+        if untracked:
+            for uf in untracked.splitlines():
+                lines.append(f"- {uf}\n")
+        else:
+            lines.append("*(none)*\n")
+
+        snapshot_path.write_text("".join(lines))
+        log.info("failure snapshot written: %s", snapshot_path)
+        return snapshot_path
+    except Exception as exc:
+        log.info("Failed to write failure snapshot: %s", exc)
+        return None
+
+
+def _latest_failure_snapshot(project_dir: Path) -> Optional[Path]:
+    """Return the most recent failure snapshot path for a project, or None."""
+    state_dir = _dtl_state_dir()
+    prefix = f"{project_dir.name}-"
+    suffix = "-failure-"
+    candidates = [
+        p
+        for p in state_dir.glob(f"{project_dir.name}-*-failure-*.md")
+        if p.name.startswith(prefix) and suffix in p.name
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.name)
+
+
 def _run_ai_with_limits(
     cmd: list[str],
     env: dict,
@@ -3975,6 +4101,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             ai_config_path = ai_dir / "config.json"
             ai_exit_code = 1
             ai_output = ""
+            ai_start = time.monotonic()
 
             if ai_config_path.exists():
                 # Use dtl's ai_run mechanism via subprocess to isolate failures
@@ -4046,6 +4173,18 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_exit_code,
                     next_feature["name"],
                 )
+                try:
+                    _write_failure_snapshot(
+                        project_dir,
+                        next_feature,
+                        branch,
+                        ai_exit_code,
+                        time.monotonic() - ai_start,
+                        ai_output,
+                        log,
+                    )
+                except Exception as _snap_exc:
+                    log.info("Unexpected error writing failure snapshot: %s", _snap_exc)
                 # Bail-out codes (wall-clock or retry-cap) pin the failure count
                 # so the next loop iteration marks the feature as Failed immediately.
                 if ai_exit_code in (124, 125):
@@ -4384,6 +4523,9 @@ def cmd_workflow_status(args: argparse.Namespace) -> None:
     print(f"Last skip reason:  {state.get('last_skip_reason', 'unknown')}")
     print(f"Consecutive skips: {state.get('consecutive_skips', 0)}")
     print(f"Next retry:        {state.get('next_retry', 'unknown')}")
+    latest_snapshot = _latest_failure_snapshot(project_dir)
+    if latest_snapshot:
+        print(f"Last failure snapshot: {latest_snapshot}")
 
 
 def cmd_workflow_next(args: argparse.Namespace) -> None:
