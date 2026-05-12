@@ -40,8 +40,8 @@ Live planning artifacts in `~/Projects/NEW-PROJECTS/`. Scan this directory befor
 
 | Visibility | Auto-merge on Free | Development model | Examples |
 |---|---|---|---|
-| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, usb-autoinstall-public, Prompt-Fishing |
-| Private | no | daytime, manual PR approval per feature | loom, future `hub` (workstation OS) |
+| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, usb-autoinstall-public, Prompt-Fishing, loom |
+| Private | no | daytime, manual PR approval per feature | future `hub` (workstation OS) |
 
 **Ephemeral workstation** — User's development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent.
 
