@@ -731,7 +731,7 @@ Cross-reference: night-4 brief misdiagnosed this as "auto-merge wasn't enabled o
 
 **Branch:** `feature/ai-failure-snapshot`
 **Depends on:** none
-**Status:** Not Started
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
@@ -781,4 +781,117 @@ Origin: loom night 4 (2026-04-27). The `diffusion-stylize` AI returned exit code
 Open question (resolve in implementation): how to capture AI stdout/stderr. The current `dtl ai run` subprocess wiring may already tee to the workflow log; if so, extracting last-200 from that log is cheaper than re-buffering. If stdout/stderr are not currently captured, this feature requires adding a ring buffer in the subprocess wrapper. Worth a quick read of the existing `_run_ai` (or equivalent) before settling the approach.
 
 Cross-reference: this complements `workflow-stall-visibility` (state file on every skip) and `ai-dev-loop-break` (FAILURE-REPORT.md on retry-cap or wall-clock kill). Those cover *successful refusal* and *self-detected stuck-loop*. This covers the *AI exited but produced uncommitted work* case — which is what actually happened on loom night 4.
+
+---
+
+## Feature: planning-templates-v2
+
+**Branch:** `feature/planning-templates-v2`
+**Depends on:** none
+**Status:** PR Open
+**Requires:** ai
+
+### Goal
+
+Refine the planning-Claude templates (PROJECT-BRIEF.md, DEVPLAN.md, CLAUDE.md, PLANNING-GUIDE.md, PROJECTS-CONTEXT.md) so that planning sessions held on a phone produce briefs the PM can act on without back-and-forth: explicit repo-visibility decision, optional Hardware Target section, mandatory Security & Trust Boundaries section, and a duplicate-detection step before proposing a brief.
+
+Origin: 2026-05-12 reconcile. The hub/hdlss-ws/watch-ops trio surfaced four gaps in the templates — duplicate planning of the same machine, missing public/private repo declaration, missing hardware section, no security-boundaries discipline.
+
+### Acceptance Criteria
+
+- [x] `templates/PLANNING-GUIDE.md` adds a "Before You Plan: Check What Already Exists" step (scan `~/Projects/NEW-PROJECTS/` for in-flight plans)
+- [x] `templates/PLANNING-GUIDE.md` adds Q11 (public/private repo), Q12 (hardware provisioning), Q13 (security/trust boundaries)
+- [x] `templates/PLANNING-GUIDE.md` adds a "Repo Visibility & Scheduling Eligibility" section explaining the GH Free auto-merge constraint
+- [x] `templates/PLANNING-GUIDE.md` adds a "Security & Trust Boundaries — How to Plan" section
+- [x] `templates/PROJECT-BRIEF.md` adds a Repo Visibility section (required)
+- [x] `templates/PROJECT-BRIEF.md` adds an optional Hardware Target section (required when project provisions a machine)
+- [x] `templates/PROJECT-BRIEF.md` adds an optional Security & Trust Boundaries section (required when project touches networking, credentials, devices, or deploys to metal)
+- [x] `templates/CLAUDE.md` adds a Network Segmentation and Trust Boundaries section after Coordination
+- [x] `templates/PROJECTS-CONTEXT.md` adds a Network Segmentation convention, a Repo Visibility & Scheduling Eligibility convention, and an "In-Flight Plans" pointer to `~/Projects/NEW-PROJECTS/`
+- [x] All tests pass (no code changed — templates only)
+- [x] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `templates/PLANNING-GUIDE.md` | Modify | Pre-plan scan, 3 new interview questions, 2 new sections |
+| `templates/PROJECT-BRIEF.md` | Modify | 3 new sections (Repo Visibility required, Hardware/Security optional-but-conditional) |
+| `templates/CLAUDE.md` | Modify | Network Segmentation and Trust Boundaries section |
+| `templates/PROJECTS-CONTEXT.md` | Modify | Two new conventions + in-flight-plans pointer |
+
+### Key Decisions
+
+- **Templates carry the discipline, not the planner's improvisation.** Every gap surfaced by hub/hdlss-ws/watch-ops becomes an explicit section so the next planning round doesn't rely on the planning Claude remembering to ask.
+- **Repo visibility is a hard fork in the development model** — public means overnight-scheduled, private means manual day-only. The template surfaces this so it's decided up front.
+- **Security & Trust Boundaries is conditional-mandatory.** Pure-software localhost-only projects skip it; anything touching networking, credentials, or hardware requires it.
+- **Bind addresses are never defaults.** The CLAUDE.md template's Network Segmentation block forces `127.0.0.1` / `tailscale0` / `0.0.0.0` to be a stated decision per service.
+- **In-flight plans live in `~/Projects/NEW-PROJECTS/`** and the planner is now instructed to scan them. Structural fix for the hub/hdlss-ws duplicate.
+
+### Notes
+
+Second round of planning-template refinement after PRs #19 and #25. Templates now carry the lessons from the first 4 production planning sessions, including the two failures (duplicate plan, missing segmentation thinking).
+
+Companion change made the same day: `~/Projects/NEW-PROJECTS/hub/PROJECT-BRIEF.md` and `DEVPLAN.md` rewritten against these refined templates; old `hub/Project-Brief.md`, `hub/Devplan.md`, `hdlss-ws/`, and `watch-ops/` moved to `~/Projects/NEW-PROJECTS/ARCHIVE/`.
+
+---
+
+## Feature: dtl-notify-hook
+
+**Branch:** `feature/dtl-notify-hook`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Add a notification hook to `dtl workflow run` that emits structured events (`needs-attention`, `feature-merged`, `test-failure`, `idle`, `ai-failure`) to a configurable HTTP endpoint. The endpoint is typically ntfy on the user's hub, which forwards to iOS via APNs and to a watch action-button surface. This decouples `dtl` from any specific notification backend.
+
+Origin: 2026-05-12, carved out of `watch-ops` planning. ntfy lives on hub (separate repo); the hook lives here because `dtl` is the event source.
+
+### Acceptance Criteria
+
+- [ ] `dtl workflow run` reads notification config from `~/.config/dtl/notify.toml` (gitignored, optional — absent = no notifications, log-only)
+- [ ] Config schema:
+  ```toml
+  url = "https://ntfy.<tailnet>.ts.net/dtl"
+  events = ["ai-failure", "feature-merged", "needs-attention", "idle"]
+  auth_header_file = "/etc/dtl/ntfy-auth"  # optional; contents become Authorization: header
+  retry_seconds = [1, 5, 30]                # backoff for delivery failures; then give up
+  ```
+- [ ] Events emitted (JSON POST body):
+  - `ai-failure` — AI subprocess exited non-zero (project, feature, exit_code, failure_snapshot_path from ai-failure-snapshot)
+  - `feature-merged` — workflow detected PR merged (project, feature, pr_number)
+  - `needs-attention` — workflow paused for [HUMAN] criterion (project, feature, criterion)
+  - `idle` — workflow has no Not-Started features left across all projects (timestamp)
+- [ ] Each POST includes a stable `event_id` for deduplication
+- [ ] Each POST includes optional `actions` array with `{label, url}` for ntfy action buttons (e.g., `approve PR 9` → POST to hub's action-handler endpoint)
+- [ ] Delivery failures retried per `retry_seconds`; total delivery time bounded; failed deliveries logged but never block the workflow
+- [ ] Notification config loaded once per workflow run, not per event
+- [ ] `dtl notify test` subcommand sends a synthetic event for testing
+- [ ] New tests in `tests/test_workflow.py`: (a) emits ai-failure event with correct shape on AI exit-1; (b) emits feature-merged on PR merge detection; (c) delivery failure is non-fatal
+- [ ] `docs/notify.md` documents config + event shapes + ntfy action-handler integration
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_load_notify_config`, `_emit_notify_event`, integrate at the 4 event sites in `cmd_workflow_run`; add `dtl notify test` subcommand |
+| `tests/test_workflow.py` | Modify | Three new tests covering event emission and delivery failure tolerance |
+| `docs/notify.md` | Create | Config + event shapes + ntfy action-handler integration |
+
+### Key Decisions
+
+- **stdlib HTTP** (`urllib.request`) — preserves the dtl stdlib-only constraint
+- **TOML config**, gitignored, optional — no surprise notifications, opt-in per machine
+- **Stable `event_id`** — lets ntfy / action-handlers deduplicate, supports retries
+- **Action buttons in the event payload** — the hook generates action URLs (e.g., `POST /api/approve/<project>/<pr>`); the hub-side action-handler endpoint dispatches them. Keeps verb vocabulary in one place (hub's dispatcher) but URL generation close to the event
+- **Delivery failures are silent (logged, not raised)** — workflow must never fail because a notification failed
+
+### Notes
+
+- **Companion features in `hub`:** `ntfy-stack`, `action-handlers`. The hub side cannot do anything without this feature shipping first as the event source
+- Authentication via `auth_header_file` is generic — works for Bearer, Basic, or none
 
