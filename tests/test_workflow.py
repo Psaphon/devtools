@@ -1092,3 +1092,158 @@ class TestPreflightAutoMerge:
             "Expected a warning log about allow_auto_merge / manual merge; "
             f"warning calls: {mock_logger.warning.call_args_list}"
         )
+
+
+# ---------------------------------------------------------------------------
+# AI failure snapshot
+# ---------------------------------------------------------------------------
+
+
+class TestAiFailureSnapshot:
+    """Tests for _write_failure_snapshot and cmd_workflow_run snapshot integration."""
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
+        return tmp_path
+
+    def test_ai_exit1_produces_snapshot_with_required_sections(
+        self, tmp_path, monkeypatch
+    ):
+        """Simulated AI exit-1 writes a snapshot file containing all required sections."""
+        from dtl import cmd_workflow_run
+
+        state_dir = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+
+        # Use a plan with a single Not Started feature so the loop terminates
+        # cleanly after one failure (max_failures=1) and only one snapshot is written.
+        single_feature_plan = """\
+# Development Plan: Single Feature
+
+## Constraints
+
+- Single file, stdlib-only
+
+---
+
+## Feature: beta-feature
+
+**Branch:** `feature/beta-feature`
+**Depends on:** none
+**Status:** Not Started
+
+### Goal
+
+Beta goal.
+
+### Acceptance Criteria
+
+- [ ] Beta criterion
+"""
+        project_dir = tmp_path / "myproject"
+        docs_dir = project_dir / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(single_feature_plan)
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 1
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        mock_logger = MagicMock()
+
+        def fake_subprocess_run(cmd, **kwargs):
+            # AI subprocess call returns exit code 1 with recognisable output
+            if sys.executable in str(cmd) or (
+                isinstance(cmd, list) and "claude" in cmd[0]
+            ):
+                return MagicMock(
+                    returncode=1,
+                    stdout="stdout line 1\n",
+                    stderr="stderr line 1\n",
+                )
+            # git calls succeed and return useful data
+            if isinstance(cmd, list):
+                if "status" in cmd:
+                    return MagicMock(returncode=0, stdout="M  foo.py\n", stderr="")
+                if "diff" in cmd and "--stat" in cmd:
+                    return MagicMock(returncode=0, stdout="foo.py | 1 +\n", stderr="")
+                if "diff" in cmd:
+                    return MagicMock(returncode=0, stdout="+added line\n", stderr="")
+                if "ls-files" in cmd:
+                    return MagicMock(returncode=0, stdout="untracked.py\n", stderr="")
+                if "checkout" in cmd or "pull" in cmd:
+                    return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch("dtl._setup_workflow_logger", return_value=mock_logger),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+            patch("dtl.time.sleep"),
+        ):
+            cmd_workflow_run(args)
+
+        snapshot_dir = state_dir / "dtl"
+        snapshots = list(snapshot_dir.glob("myproject-*-failure-*.md"))
+        assert len(snapshots) == 1, f"Expected 1 snapshot file; found {snapshots}"
+
+        content = snapshots[0].read_text()
+        assert "**Project:**" in content
+        assert "**Feature:**" in content
+        assert "**Branch:**" in content
+        assert "**AI exit code:**" in content
+        assert "**Wall-clock duration:**" in content
+        assert "## Last 200 Lines of AI Output" in content
+        assert "## Git Status" in content
+        assert "## Diff Stat" in content
+        assert "## Full Diff" in content
+        assert "## Untracked Files" in content
+        # Snapshot path logged
+        info_calls = [str(c) for c in mock_logger.info.call_args_list]
+        assert any("failure snapshot written" in c for c in info_calls), (
+            f"Expected 'failure snapshot written' log; got {info_calls}"
+        )
+
+    def test_snapshot_write_failure_does_not_raise(self, tmp_path, monkeypatch):
+        """If snapshot directory is unwritable, cmd_workflow_run does not raise."""
+        from dtl import cmd_workflow_run
+
+        state_dir = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+        project_dir = self._make_project(tmp_path / "myproject")
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if sys.executable in str(cmd) or (
+                isinstance(cmd, list) and "claude" in cmd[0]
+            ):
+                return MagicMock(returncode=1, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        def exploding_write_snapshot(*args, **kwargs):
+            raise OSError("disk full")
+
+        with (
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+            patch("dtl._write_failure_snapshot", side_effect=exploding_write_snapshot),
+            patch("dtl.time.sleep"),
+        ):
+            # Must not raise
+            cmd_workflow_run(args)

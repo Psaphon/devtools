@@ -731,7 +731,7 @@ Cross-reference: night-4 brief misdiagnosed this as "auto-merge wasn't enabled o
 
 **Branch:** `feature/ai-failure-snapshot`
 **Depends on:** none
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** ai
 
 ### Goal
