@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ import sys
 import textwrap
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -3684,6 +3686,106 @@ def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict
     return None
 
 
+# ---------------------------------------------------------------------------
+# Notification hook helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_notify_config() -> Optional[dict]:
+    """Load ~/.config/dtl/notify.toml.
+
+    Returns the parsed config dict, or None if the file is absent or unparseable.
+    Config is optional — absent means no notifications, log-only.
+    """
+    config_path = Path.home() / ".config" / "dtl" / "notify.toml"
+    if not config_path.exists():
+        return None
+    try:
+        import tomllib  # Python 3.11+ stdlib
+
+        with open(config_path, "rb") as fh:
+            return tomllib.load(fh)
+    except Exception:
+        return None
+
+
+def _emit_notify_event(
+    config: Optional[dict],
+    event_type: str,
+    payload: dict,
+    log: "logging.Logger",
+) -> None:
+    """POST a structured notification event to the configured HTTP endpoint.
+
+    Never raises; delivery failures are logged but never block the workflow.
+    Config is loaded once per workflow run and passed in here.
+
+    Event body shape:
+        {event, event_id, timestamp, actions, **payload}
+    """
+    if not config:
+        return
+
+    events_filter = config.get("events", [])
+    if events_filter and event_type not in events_filter:
+        return
+
+    url = config.get("url", "")
+    if not url:
+        return
+
+    # Stable event_id for deduplication — survives retries and hub restarts
+    id_src = f"{event_type}:{json.dumps(payload, sort_keys=True)}"
+    event_id = hashlib.sha256(id_src.encode()).hexdigest()[:16]
+
+    body: dict = {
+        "event": event_type,
+        "event_id": event_id,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "actions": [],
+    }
+    body.update(payload)
+
+    headers = {"Content-Type": "application/json"}
+    auth_file = config.get("auth_header_file", "")
+    if auth_file:
+        try:
+            auth_value = Path(auth_file).read_text().strip()
+            if auth_value:
+                headers["Authorization"] = auth_value
+        except Exception:
+            pass  # auth file missing or unreadable — proceed without auth
+
+    retry_seconds: list = config.get("retry_seconds", [1, 5, 30])
+    data = json.dumps(body).encode()
+
+    for attempt, delay in enumerate(retry_seconds):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status < 300:
+                    log.info(
+                        "Notify: %s delivered (event_id=%s).", event_type, event_id
+                    )
+                    return
+                log.info(
+                    "Notify: %s HTTP %d on attempt %d.",
+                    event_type,
+                    resp.status,
+                    attempt + 1,
+                )
+        except Exception as exc:
+            log.info(
+                "Notify: attempt %d failed for %s: %s", attempt + 1, event_type, exc
+            )
+        if attempt < len(retry_seconds) - 1 and delay > 0:
+            time.sleep(delay)
+
+    log.info(
+        "Notify: giving up on %s after %d attempts.", event_type, len(retry_seconds)
+    )
+
+
 def cmd_workflow_finish(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow finish'."""
     plan_path = Path(args.plan).resolve()
@@ -3887,6 +3989,59 @@ def _preflight_auto_merge(project_dir: Path) -> Optional[bool]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Notify commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_notify_test(args: argparse.Namespace) -> None:
+    """Handle 'dtl notify test' — send a synthetic event to verify notification config."""
+    cfg = _load_notify_config()
+    if not cfg:
+        print(
+            "No notify config found at ~/.config/dtl/notify.toml\n"
+            "Create the file first. See docs/notify.md for the config schema.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    log = logging.getLogger("dtl.notify.test")
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+
+    event_type = getattr(args, "event", "idle")
+    now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    _synthetic: dict[str, dict] = {
+        "ai-failure": {
+            "project": "test-project",
+            "feature": "test-feature",
+            "exit_code": 1,
+            "failure_snapshot_path": None,
+        },
+        "feature-merged": {
+            "project": "test-project",
+            "feature": "test-feature",
+            "pr_number": 42,
+        },
+        "needs-attention": {
+            "project": "test-project",
+            "feature": "test-feature",
+            "criterion": "- [ ] [HUMAN] Manually verify the output",
+        },
+        "idle": {"timestamp": now_ts},
+    }
+
+    payload = _synthetic.get(event_type, {"timestamp": now_ts})
+    url = cfg.get("url", "(no url configured)")
+    print(f"Sending synthetic '{event_type}' event to {url} ...")
+    _emit_notify_event(cfg, event_type, payload, log)
+    print("Done.")
+
+
 def cmd_workflow_run(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow run' — the full autonomous loop."""
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
@@ -3920,6 +4075,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             pass
 
     log = _setup_workflow_logger(log_path)
+
+    # Load notification config once for the entire run
+    notify_cfg = _load_notify_config()
+    log.info(
+        "Notify config: %s",
+        "loaded" if notify_cfg else "absent (notifications disabled)",
+    )
 
     # Preflight: check allow_auto_merge on each project's GitHub repo
     failed_repos: list[str] = []
@@ -4173,8 +4335,9 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_exit_code,
                     next_feature["name"],
                 )
+                _snapshot_path: Optional[Path] = None
                 try:
-                    _write_failure_snapshot(
+                    _snapshot_path = _write_failure_snapshot(
                         project_dir,
                         next_feature,
                         branch,
@@ -4185,6 +4348,19 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     )
                 except Exception as _snap_exc:
                     log.info("Unexpected error writing failure snapshot: %s", _snap_exc)
+                _emit_notify_event(
+                    notify_cfg,
+                    "ai-failure",
+                    {
+                        "project": project_dir.name,
+                        "feature": next_feature["name"],
+                        "exit_code": ai_exit_code,
+                        "failure_snapshot_path": str(_snapshot_path)
+                        if _snapshot_path
+                        else None,
+                    },
+                    log,
+                )
                 # Bail-out codes (wall-clock or retry-cap) pin the failure count
                 # so the next loop iteration marks the feature as Failed immediately.
                 if ai_exit_code in (124, 125):
@@ -4222,6 +4398,30 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     capture_output=True,
                 )
                 continue
+
+            # Emit needs-attention for any [HUMAN] acceptance criteria
+            _human_criteria = [
+                line.strip()
+                for line in next_feature["block"].splitlines()
+                if "[HUMAN]" in line and line.strip().startswith("- [")
+            ]
+            for _criterion in _human_criteria:
+                _emit_notify_event(
+                    notify_cfg,
+                    "needs-attention",
+                    {
+                        "project": project_dir.name,
+                        "feature": next_feature["name"],
+                        "criterion": _criterion,
+                    },
+                    log,
+                )
+            if _human_criteria:
+                log.info(
+                    "[%s] %d [HUMAN] criterion/criteria — needs-attention event(s) emitted.",
+                    project_dir.name,
+                    len(_human_criteria),
+                )
 
             # Commit any remaining changes
             if _git_is_dirty(project_dir):
@@ -4332,6 +4532,20 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     )
                     # Reset failure counter on success
                     consecutive_failures[fail_key] = 0
+                    # Emit feature-merged event
+                    _pr_num_match = re.search(r"/pull/(\d+)", pr_url or "")
+                    _emit_notify_event(
+                        notify_cfg,
+                        "feature-merged",
+                        {
+                            "project": project_dir.name,
+                            "feature": next_feature["name"],
+                            "pr_number": int(_pr_num_match.group(1))
+                            if _pr_num_match
+                            else None,
+                        },
+                        log,
+                    )
                     break
                 elif state == "CLOSED":
                     log.info(
@@ -4344,6 +4558,12 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
 
         if not any_work_done:
             log.info("=== All projects complete. Exiting. ===")
+            _emit_notify_event(
+                notify_cfg,
+                "idle",
+                {"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+                log,
+            )
             break
 
         # Floor sleep — belt-and-suspenders to prevent spin if any_work_done
@@ -5067,6 +5287,24 @@ def main() -> None:
     )
     wf_status_parser.set_defaults(func=cmd_workflow_status)
 
+    # -- notify --
+    notify_parser = subparsers.add_parser(
+        "notify",
+        help="Notification hook management",
+    )
+    notify_subparsers = notify_parser.add_subparsers(dest="notify_command")
+    nt_test_parser = notify_subparsers.add_parser(
+        "test",
+        help="Send a synthetic event to verify notification config",
+    )
+    nt_test_parser.add_argument(
+        "--event",
+        default="idle",
+        choices=["ai-failure", "feature-merged", "needs-attention", "idle"],
+        help="Event type to send (default: idle)",
+    )
+    nt_test_parser.set_defaults(func=cmd_notify_test)
+
     # -- Parse and dispatch --
     args = parser.parse_args()
     if not args.command:
@@ -5089,6 +5327,12 @@ def main() -> None:
     if args.command == "watchdog":
         if not getattr(args, "watchdog_command", None):
             watchdog_parser.print_help()
+            sys.exit(1)
+
+    # Handle 'notify' subcommand group
+    if args.command == "notify":
+        if not getattr(args, "notify_command", None):
+            notify_parser.print_help()
             sys.exit(1)
 
     args.func(args)

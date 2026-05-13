@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
     _build_ai_prompt,
+    _emit_notify_event,
     _git_is_dirty,
     _maybe_notify_stalled,
     _parse_devplan,
@@ -1246,4 +1247,219 @@ Beta goal.
             patch("dtl.time.sleep"),
         ):
             # Must not raise
+            cmd_workflow_run(args)
+
+
+# ---------------------------------------------------------------------------
+# Notify hook tests
+# ---------------------------------------------------------------------------
+
+
+class TestEmitNotifyEventAiFailure:
+    """_emit_notify_event sends an ai-failure event with the correct JSON shape."""
+
+    def test_ai_failure_event_shape(self, tmp_path):
+        """ai-failure POST body contains event, event_id, timestamp, and payload fields."""
+        import json
+        import logging
+
+        posted_bodies: list[dict] = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        def fake_urlopen(req, timeout=None):
+            posted_bodies.append(json.loads(req.data.decode()))
+            return FakeResponse()
+
+        cfg = {
+            "url": "https://ntfy.example.ts.net/dtl",
+            "events": ["ai-failure", "feature-merged", "needs-attention", "idle"],
+            "retry_seconds": [0],
+        }
+        log = logging.getLogger("test.ai_failure")
+
+        with patch("dtl.urllib.request.urlopen", side_effect=fake_urlopen):
+            _emit_notify_event(
+                cfg,
+                "ai-failure",
+                {
+                    "project": "myproject",
+                    "feature": "beta-feature",
+                    "exit_code": 1,
+                    "failure_snapshot_path": "/tmp/snap.md",
+                },
+                log,
+            )
+
+        assert len(posted_bodies) == 1, "Expected exactly one POST"
+        body = posted_bodies[0]
+        assert body["event"] == "ai-failure"
+        assert "event_id" in body and len(body["event_id"]) == 16
+        assert "timestamp" in body
+        assert body["project"] == "myproject"
+        assert body["feature"] == "beta-feature"
+        assert body["exit_code"] == 1
+        assert body["failure_snapshot_path"] == "/tmp/snap.md"
+        assert "actions" in body
+
+
+class TestEmitNotifyEventFeatureMerged:
+    """cmd_workflow_run emits feature-merged event when a PR is detected as merged."""
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        plan = """\
+# Development Plan: Test
+
+## Feature: beta-feature
+
+**Branch:** `feature/beta-feature`
+**Depends on:** none
+**Status:** Not Started
+
+### Goal
+
+Beta goal.
+
+### Acceptance Criteria
+
+- [ ] Beta criterion
+"""
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(plan)
+        return tmp_path
+
+    def test_feature_merged_event_emitted_on_pr_merge(self, tmp_path, monkeypatch):
+        """When the poll loop detects MERGED, a feature-merged event is emitted."""
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "myproject")
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        emitted_events: list[dict] = []
+
+        def fake_emit(cfg, event_type, payload, log):
+            emitted_events.append({"event": event_type, **payload})
+
+        def fake_update_status(plan_path_arg, name, status):
+            # Use the real implementation so the plan file is updated, terminating the loop
+            _update_feature_status(plan_path_arg, name, status)
+
+        with (
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch(
+                "dtl._load_notify_config",
+                return_value={"url": "https://example.com", "events": []},
+            ),
+            patch("dtl._emit_notify_event", side_effect=fake_emit),
+            patch(
+                "dtl.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="", stderr=""),
+            ),
+            patch("dtl.ai_run"),
+            patch("dtl._run_lint_and_tests", return_value=(True, "")),
+            patch("dtl._git_push_branch", return_value=True),
+            patch(
+                "dtl._gh_create_pr", return_value="https://github.com/org/repo/pull/7"
+            ),
+            patch("dtl._gh_enable_auto_merge", return_value=True),
+            patch("dtl._gh_pr_state", return_value="MERGED"),
+            patch("dtl._update_feature_status", side_effect=fake_update_status),
+            patch("dtl.time.sleep"),
+        ):
+            cmd_workflow_run(args)
+
+        merged_events = [e for e in emitted_events if e["event"] == "feature-merged"]
+        assert merged_events, f"Expected feature-merged event; got {emitted_events}"
+        ev = merged_events[0]
+        assert ev["project"] == "myproject"
+        assert ev["feature"] == "beta-feature"
+        assert ev["pr_number"] == 7
+
+
+class TestNotifyDeliveryFailureNonFatal:
+    """Delivery failures from _emit_notify_event never raise and never block the workflow."""
+
+    def test_urlopen_exception_is_swallowed(self):
+        """When urllib raises on every attempt, _emit_notify_event returns without raising."""
+        import logging
+
+        log = logging.getLogger("test.delivery_failure")
+        cfg = {
+            "url": "https://ntfy.example.ts.net/dtl",
+            "events": [],
+            "retry_seconds": [0, 0],
+        }
+
+        def exploding_urlopen(req, timeout=None):
+            raise OSError("connection refused")
+
+        with patch("dtl.urllib.request.urlopen", side_effect=exploding_urlopen):
+            # Must not raise
+            _emit_notify_event(
+                cfg,
+                "idle",
+                {"timestamp": "2026-01-01T00:00:00+00:00"},
+                log,
+            )
+
+    def test_workflow_run_continues_when_urlopen_fails(self, tmp_path, monkeypatch):
+        """cmd_workflow_run exits cleanly when the notify endpoint is unreachable."""
+        from dtl import cmd_workflow_run
+
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        docs_dir = project_dir / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(
+            "## Feature: solo\n\n**Branch:** `feature/solo`\n"
+            "**Depends on:** none\n**Status:** Not Started\n\n### Goal\n\nSolo.\n"
+        )
+
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+
+        def exploding_urlopen(req, timeout=None):
+            raise OSError("connection refused")
+
+        # All projects skipped (dirty tree) → idle event fired → urlopen fails.
+        # Workflow must still exit cleanly.
+        with (
+            patch("dtl._git_is_dirty", return_value=True),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch(
+                "dtl._load_notify_config",
+                return_value={
+                    "url": "https://ntfy.example.ts.net/dtl",
+                    "events": ["idle"],
+                    "retry_seconds": [0],
+                },
+            ),
+            patch("dtl.urllib.request.urlopen", side_effect=exploding_urlopen),
+            patch("dtl.time.sleep"),
+        ):
+            # Must not raise even though every urlopen call fails
             cmd_workflow_run(args)
