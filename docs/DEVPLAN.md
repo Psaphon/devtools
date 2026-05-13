@@ -840,7 +840,7 @@ Companion change made the same day: `~/Projects/NEW-PROJECTS/hub/PROJECT-BRIEF.m
 
 **Branch:** `feature/dtl-notify-hook`
 **Depends on:** none
-**Status:** In Progress
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
