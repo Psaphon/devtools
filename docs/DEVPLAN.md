@@ -895,3 +895,121 @@ Origin: 2026-05-12, carved out of `watch-ops` planning. ntfy lives on hub (separ
 - **Companion features in `hub`:** `ntfy-stack`, `action-handlers`. The hub side cannot do anything without this feature shipping first as the event source
 - Authentication via `auth_header_file` is generic — works for Bearer, Basic, or none
 
+## Feature: interruption-taxonomy
+
+**Branch:** `feature/interruption-taxonomy`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Replace the substring-on-stdout auth-failure detection with a structured outcome signal. `_detect_auth_failure` (dtl.py:3666) does a full-text scan of AI output for strings like `"authentication failed"` — and on 2026-05-14 02:20 EDT it false-positive'd on the AI's own narration of writing a Cloudflare Worker error message, abandoning a fully-completed `research-worker` feature mid-run. This feature introduces a `RunOutcome` enum, a sentinel marker the AI prints as its final line, and tail-only fallback detection. No more stranded work because of substring collisions.
+
+### Acceptance Criteria
+
+- [ ] New `class RunOutcome` (string constants) defined in `dtl.py`: `COMPLETED`, `COMPLETED_TESTS_FAILED`, `COMPLETED_NOTHING_TO_PUSH`, `INTERRUPTED_QUOTA`, `INTERRUPTED_AUTH`, `INTERRUPTED_WALL_CLOCK`, `INTERRUPTED_NETWORK`, `FAILED_AI`, `FAILED_INFRA`
+- [ ] New `_classify_run(exit_code, output_lines)` returns a `RunOutcome`. Looks for `<<<DTL:OUTCOME=NAME>>>` sentinel first, then falls back to tail-only scan (last 50 lines) with disjoint pattern sets per outcome
+- [ ] `_build_ai_prompt` (dtl.py:3118) appends: *"After committing, print exactly this line as your final output: `<<<DTL:OUTCOME=COMPLETED>>>`. If you cannot complete, print `<<<DTL:OUTCOME=FAILED_AI>>>` followed by a one-line reason."*
+- [ ] `_detect_auth_failure` is deleted; all callers route through `_classify_run`
+- [ ] `cmd_workflow_run` (dtl.py:4322) replaces the `if _detect_auth_failure(ai_output): sys.exit(2)` block with a switch on `_classify_run(...)`. Each outcome has explicit handling (no silent `sys.exit`)
+- [ ] `INTERRUPTED_AUTH` writes a snapshot, emits a notify event, and pauses cleanly
+- [ ] `INTERRUPTED_QUOTA` and `INTERRUPTED_NETWORK` do NOT count toward the feature's failure budget (environmental)
+- [ ] On any interruption, working tree is left clean (DEVPLAN status reverted, branch returned to develop) — no more dirty-tree skip loops on the next run
+- [ ] Tests in `tests/test_workflow.py`: `TestRunClassification` covers one test per outcome plus a regression test for last night's bug (output containing `"authentication failed"` PLUS `<<<DTL:OUTCOME=COMPLETED>>>` must classify as `COMPLETED`)
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `RunOutcome`, `_classify_run`; delete `_detect_auth_failure`; update `_build_ai_prompt` and `cmd_workflow_run` |
+| `tests/test_workflow.py` | Modify | Add `TestRunClassification` |
+
+### Notes
+
+- **Single-file constraint:** `RunOutcome` is a class of string constants in `dtl.py`, not a separate module
+- **Sentinel format:** `<<<DTL:OUTCOME=NAME>>>` chosen for low collision risk — triple-bracket sentinels are unusual in code, AI narration, or test output
+- **Tail-only fallback:** scan `output_lines[-50:]` not full output. Last night's bug class is impossible if the AI never narrates auth errors in its closing 50 lines
+- **Backward compat:** when the sentinel is absent (AI ignored the instruction), classification falls back to tail scan — never to full-text scan
+- **Bootstrapping caveat:** this feature changes the very detection that would otherwise strand it. Build via direct edit, not via `dtl workflow run` (which would false-positive on its own test patterns)
+
+## Feature: per-feature-state
+
+**Branch:** `feature/per-feature-state`
+**Depends on:** interruption-taxonomy
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Move the workflow's per-feature retry budget out of an in-memory dict (`consecutive_failures` in `cmd_workflow_run`) and into a persistent per-feature state file. Adds a clean separation: DEVPLAN status is the *lifecycle* (humans plan from it); per-feature state is the *cause* (workflow recovers from it). Makes interruption-recovery decisions possible across workflow restarts.
+
+### Acceptance Criteria
+
+- [ ] New `_feature_state_path(project_dir, feature_name)` returns `~/.local/state/dtl/<project>/<feature>.json`
+- [ ] New `_read_feature_state` and `_write_feature_state` (atomic write via tempfile + rename, mode 0o600)
+- [ ] State schema: `{"last_outcome": str, "last_run_iso": str, "attempts_completed": int, "attempts_interrupted": int, "partial_work_branch": str|null}`
+- [ ] `cmd_workflow_run` removes `consecutive_failures: dict[str, int]` and reads/writes per-feature state instead
+- [ ] `INTERRUPTED_*` outcomes increment `attempts_interrupted`, NOT `attempts_completed` (so quota interruptions don't burn the retry budget)
+- [ ] `FAILED_*` outcomes increment `attempts_completed`; after `max_failures`, feature is marked `Failed` in DEVPLAN
+- [ ] `_write_failure_snapshot` is the single snapshot writer. `_write_failure_report` is deleted (it dirtied the project root with `FAILURE-REPORT.md`)
+- [ ] `_watchdog_check_*` reads `<project>/<feature>.json` as primary signal where applicable; falls back to git/gh
+- [ ] New `dtl workflow status --plan <plan>` subcommand shows per-feature state alongside DEVPLAN status (lifecycle vs cause)
+- [ ] Tests verify: state survives a simulated process restart; `INTERRUPTED_QUOTA` does not increment `attempts_completed`; existing workflow paths work unchanged
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add state helpers, refactor `cmd_workflow_run`, delete `_write_failure_report`, update watchdog |
+| `tests/test_workflow.py` | Modify | Add `TestFeatureState` |
+| `tests/test_watchdog.py` | Modify | Verify watchdog reads state file |
+
+### Notes
+
+- **State directory:** uses existing `_dtl_state_dir()` (dtl.py:3251). New per-feature subdirectory: `~/.local/state/dtl/<project>/`
+- **Migration:** none — first read of an absent file returns the empty default
+- **`partial_work_branch`:** populated on `INTERRUPTED_WALL_CLOCK` so a future feature can teach the AI to resume on its existing branch
+- **Lifecycle/cause split:** DEVPLAN status remains the planning-side source of truth; per-feature state is the workflow-side source of truth. Workflow trusts DEVPLAN for lifecycle, trusts state file for cause
+
+## Feature: provider-chain
+
+**Branch:** `feature/provider-chain`
+**Depends on:** per-feature-state
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make `dtl ai run` and `dtl workflow run` aware of an ordered list of AI providers, and rotate to the next provider on `INTERRUPTED_QUOTA`. Replaces the current single-provider-per-project model. Also refreshes the stale model IDs in `AI_PROVIDERS_CONFIG` (dtl.py:239) to current versions.
+
+### Acceptance Criteria
+
+- [ ] `<project>/.ai/config.json` accepts a new optional `provider_chain` field: ordered list of provider names. Falls back to single `provider` if absent (backward compat)
+- [ ] `cmd_workflow_run` consults `provider_chain` on `INTERRUPTED_QUOTA`: writes `last_outcome=INTERRUPTED_QUOTA`, retries the same feature with the next provider in the chain. After exhausting the chain, sleeps until quota window resets (configurable, default 3600s)
+- [ ] `AI_PROVIDERS_CONFIG` model IDs updated: opus → `claude-opus-4-7`, sonnet → `claude-sonnet-4-6`, haiku → `claude-haiku-4-5-20251001`
+- [ ] `ollama` gains an autonomous adapter (`supports_autonomous: True`), serving as a no-quota fallback. Uses `ollama run` in print mode against the host daemon
+- [ ] `dtl ai list-providers` output shows a quota-source annotation (e.g. `[anthropic-shared]` for claude/openclaw, `[local]` for ollama)
+- [ ] `dtl ai run` accepts `--provider-chain claude,ollama` to override per-call (optional)
+- [ ] Tests cover: chain rotation on simulated `INTERRUPTED_QUOTA`; chain exhaustion sleep; backward compat with single-provider config
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add ollama autonomous adapter, refactor dispatcher, refresh model IDs |
+| `tests/test_workflow.py` | Modify | Add `TestProviderChain` |
+| `tests/test_ai_run.py` | Modify | Verify chain rotation |
+
+### Notes
+
+- **`openclaw` and `claude` share the Anthropic quota** when both use `ANTHROPIC_API_KEY` from the same account. Document this in `dtl ai list-providers` so users don't pick a useless chain
+- **Local Ollama is the only true no-quota fallback** today, but its `supports_autonomous` is False — this PR adds the autonomous adapter
+- **Model ID drift:** the current IDs (`claude-opus-4-20250514`) are pre-4.7. Update at merge time and document the bump convention
+
