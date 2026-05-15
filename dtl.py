@@ -3133,6 +3133,15 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
         "GitHub appends one automatically on squash-merge, so including one "
         "here produces a duplicate suffix (e.g. feat: foo (#4) (#4))."
     )
+    parts.append("")
+    parts.append(
+        "After your final commit (or when you cannot proceed), print exactly "
+        "this line as your final output (no trailing text on the same line): "
+        "<<<DTL:OUTCOME=COMPLETED>>> if you successfully implemented the "
+        "feature, or <<<DTL:OUTCOME=FAILED_AI>>> followed by a one-line "
+        "reason on the next line if you could not. The host workflow uses "
+        "this marker as the authoritative signal of run outcome."
+    )
     return "\n".join(parts)
 
 
@@ -3663,19 +3672,110 @@ def _gh_pr_state(project_dir: Path, branch: str) -> Optional[str]:
     return None
 
 
-def _detect_auth_failure(output: str) -> bool:
-    """Check if AI output indicates an authentication failure."""
-    auth_patterns = [
-        "authentication failed",
-        "auth error",
-        "invalid api key",
-        "unauthorized",
-        "expired token",
-        "please run claude login",
-        "not authenticated",
-    ]
-    lower = output.lower()
-    return any(p in lower for p in auth_patterns)
+class RunOutcome:
+    """Structured outcomes of an AI run, used by _classify_run.
+
+    String-constants form (not Enum) to keep dtl.py stdlib-friendly and
+    let the values pass through subprocess output cleanly.
+    """
+
+    COMPLETED = "COMPLETED"
+    COMPLETED_TESTS_FAILED = "COMPLETED_TESTS_FAILED"
+    COMPLETED_NOTHING_TO_PUSH = "COMPLETED_NOTHING_TO_PUSH"
+    INTERRUPTED_QUOTA = "INTERRUPTED_QUOTA"
+    INTERRUPTED_AUTH = "INTERRUPTED_AUTH"
+    INTERRUPTED_WALL_CLOCK = "INTERRUPTED_WALL_CLOCK"
+    INTERRUPTED_NETWORK = "INTERRUPTED_NETWORK"
+    FAILED_AI = "FAILED_AI"
+    FAILED_INFRA = "FAILED_INFRA"
+
+    ALL = (
+        COMPLETED,
+        COMPLETED_TESTS_FAILED,
+        COMPLETED_NOTHING_TO_PUSH,
+        INTERRUPTED_QUOTA,
+        INTERRUPTED_AUTH,
+        INTERRUPTED_WALL_CLOCK,
+        INTERRUPTED_NETWORK,
+        FAILED_AI,
+        FAILED_INFRA,
+    )
+
+    INTERRUPTED = (
+        INTERRUPTED_QUOTA,
+        INTERRUPTED_AUTH,
+        INTERRUPTED_WALL_CLOCK,
+        INTERRUPTED_NETWORK,
+    )
+
+
+SENTINEL_RE = re.compile(r"<<<DTL:OUTCOME=([A-Z_]+)>>>")
+
+# Disjoint pattern groups for tail-only fallback classification.
+# Patterns are tested in order; the first group with a match wins.
+_TAIL_PATTERNS: tuple = (
+    (
+        RunOutcome.INTERRUPTED_QUOTA,
+        (
+            "claude usage limit reached",
+            "usage limit reached",
+            "rate_limit_error",
+            "rate limit exceeded",
+            "quota exceeded",
+        ),
+    ),
+    (
+        RunOutcome.INTERRUPTED_AUTH,
+        (
+            "please run claude login",
+            "expired token",
+            "not authenticated",
+            "invalid api key",
+        ),
+    ),
+    (
+        RunOutcome.INTERRUPTED_NETWORK,
+        (
+            "connection reset by peer",
+            "temporary failure in name resolution",
+            "no route to host",
+            "connection timed out",
+        ),
+    ),
+)
+
+
+def _classify_run(exit_code: int, output_lines: list[str]) -> str:
+    """Classify a finished AI run as a RunOutcome value.
+
+    Detection order:
+
+    1. Sentinel marker — scan output_lines for ``<<<DTL:OUTCOME=NAME>>>``.
+       A recognized sentinel value is authoritative.
+    2. Tail-only substring scan (last 50 lines) with disjoint per-outcome
+       patterns. Tail-only is deliberate: full-text scans false-positive on
+       the AI's own narration of writing auth/quota-related code (see the
+       2026-05-14 stranded-research-worker incident).
+    3. Exit-code fallback — 0 -> COMPLETED, 124 -> INTERRUPTED_WALL_CLOCK,
+       anything else (including 125 retry-cap) -> FAILED_AI.
+    """
+    for line in reversed(output_lines):
+        m = SENTINEL_RE.search(line)
+        if m:
+            name = m.group(1)
+            if name in RunOutcome.ALL:
+                return name
+
+    tail = "\n".join(output_lines[-50:]).lower()
+    for outcome, patterns in _TAIL_PATTERNS:
+        if any(p in tail for p in patterns):
+            return outcome
+
+    if exit_code == 0:
+        return RunOutcome.COMPLETED
+    if exit_code == 124:
+        return RunOutcome.INTERRUPTED_WALL_CLOCK
+    return RunOutcome.FAILED_AI
 
 
 def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict]:
@@ -4042,6 +4142,70 @@ def cmd_notify_test(args: argparse.Namespace) -> None:
     print("Done.")
 
 
+def _handle_interruption(
+    project_dir: Path,
+    plan_path: Path,
+    feature: dict,
+    branch: str,
+    outcome: str,
+    ai_exit_code: int,
+    ai_output: str,
+    ai_start: float,
+    log: "logging.Logger",
+    notify_cfg: Optional[dict],
+) -> None:
+    """Record an interruption: snapshot, notify, restore clean tree on develop.
+
+    Interruptions are NOT failures — the AI was prevented from completing,
+    not unable to complete. They never consume the feature's failure budget.
+    The feature branch is left intact for forensics; develop is checked out
+    cleanly so the next loop iteration can retry the feature without
+    tripping the dirty-tree skip.
+    """
+    snapshot_path: Optional[Path] = None
+    try:
+        snapshot_path = _write_failure_snapshot(
+            project_dir,
+            feature,
+            branch,
+            ai_exit_code,
+            time.monotonic() - ai_start,
+            ai_output,
+            log,
+        )
+    except Exception as exc:
+        log.info("Snapshot write failed: %s", exc)
+
+    _emit_notify_event(
+        notify_cfg,
+        "ai-interruption",
+        {
+            "project": project_dir.name,
+            "feature": feature["name"],
+            "outcome": outcome,
+            "exit_code": ai_exit_code,
+            "failure_snapshot_path": str(snapshot_path) if snapshot_path else None,
+        },
+        log,
+    )
+
+    # Discard the workflow's pre-run "In Progress" status edit if the AI
+    # didn't commit it. Targeted to DEVPLAN.md only — any unexpected dirty
+    # files trigger the dirty-tree skip on the next loop instead of being
+    # silently erased.
+    rel_plan = plan_path.relative_to(project_dir)
+    subprocess.run(
+        ["git", "checkout", "--", str(rel_plan)],
+        cwd=project_dir,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "develop"],
+        cwd=project_dir,
+        capture_output=True,
+    )
+
+
 def cmd_workflow_run(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow run' — the full autonomous loop."""
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
@@ -4319,14 +4483,34 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_output = ""
 
             # Check for auth failure
-            if _detect_auth_failure(ai_output):
-                log.info(
-                    "[%s] AUTH FAILURE detected — pausing workflow. "
-                    "Run 'claude login' to re-authenticate.",
-                    project_dir.name,
+            outcome = _classify_run(ai_exit_code, ai_output.splitlines())
+            log.info("[%s] AI run outcome: %s", project_dir.name, outcome)
+
+            if outcome in RunOutcome.INTERRUPTED:
+                _handle_interruption(
+                    project_dir,
+                    plan_path,
+                    next_feature,
+                    branch,
+                    outcome,
+                    ai_exit_code,
+                    ai_output,
+                    ai_start,
+                    log,
+                    notify_cfg,
                 )
-                _update_feature_status(plan_path, next_feature["name"], "Not Started")
-                sys.exit(2)
+                if outcome in (
+                    RunOutcome.INTERRUPTED_AUTH,
+                    RunOutcome.INTERRUPTED_QUOTA,
+                ):
+                    log.info(
+                        "[%s] Interruption requires human attention (%s). "
+                        "Pausing workflow cleanly.",
+                        project_dir.name,
+                        outcome,
+                    )
+                    sys.exit(0)
+                continue
 
             if ai_exit_code != 0:
                 log.info(

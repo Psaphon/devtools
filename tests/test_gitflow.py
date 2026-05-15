@@ -9,7 +9,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
-    _detect_auth_failure,
     _find_feature_for_branch,
     _parse_devplan,
     _run_lint_and_tests,
@@ -73,29 +72,9 @@ Gamma goal.
 """
 
 
-# ---------------------------------------------------------------------------
-# _detect_auth_failure
-# ---------------------------------------------------------------------------
-
-
-class TestDetectAuthFailure:
-    def test_detects_auth_error(self):
-        assert _detect_auth_failure("Error: Authentication failed for Claude API")
-
-    def test_detects_login_prompt(self):
-        assert _detect_auth_failure("Please run claude login to authenticate")
-
-    def test_detects_expired_token(self):
-        assert _detect_auth_failure("Your session has expired token please re-auth")
-
-    def test_normal_output_not_flagged(self):
-        assert not _detect_auth_failure("Successfully implemented the feature")
-
-    def test_empty_output(self):
-        assert not _detect_auth_failure("")
-
-    def test_case_insensitive(self):
-        assert _detect_auth_failure("UNAUTHORIZED access denied")
+# Note: _detect_auth_failure was removed in feature/interruption-taxonomy.
+# Equivalent (and stricter, false-positive-resistant) coverage now lives in
+# tests/test_workflow.py::TestRunClassification, exercising _classify_run.
 
 
 # ---------------------------------------------------------------------------
