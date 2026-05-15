@@ -11,7 +11,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
+    RunOutcome,
     _build_ai_prompt,
+    _classify_run,
     _emit_notify_event,
     _git_is_dirty,
     _maybe_notify_stalled,
@@ -1463,3 +1465,124 @@ class TestNotifyDeliveryFailureNonFatal:
         ):
             # Must not raise even though every urlopen call fails
             cmd_workflow_run(args)
+
+
+# ---------------------------------------------------------------------------
+# Run classification (interruption-taxonomy)
+# ---------------------------------------------------------------------------
+
+
+class TestRunClassification:
+    """_classify_run: sentinel > tail-pattern > exit-code, in that order."""
+
+    # --- Sentinel detection (most authoritative) ---
+
+    def test_sentinel_completed(self):
+        out = ["doing work...\n", "all done.\n", "<<<DTL:OUTCOME=COMPLETED>>>\n"]
+        assert _classify_run(0, out) == RunOutcome.COMPLETED
+
+    def test_sentinel_quota(self):
+        out = ["<<<DTL:OUTCOME=INTERRUPTED_QUOTA>>>\n"]
+        assert _classify_run(1, out) == RunOutcome.INTERRUPTED_QUOTA
+
+    def test_sentinel_failed_ai(self):
+        out = [
+            "I cannot proceed.\n",
+            "<<<DTL:OUTCOME=FAILED_AI>>>\n",
+            "missing context\n",
+        ]
+        assert _classify_run(0, out) == RunOutcome.FAILED_AI
+
+    def test_sentinel_unknown_falls_through_to_exit_code(self):
+        out = ["<<<DTL:OUTCOME=BOGUS_VALUE>>>\n"]
+        assert _classify_run(0, out) == RunOutcome.COMPLETED
+        assert _classify_run(1, out) == RunOutcome.FAILED_AI
+
+    def test_sentinel_overrides_tail_patterns(self):
+        # Tail contains a quota pattern; sentinel says COMPLETED. Sentinel wins.
+        out = (
+            ["work...\n"] * 30
+            + ["claude usage limit reached\n"]
+            + ["<<<DTL:OUTCOME=COMPLETED>>>\n"]
+        )
+        assert _classify_run(0, out) == RunOutcome.COMPLETED
+
+    # --- Tail-only fallback (last 50 lines) ---
+
+    def test_tail_pattern_quota(self):
+        out = ["normal work\n"] * 10 + ["claude usage limit reached\n"]
+        assert _classify_run(1, out) == RunOutcome.INTERRUPTED_QUOTA
+
+    def test_tail_pattern_auth(self):
+        out = ["normal work\n"] * 10 + ["please run claude login\n"]
+        assert _classify_run(1, out) == RunOutcome.INTERRUPTED_AUTH
+
+    def test_tail_pattern_network(self):
+        out = ["normal work\n"] * 10 + ["connection timed out\n"]
+        assert _classify_run(1, out) == RunOutcome.INTERRUPTED_NETWORK
+
+    def test_pattern_outside_tail_does_not_match(self):
+        # Pattern in line 1 of 100; tail (last 50) is clean. Should fall to exit code.
+        out = ["claude usage limit reached\n"] + ["normal work\n"] * 99
+        assert _classify_run(0, out) == RunOutcome.COMPLETED
+
+    # --- Exit-code fallback ---
+
+    def test_exit_code_zero_completed(self):
+        assert _classify_run(0, ["normal work\n"]) == RunOutcome.COMPLETED
+
+    def test_exit_code_124_wall_clock(self):
+        assert (
+            _classify_run(124, ["normal work\n"]) == RunOutcome.INTERRUPTED_WALL_CLOCK
+        )
+
+    def test_exit_code_125_retry_cap_is_failed_ai(self):
+        # 125 was the retry-cap kill — AI was looping on tests, treat as failure.
+        assert _classify_run(125, ["normal work\n"]) == RunOutcome.FAILED_AI
+
+    def test_exit_code_nonzero_failed_ai(self):
+        assert _classify_run(1, ["normal work\n"]) == RunOutcome.FAILED_AI
+
+    # --- Regression: 2026-05-14 stranded-research-worker ---
+
+    def test_regression_completed_with_auth_string_in_body(self):
+        """The bug: AI builds a Worker that contains 'authentication failed' as
+        a user-facing error string. The OLD _detect_auth_failure substring-matched
+        the AI's own narration of writing that code and aborted the workflow,
+        stranding 1004 lines of completed, tested work.
+
+        With sentinel + tail-only: the AI prints COMPLETED at the end, the
+        narration of 'authentication failed' is somewhere in the middle of the
+        output, and classification correctly returns COMPLETED.
+        """
+        out = (
+            ["narrating: I'm writing the Cloudflare Worker now.\n"]
+            + [
+                "narrating: adding error handling that returns "
+                "'Claude API authentication failed.'\n"
+            ]
+            + ["narrating: more code...\n"] * 60  # pushes auth string out of the tail
+            + ["all tests pass.\n", "committed.\n", "<<<DTL:OUTCOME=COMPLETED>>>\n"]
+        )
+        assert _classify_run(0, out) == RunOutcome.COMPLETED
+
+    def test_regression_no_sentinel_with_auth_in_tail_classifies_auth(self):
+        """Inverse case: AI didn't print the sentinel AND the actual auth failure
+        message is in the tail. Should classify as INTERRUPTED_AUTH (a real auth
+        problem the human needs to address)."""
+        out = ["normal work\n"] * 10 + ["please run claude login\n"]
+        assert _classify_run(1, out) == RunOutcome.INTERRUPTED_AUTH
+
+    # --- Prompt instruction ---
+
+    def test_build_ai_prompt_includes_sentinel_instruction(self):
+        feature = {
+            "name": "test-feature",
+            "branch": "feature/test-feature",
+            "depends_on": "none",
+            "status": "Not Started",
+            "block": "## Feature: test-feature\n\nDo a thing.",
+        }
+        prompt = _build_ai_prompt("Some constraints.", feature)
+        assert "<<<DTL:OUTCOME=COMPLETED>>>" in prompt
+        assert "<<<DTL:OUTCOME=FAILED_AI>>>" in prompt
