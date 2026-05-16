@@ -788,7 +788,7 @@ Cross-reference: this complements `workflow-stall-visibility` (state file on eve
 
 **Branch:** `feature/planning-templates-v2`
 **Depends on:** none
-**Status:** PR Open
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
@@ -980,7 +980,7 @@ Move the workflow's per-feature retry budget out of an in-memory dict (`consecut
 
 **Branch:** `feature/provider-chain`
 **Depends on:** per-feature-state
-**Status:** Deferred
+**Status:** Not Started
 **Requires:** ai
 
 ### Goal
