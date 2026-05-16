@@ -1902,31 +1902,6 @@ def ai_status(project_dir: Path) -> None:
         _run_cmd(["bash", str(vm_script), "status"])
 
 
-def _write_failure_report(
-    project_dir: Path,
-    feature_name: str,
-    limit_hit: str,
-    output_lines: list[str],
-) -> None:
-    """Write FAILURE-REPORT.md to the project root on bail-out."""
-    last_200 = output_lines[-200:] if len(output_lines) > 200 else output_lines
-    limit_desc = {
-        "wall_clock": "Wall-clock timeout exceeded",
-        "retry_cap": "AI retry cap exceeded",
-    }.get(limit_hit, limit_hit)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    report = (
-        f"# AI Failure Report\n\n"
-        f"**Generated:** {ts}  \n"
-        f"**Feature:** {feature_name or '(unknown)'}  \n"
-        f"**Limit hit:** {limit_desc}  \n\n"
-        f"## Last 200 Lines of Output\n\n"
-        f"```\n" + "".join(last_200) + "```\n"
-    )
-    report_path = project_dir / "FAILURE-REPORT.md"
-    report_path.write_text(report)
-
-
 def _write_failure_snapshot(
     project_dir: Path,
     feature: dict,
@@ -2196,12 +2171,12 @@ def ai_run(
                 )
                 sys.exit(127)
 
-            # On bail-out: stop the container and write failure report
+            # On bail-out: stop the container
             if exit_code in (124, 125):
                 limit_hit = "wall_clock" if exit_code == 124 else "retry_cap"
                 print(
                     f"\n[dtl ai run] Limit reached ({limit_hit}). "
-                    "Stopping container and writing FAILURE-REPORT.md...",
+                    "Stopping container...",
                     file=sys.stderr,
                 )
                 subprocess.run(
@@ -2214,9 +2189,6 @@ def ai_run(
                     ],
                     capture_output=True,
                     timeout=30,
-                )
-                _write_failure_report(
-                    project_dir, feature_name, limit_hit, output_lines
                 )
 
             # Send notification
@@ -2261,10 +2233,9 @@ def ai_run(
                 )
             except subprocess.TimeoutExpired:
                 print(
-                    "\n[dtl ai run] Wall-clock timeout reached. Writing FAILURE-REPORT.md...",
+                    "\n[dtl ai run] Wall-clock timeout reached.",
                     file=sys.stderr,
                 )
-                _write_failure_report(project_dir, feature_name, "wall_clock", [])
                 sys.exit(124)
         elif provider == "openclaw":
             print("[dtl ai run] Starting OpenClaw in VM...")
@@ -3264,6 +3235,54 @@ def _dtl_state_dir() -> Path:
     return state_home / "dtl"
 
 
+def _feature_state_path(project_dir: Path, feature_name: str) -> Path:
+    """Return ~/.local/state/dtl/<project>/<feature>.json for per-feature workflow state."""
+    return _dtl_state_dir() / project_dir.name / f"{feature_name}.json"
+
+
+_FEATURE_STATE_DEFAULT: dict = {
+    "last_outcome": "",
+    "last_run_iso": "",
+    "attempts_completed": 0,
+    "attempts_interrupted": 0,
+    "partial_work_branch": None,
+}
+
+
+def _read_feature_state(project_dir: Path, feature_name: str) -> dict:
+    """Read per-feature state file, returning defaults if absent or unreadable."""
+    p = _feature_state_path(project_dir, feature_name)
+    if p.exists():
+        try:
+            with open(p) as f:
+                data = json.load(f)
+            # Merge with defaults so new keys are always present
+            return {**_FEATURE_STATE_DEFAULT, **data}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return dict(_FEATURE_STATE_DEFAULT)
+
+
+def _write_feature_state(project_dir: Path, feature_name: str, state: dict) -> None:
+    """Atomically write per-feature state (tempfile + rename, mode 0o600)."""
+    import tempfile
+
+    p = _feature_state_path(project_dir, feature_name)
+    p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, p)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _watchdog_state_path() -> Path:
     """Return path to the watchdog run-state JSON file."""
     return _dtl_state_dir() / "watchdog-state.json"
@@ -3308,7 +3327,19 @@ def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
     if not not_started:
         return None
 
-    # Check whether a matching 'dtl workflow run' process exists.
+    # Primary signal: per-feature state file. If every Not Started feature's
+    # last outcome was a human-attention interruption, the workflow halted
+    # intentionally — suppressing a spurious anomaly.
+    human_attention = (RunOutcome.INTERRUPTED_AUTH, RunOutcome.INTERRUPTED_QUOTA)
+    all_intentionally_halted = all(
+        _read_feature_state(project_dir, f["name"]).get("last_outcome")
+        in human_attention
+        for f in not_started
+    )
+    if all_intentionally_halted:
+        return None
+
+    # Fallback: check whether a matching 'dtl workflow run' process exists.
     try:
         result = subprocess.run(
             ["ps", "aux"],
@@ -4176,6 +4207,21 @@ def _handle_interruption(
     except Exception as exc:
         log.info("Snapshot write failed: %s", exc)
 
+    # Write per-feature state: interruptions increment attempts_interrupted only,
+    # not attempts_completed, so they don't burn the retry budget.
+    try:
+        _fstate = _read_feature_state(project_dir, feature["name"])
+        _fstate["last_outcome"] = outcome
+        _fstate["last_run_iso"] = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+        _fstate["attempts_interrupted"] = _fstate["attempts_interrupted"] + 1
+        if outcome == RunOutcome.INTERRUPTED_WALL_CLOCK:
+            _fstate["partial_work_branch"] = branch
+        _write_feature_state(project_dir, feature["name"], _fstate)
+    except Exception as exc:
+        log.info("Failed to write feature state on interruption: %s", exc)
+
     _emit_notify_event(
         notify_cfg,
         "ai-interruption",
@@ -4323,8 +4369,6 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     log.info("=== dtl workflow run starting ===")
     log.info("Projects: %s", ", ".join(str(p) for p in projects))
 
-    consecutive_failures: dict[str, int] = {}
-
     while True:
         any_work_done = False
 
@@ -4341,8 +4385,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             next_feature = None
             for f in features:
                 if f["status"] == "Not Started":
-                    fail_key = f"{project_dir.name}:{f['name']}"
-                    if consecutive_failures.get(fail_key, 0) >= max_failures:
+                    fstate = _read_feature_state(project_dir, f["name"])
+                    if fstate["attempts_completed"] >= max_failures:
                         log.info(
                             "[%s] Skipping %s (failed %d times).",
                             project_dir.name,
@@ -4358,7 +4402,6 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 log.info("[%s] No unstarted features remaining.", project_dir.name)
                 continue
 
-            fail_key = f"{project_dir.name}:{next_feature['name']}"
             branch = next_feature["branch"]
             log.info(
                 "[%s] Starting feature: %s", project_dir.name, next_feature["name"]
@@ -4394,9 +4437,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 _git_create_branch(project_dir, branch, base="develop")
             except subprocess.CalledProcessError:
                 log.info("[%s] Failed to create branch %s.", project_dir.name, branch)
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = RunOutcome.FAILED_INFRA
+                _fstate["last_run_iso"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
+                _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _reason = "branch_create_failed"
                 _prev = _read_workflow_state(project_dir)
                 _skip_count = (
@@ -4472,12 +4519,9 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_output = result.stdout + result.stderr
                 except subprocess.TimeoutExpired:
                     log.info(
-                        "[%s] AI wall-clock timeout for %s. Writing FAILURE-REPORT.md.",
+                        "[%s] AI wall-clock timeout for %s.",
                         project_dir.name,
                         next_feature["name"],
-                    )
-                    _write_failure_report(
-                        project_dir, next_feature["name"], "wall_clock", []
                     )
                     ai_exit_code = 124
                     ai_output = ""
@@ -4547,17 +4591,23 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 )
                 # Bail-out codes (wall-clock or retry-cap) pin the failure count
                 # so the next loop iteration marks the feature as Failed immediately.
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = (
+                    outcome if outcome != RunOutcome.COMPLETED else RunOutcome.FAILED_AI
+                )
+                _fstate["last_run_iso"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
                 if ai_exit_code in (124, 125):
                     log.info(
                         "[%s] Bail-out limit hit for %s — marking as permanently failed.",
                         project_dir.name,
                         next_feature["name"],
                     )
-                    consecutive_failures[fail_key] = max_failures
+                    _fstate["attempts_completed"] = max_failures
                 else:
-                    consecutive_failures[fail_key] = (
-                        consecutive_failures.get(fail_key, 0) + 1
-                    )
+                    _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
                 continue
 
@@ -4571,9 +4621,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     project_dir.name,
                     test_output,
                 )
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = RunOutcome.FAILED_AI
+                _fstate["last_run_iso"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
+                _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
                 # Return to develop
                 subprocess.run(
@@ -4626,9 +4680,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             # Push
             if not _git_push_branch(project_dir, branch):
                 log.info("[%s] Push failed for %s.", project_dir.name, branch)
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = RunOutcome.FAILED_INFRA
+                _fstate["last_run_iso"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat()
+                _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 continue
 
             # Create PR
@@ -4714,8 +4772,15 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         cwd=project_dir,
                         capture_output=True,
                     )
-                    # Reset failure counter on success
-                    consecutive_failures[fail_key] = 0
+                    # Reset per-feature state on success
+                    _fstate = _read_feature_state(project_dir, next_feature["name"])
+                    _fstate["last_outcome"] = RunOutcome.COMPLETED
+                    _fstate["last_run_iso"] = datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat()
+                    _fstate["attempts_completed"] = 0
+                    _fstate["partial_work_branch"] = None
+                    _write_feature_state(project_dir, next_feature["name"], _fstate)
                     # Emit feature-merged event
                     _pr_num_match = re.search(r"/pull/(\d+)", pr_url or "")
                     _emit_notify_event(
@@ -4915,18 +4980,43 @@ def cmd_workflow_list(args: argparse.Namespace) -> None:
 
 def cmd_workflow_status(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow status'."""
-    project_dir = Path(args.project).resolve()
+    plan_path = Path(args.plan).resolve()
+    if not plan_path.exists():
+        print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+        sys.exit(1)
+
+    project_dir = plan_path.parent.parent
+
+    _, features = _parse_devplan(plan_path.read_text())
+
+    # Workflow skip state (lifecycle)
     state_path = _workflow_state_path(project_dir)
-    if not state_path.exists():
-        print(f"No workflow state found for {project_dir.name}.")
-        return
-    with open(state_path) as f:
-        state = json.load(f)
-    print(f"Project:           {project_dir.name}")
-    print(f"Last check:        {state.get('last_check', 'unknown')}")
-    print(f"Last skip reason:  {state.get('last_skip_reason', 'unknown')}")
-    print(f"Consecutive skips: {state.get('consecutive_skips', 0)}")
-    print(f"Next retry:        {state.get('next_retry', 'unknown')}")
+    if state_path.exists():
+        with open(state_path) as f:
+            wf_state = json.load(f)
+        print(f"Project:           {project_dir.name}")
+        print(f"Last skip reason:  {wf_state.get('last_skip_reason', 'none')}")
+        print(f"Consecutive skips: {wf_state.get('consecutive_skips', 0)}")
+    else:
+        print(f"Project:           {project_dir.name}")
+        print("Workflow state:    (no run state recorded yet)")
+
+    print()
+    print(
+        f"{'Feature':<30}  {'DEVPLAN':<14}  {'Last outcome':<24}  {'Done':<4}  {'Int':<4}  Partial branch"
+    )
+    print("-" * 100)
+    for f in features:
+        fstate = _read_feature_state(project_dir, f["name"])
+        partial = fstate.get("partial_work_branch") or ""
+        print(
+            f"{f['name']:<30}  {f['status']:<14}  "
+            f"{fstate.get('last_outcome', ''):<24}  "
+            f"{fstate.get('attempts_completed', 0):<4}  "
+            f"{fstate.get('attempts_interrupted', 0):<4}  "
+            f"{partial}"
+        )
+    print()
     latest_snapshot = _latest_failure_snapshot(project_dir)
     if latest_snapshot:
         print(f"Last failure snapshot: {latest_snapshot}")
@@ -5462,12 +5552,12 @@ def main() -> None:
     # -- workflow status --
     wf_status_parser = workflow_subparsers.add_parser(
         "status",
-        help="Print the current workflow skip state for a project",
+        help="Show per-feature state (cause) alongside DEVPLAN status (lifecycle)",
     )
     wf_status_parser.add_argument(
-        "--project",
+        "--plan",
         required=True,
-        help="Path to the project directory",
+        help="Path to DEVPLAN.md",
     )
     wf_status_parser.set_defaults(func=cmd_workflow_status)
 

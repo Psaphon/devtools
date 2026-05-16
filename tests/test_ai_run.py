@@ -6,45 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dtl import _run_ai_with_limits, _write_failure_report
-
-
-# ---------------------------------------------------------------------------
-# _write_failure_report
-# ---------------------------------------------------------------------------
-
-
-def test_write_failure_report_creates_file(tmp_path):
-    lines = ["line one\n", "line two\n"]
-    _write_failure_report(tmp_path, "my-feature", "wall_clock", lines)
-    report = tmp_path / "FAILURE-REPORT.md"
-    assert report.exists()
-    text = report.read_text()
-    assert "Wall-clock timeout exceeded" in text
-    assert "my-feature" in text
-    assert "line one" in text
-    assert "line two" in text
-
-
-def test_write_failure_report_truncates_to_200_lines(tmp_path):
-    lines = [f"line {i}\n" for i in range(300)]
-    _write_failure_report(tmp_path, "feat", "retry_cap", lines)
-    text = (tmp_path / "FAILURE-REPORT.md").read_text()
-    # last line is 299, first of last 200 is 100
-    assert "line 299" in text
-    assert "line 99\n" not in text
-
-
-def test_write_failure_report_unknown_feature(tmp_path):
-    _write_failure_report(tmp_path, "", "wall_clock", [])
-    text = (tmp_path / "FAILURE-REPORT.md").read_text()
-    assert "(unknown)" in text
-
-
-def test_write_failure_report_retry_cap_label(tmp_path):
-    _write_failure_report(tmp_path, "feat", "retry_cap", [])
-    text = (tmp_path / "FAILURE-REPORT.md").read_text()
-    assert "AI retry cap exceeded" in text
+from dtl import _run_ai_with_limits
 
 
 # ---------------------------------------------------------------------------
