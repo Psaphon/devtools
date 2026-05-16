@@ -939,7 +939,7 @@ Replace the substring-on-stdout auth-failure detection with a structured outcome
 
 **Branch:** `feature/per-feature-state`
 **Depends on:** interruption-taxonomy
-**Status:** Not Started
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal

@@ -120,6 +120,89 @@ class TestWatchdogCheckMissingRunner:
             result = dtl._watchdog_check_missing_runner(project)
         assert result is not None
 
+    def test_state_file_quota_interruption_suppresses_anomaly(
+        self, tmp_path, monkeypatch
+    ):
+        """If the feature state shows INTERRUPTED_QUOTA, the watchdog suppresses
+        anomaly A because the workflow halted intentionally for human attention."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"])
+
+        # Write per-feature state showing intentional halt
+        dtl._write_feature_state(
+            project,
+            "feature-0",
+            {
+                "last_outcome": dtl.RunOutcome.INTERRUPTED_QUOTA,
+                "last_run_iso": "2026-05-16T00:00:00+00:00",
+                "attempts_completed": 0,
+                "attempts_interrupted": 1,
+                "partial_work_branch": None,
+            },
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="other stuff\n", returncode=0)
+            result = dtl._watchdog_check_missing_runner(project)
+        assert result is None, (
+            "INTERRUPTED_QUOTA state should suppress missing-runner anomaly"
+        )
+
+    def test_state_file_auth_interruption_suppresses_anomaly(
+        self, tmp_path, monkeypatch
+    ):
+        """INTERRUPTED_AUTH also suppresses anomaly A."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"])
+
+        dtl._write_feature_state(
+            project,
+            "feature-0",
+            {
+                "last_outcome": dtl.RunOutcome.INTERRUPTED_AUTH,
+                "last_run_iso": "2026-05-16T00:00:00+00:00",
+                "attempts_completed": 0,
+                "attempts_interrupted": 1,
+                "partial_work_branch": None,
+            },
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="other stuff\n", returncode=0)
+            result = dtl._watchdog_check_missing_runner(project)
+        assert result is None, (
+            "INTERRUPTED_AUTH state should suppress missing-runner anomaly"
+        )
+
+    def test_state_file_failed_ai_does_not_suppress_anomaly(
+        self, tmp_path, monkeypatch
+    ):
+        """FAILED_AI state does not suppress anomaly A — the workflow should retry."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"])
+
+        dtl._write_feature_state(
+            project,
+            "feature-0",
+            {
+                "last_outcome": dtl.RunOutcome.FAILED_AI,
+                "last_run_iso": "2026-05-16T00:00:00+00:00",
+                "attempts_completed": 1,
+                "attempts_interrupted": 0,
+                "partial_work_branch": None,
+            },
+        )
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="other stuff\n", returncode=0)
+            result = dtl._watchdog_check_missing_runner(project)
+        assert result is not None, (
+            "FAILED_AI state should NOT suppress missing-runner anomaly"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Check B: dirty tree age

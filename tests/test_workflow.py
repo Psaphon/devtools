@@ -15,13 +15,16 @@ from dtl import (
     _build_ai_prompt,
     _classify_run,
     _emit_notify_event,
+    _feature_state_path,
     _git_is_dirty,
     _maybe_notify_stalled,
     _parse_devplan,
+    _read_feature_state,
     _read_workflow_state,
     _run_lint_and_tests,
     _update_feature_status,
     _workflow_state_path,
+    _write_feature_state,
     _write_workflow_state,
 )
 
@@ -847,11 +850,11 @@ class TestCmdWorkflowStatus:
         project_dir = self._make_project(tmp_path / "proj")
 
         args = MagicMock()
-        args.project = str(project_dir)
+        args.plan = str(project_dir / "docs" / "DEVPLAN.md")
         cmd_workflow_status(args)
 
         out = capsys.readouterr().out
-        assert "No workflow state" in out
+        assert "no run state" in out.lower()
 
     def test_prints_state_when_file_present(self, tmp_path, monkeypatch, capsys):
         from dtl import cmd_workflow_status
@@ -862,13 +865,51 @@ class TestCmdWorkflowStatus:
         _write_workflow_state(project_dir, "dirty_tree", 2)
 
         args = MagicMock()
-        args.project = str(project_dir)
+        args.plan = str(project_dir / "docs" / "DEVPLAN.md")
         cmd_workflow_status(args)
 
         out = capsys.readouterr().out
         assert "dirty_tree" in out
         assert "2" in out
         assert "proj" in out
+
+    def test_shows_per_feature_state(self, tmp_path, monkeypatch, capsys):
+        from dtl import cmd_workflow_status
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "proj")
+
+        # Write a per-feature state for beta-feature
+        _write_feature_state(
+            project_dir,
+            "beta-feature",
+            {
+                "last_outcome": RunOutcome.FAILED_AI,
+                "last_run_iso": "2026-05-16T00:00:00+00:00",
+                "attempts_completed": 2,
+                "attempts_interrupted": 1,
+                "partial_work_branch": None,
+            },
+        )
+
+        args = MagicMock()
+        args.plan = str(project_dir / "docs" / "DEVPLAN.md")
+        cmd_workflow_status(args)
+
+        out = capsys.readouterr().out
+        assert "beta-feature" in out
+        assert "FAILED_AI" in out
+        assert "2" in out  # attempts_completed
+
+    def test_exits_on_missing_plan(self, tmp_path, monkeypatch):
+        from dtl import cmd_workflow_status
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        args = MagicMock()
+        args.plan = str(tmp_path / "nonexistent" / "DEVPLAN.md")
+        with pytest.raises(SystemExit) as exc:
+            cmd_workflow_status(args)
+        assert exc.value.code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1586,3 +1627,178 @@ class TestRunClassification:
         prompt = _build_ai_prompt("Some constraints.", feature)
         assert "<<<DTL:OUTCOME=COMPLETED>>>" in prompt
         assert "<<<DTL:OUTCOME=FAILED_AI>>>" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Per-feature state: _read_feature_state / _write_feature_state
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureState:
+    """Tests for per-feature persistent state helpers."""
+
+    def test_read_returns_defaults_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        state = _read_feature_state(project_dir, "my-feature")
+        assert state["last_outcome"] == ""
+        assert state["last_run_iso"] == ""
+        assert state["attempts_completed"] == 0
+        assert state["attempts_interrupted"] == 0
+        assert state["partial_work_branch"] is None
+
+    def test_write_then_read_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        written = {
+            "last_outcome": RunOutcome.FAILED_AI,
+            "last_run_iso": "2026-05-16T12:00:00+00:00",
+            "attempts_completed": 2,
+            "attempts_interrupted": 1,
+            "partial_work_branch": None,
+        }
+        _write_feature_state(project_dir, "my-feature", written)
+        read_back = _read_feature_state(project_dir, "my-feature")
+        assert read_back["last_outcome"] == RunOutcome.FAILED_AI
+        assert read_back["attempts_completed"] == 2
+        assert read_back["attempts_interrupted"] == 1
+
+    def test_state_path_is_under_project_subdir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "myproject"
+        project_dir.mkdir()
+
+        p = _feature_state_path(project_dir, "some-feature")
+        assert p.parent.name == "myproject"
+        assert p.name == "some-feature.json"
+
+    def test_write_is_atomic_no_tmp_files(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        state = {
+            "last_outcome": RunOutcome.COMPLETED,
+            "last_run_iso": "2026-05-16T00:00:00+00:00",
+            "attempts_completed": 0,
+            "attempts_interrupted": 0,
+            "partial_work_branch": None,
+        }
+        _write_feature_state(project_dir, "feat", state)
+
+        p = _feature_state_path(project_dir, "feat")
+        assert p.exists()
+        tmp_files = list(p.parent.glob("*.tmp"))
+        assert tmp_files == [], f"Leftover tmp files: {tmp_files}"
+
+    def test_write_sets_mode_600(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        _write_feature_state(
+            project_dir,
+            "feat",
+            {
+                "last_outcome": "",
+                "last_run_iso": "",
+                "attempts_completed": 0,
+                "attempts_interrupted": 0,
+                "partial_work_branch": None,
+            },
+        )
+        p = _feature_state_path(project_dir, "feat")
+        mode = p.stat().st_mode & 0o777
+        assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
+
+    def test_state_survives_simulated_process_restart(self, tmp_path, monkeypatch):
+        """State written before a restart is readable after — simulated by a
+        fresh call to _read_feature_state with only the XDG env set."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        # "Before restart": write state
+        _write_feature_state(
+            project_dir,
+            "restart-feature",
+            {
+                "last_outcome": RunOutcome.INTERRUPTED_NETWORK,
+                "last_run_iso": "2026-05-16T08:00:00+00:00",
+                "attempts_completed": 1,
+                "attempts_interrupted": 3,
+                "partial_work_branch": "feature/restart-feature",
+            },
+        )
+
+        # "After restart": read state (same XDG, no in-memory dict)
+        recovered = _read_feature_state(project_dir, "restart-feature")
+        assert recovered["last_outcome"] == RunOutcome.INTERRUPTED_NETWORK
+        assert recovered["attempts_completed"] == 1
+        assert recovered["attempts_interrupted"] == 3
+        assert recovered["partial_work_branch"] == "feature/restart-feature"
+
+    def test_interrupted_quota_does_not_increment_attempts_completed(
+        self, tmp_path, monkeypatch
+    ):
+        """INTERRUPTED_QUOTA must only increment attempts_interrupted, not attempts_completed."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        initial = _read_feature_state(project_dir, "quota-feature")
+        assert initial["attempts_completed"] == 0
+        assert initial["attempts_interrupted"] == 0
+
+        # Simulate what _handle_interruption does for INTERRUPTED_QUOTA
+        fstate = _read_feature_state(project_dir, "quota-feature")
+        fstate["last_outcome"] = RunOutcome.INTERRUPTED_QUOTA
+        fstate["attempts_interrupted"] = fstate["attempts_interrupted"] + 1
+        # attempts_completed deliberately NOT incremented
+        _write_feature_state(project_dir, "quota-feature", fstate)
+
+        after = _read_feature_state(project_dir, "quota-feature")
+        assert after["attempts_completed"] == 0, (
+            "INTERRUPTED_QUOTA must not burn the retry budget"
+        )
+        assert after["attempts_interrupted"] == 1
+
+    def test_failed_ai_increments_attempts_completed(self, tmp_path, monkeypatch):
+        """FAILED_AI increments attempts_completed, allowing eventual Failed marking."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        for i in range(1, 4):
+            fstate = _read_feature_state(project_dir, "failing-feature")
+            fstate["last_outcome"] = RunOutcome.FAILED_AI
+            fstate["attempts_completed"] = fstate["attempts_completed"] + 1
+            _write_feature_state(project_dir, "failing-feature", fstate)
+            assert (
+                _read_feature_state(project_dir, "failing-feature")[
+                    "attempts_completed"
+                ]
+                == i
+            )
+
+    def test_partial_work_branch_set_on_wall_clock_interruption(
+        self, tmp_path, monkeypatch
+    ):
+        """partial_work_branch is populated on INTERRUPTED_WALL_CLOCK."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+
+        fstate = _read_feature_state(project_dir, "slow-feature")
+        fstate["last_outcome"] = RunOutcome.INTERRUPTED_WALL_CLOCK
+        fstate["partial_work_branch"] = "feature/slow-feature"
+        fstate["attempts_interrupted"] = fstate["attempts_interrupted"] + 1
+        _write_feature_state(project_dir, "slow-feature", fstate)
+
+        after = _read_feature_state(project_dir, "slow-feature")
+        assert after["partial_work_branch"] == "feature/slow-feature"
+        assert after["attempts_completed"] == 0
