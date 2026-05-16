@@ -899,7 +899,7 @@ Origin: 2026-05-12, carved out of `watch-ops` planning. ntfy lives on hub (separ
 
 **Branch:** `feature/interruption-taxonomy`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
