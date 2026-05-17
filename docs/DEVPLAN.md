@@ -980,7 +980,7 @@ Move the workflow's per-feature retry budget out of an in-memory dict (`consecut
 
 **Branch:** `feature/provider-chain`
 **Depends on:** per-feature-state
-**Status:** In Progress
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
