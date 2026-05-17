@@ -242,9 +242,10 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
         "description": "Anthropic Claude Code CLI in a container",
         "image": "node:22-slim",
         "env_key": None,
+        "quota_source": "anthropic-shared",
         "models": {
-            "opus": "claude-opus-4-20250514",
-            "sonnet": "claude-sonnet-4-20250514",
+            "opus": "claude-opus-4-7",
+            "sonnet": "claude-sonnet-4-6",
             "haiku": "claude-haiku-4-5-20251001",
         },
         "default_model": "sonnet",
@@ -253,12 +254,13 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
     },
     "ollama": {
         "display": "Ollama (local models)",
-        "description": "Run open-source LLMs locally via Ollama",
+        "description": "Run open-source LLMs locally via Ollama (no-quota local fallback)",
         "image": "ollama/ollama:latest",
         "env_key": None,
+        "quota_source": "local",
         "models": {},
-        "default_model": None,
-        "supports_autonomous": False,
+        "default_model": "llama3",
+        "supports_autonomous": True,
         "supports_interactive": True,
     },
     "openclaw": {
@@ -266,6 +268,7 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
         "description": "Autonomous AI agent with native chat-app integration",
         "image": "ghcr.io/openclaw/openclaw:latest",
         "env_key": "ANTHROPIC_API_KEY",
+        "quota_source": "anthropic-shared",
         "models": {},
         "default_model": None,
         "supports_autonomous": True,
@@ -1822,6 +1825,24 @@ def _save_ai_config(project_dir: Path, config: dict) -> None:
     config_path.write_text(json.dumps(config, indent=2) + "\n")
 
 
+def _resolve_provider_chain(project_dir: Path) -> list[str]:
+    """Return the ordered provider list for a project.
+
+    Reads ``provider_chain`` from .ai/config.json when present and non-empty;
+    falls back to ``[config["provider"]]`` for backward compatibility.
+    Returns ``["claude"]`` when no config file exists.
+    """
+    config_path = project_dir / ".ai" / "config.json"
+    if not config_path.exists():
+        return ["claude"]
+    with open(config_path) as f:
+        config = json.load(f)
+    chain = config.get("provider_chain")
+    if chain and isinstance(chain, list) and chain:
+        return [str(p) for p in chain]
+    return [config.get("provider", "claude")]
+
+
 def ai_start(project_dir: Path) -> None:
     """Start the AI containers/VM for a project."""
     config = _load_ai_config(project_dir)
@@ -2107,10 +2128,11 @@ def ai_run(
     max_wall_clock: int = 1800,
     max_ai_retries: int = 3,
     feature_name: str = "",
+    provider_override: str | None = None,
 ) -> None:
     """Run an autonomous AI session with a prompt."""
     config = _load_ai_config(project_dir)
-    provider = config["provider"]
+    provider = provider_override or config["provider"]
     mode = config["mode"]
     ai_dir = project_dir / ".ai"
 
@@ -2127,6 +2149,36 @@ def ai_run(
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Ollama: run directly against the host daemon, regardless of configured mode.
+    # Uses `ollama run <model> <prompt>` in single-shot (non-interactive) mode.
+    if provider == "ollama":
+        model = config.get("model") or AI_PROVIDERS_CONFIG["ollama"]["default_model"]
+        print(f"[dtl ai run] Running Ollama autonomously (model: {model})...")
+        print(f"[dtl ai run] Prompt: {prompt}")
+        if max_wall_clock:
+            print(f"[dtl ai run] Wall-clock limit: {max_wall_clock}s")
+        print()
+        cmd = ["ollama", "run", model, prompt]
+        try:
+            exit_code, output_lines = _run_ai_with_limits(
+                cmd,
+                {**os.environ},
+                max_wall_clock,
+                max_ai_retries,
+            )
+        except FileNotFoundError:
+            print(
+                "Error: ollama not found. Install Ollama and ensure it is in PATH.",
+                file=sys.stderr,
+            )
+            sys.exit(127)
+        _send_notification(
+            ai_dir,
+            exit_code,
+            "".join(output_lines[-10:]) or "(no output)",
+        )
+        sys.exit(exit_code)
 
     if mode == "docker":
         if provider == "claude":
@@ -2915,6 +2967,13 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     """Handle 'dtl ai run'."""
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
+    # --provider overrides the config; --provider-chain sets the first provider in a
+    # chain (rotation is handled by cmd_workflow_run at the outer loop level).
+    provider_override = getattr(args, "provider", None) or None
+    if not provider_override:
+        chain_arg = getattr(args, "provider_chain", None)
+        if chain_arg:
+            provider_override = chain_arg.split(",")[0].strip() or None
     ai_run(
         project_dir,
         prompt,
@@ -2922,6 +2981,7 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
         max_wall_clock=getattr(args, "max_wall_clock", 1800),
         max_ai_retries=getattr(args, "max_ai_retries", 3),
         feature_name=getattr(args, "feature_name", ""),
+        provider_override=provider_override,
     )
 
 
@@ -2955,10 +3015,17 @@ def cmd_ai_config_notify(args: argparse.Namespace) -> None:
 def cmd_ai_list_providers(args: argparse.Namespace) -> None:
     """Handle 'dtl ai list-providers'."""
     print("Available AI providers:\n")
+    print(
+        "  Quota-source annotations:\n"
+        "    [anthropic-shared]  Shares the same Anthropic quota — "
+        "claude and openclaw exhaust the same pool.\n"
+        "    [local]             No external quota — runs on local hardware.\n"
+    )
     for key, pconfig in sorted(AI_PROVIDERS_CONFIG.items()):
         auto = " [autonomous]" if pconfig.get("supports_autonomous") else ""
         inter = " [interactive]" if pconfig.get("supports_interactive") else ""
-        print(f"  {key}")
+        quota_src = pconfig.get("quota_source", "unknown")
+        print(f"  {key}  [{quota_src}]")
         print(f"    {pconfig['description']}")
         print(f"    Image: {pconfig['image']}")
         print(f"    Modes:{auto}{inter}")
@@ -4259,6 +4326,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     max_failures = getattr(args, "max_failures", 3)
     max_wall_clock = getattr(args, "max_wall_clock", 1800)
     max_ai_retries = getattr(args, "max_ai_retries", 3)
+    quota_reset_sleep = getattr(args, "quota_reset_sleep", 3600)
 
     # Resolve log path: explicit --log overrides XDG default
     log_arg = getattr(args, "log", None)
@@ -4369,6 +4437,10 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     log.info("=== dtl workflow run starting ===")
     log.info("Projects: %s", ", ".join(str(p) for p in projects))
 
+    # Per-project provider chain index.  Incremented on INTERRUPTED_QUOTA to
+    # rotate to the next provider; reset to 0 after chain is exhausted.
+    chain_indices: dict[Path, int] = {}
+
     while True:
         any_work_done = False
 
@@ -4477,6 +4549,17 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             ai_start = time.monotonic()
 
             if ai_config_path.exists():
+                # Resolve the active provider from the chain.
+                _chain = _resolve_provider_chain(project_dir)
+                _chain_idx = chain_indices.get(project_dir, 0)
+                _active_provider = _chain[_chain_idx]
+                log.info(
+                    "[%s] Provider chain: %s (using index %d: %s)",
+                    project_dir.name,
+                    _chain,
+                    _chain_idx,
+                    _active_provider,
+                )
                 # Use dtl's ai_run mechanism via subprocess to isolate failures
                 result = subprocess.run(
                     [
@@ -4494,6 +4577,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         str(max_wall_clock),
                         "--max-ai-retries",
                         str(max_ai_retries),
+                        "--provider",
+                        _active_provider,
                     ],
                     capture_output=True,
                     text=True,
@@ -4543,17 +4628,39 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     log,
                     notify_cfg,
                 )
-                if outcome in (
-                    RunOutcome.INTERRUPTED_AUTH,
-                    RunOutcome.INTERRUPTED_QUOTA,
-                ):
+                if outcome == RunOutcome.INTERRUPTED_AUTH:
                     log.info(
-                        "[%s] Interruption requires human attention (%s). "
-                        "Pausing workflow cleanly.",
+                        "[%s] Auth interruption — pausing workflow cleanly.",
                         project_dir.name,
-                        outcome,
                     )
                     sys.exit(0)
+                elif outcome == RunOutcome.INTERRUPTED_QUOTA:
+                    _chain = _resolve_provider_chain(project_dir)
+                    _cur_idx = chain_indices.get(project_dir, 0)
+                    _next_idx = _cur_idx + 1
+                    if _next_idx < len(_chain):
+                        log.info(
+                            "[%s] Quota hit on '%s'; rotating to '%s' "
+                            "(chain index %d → %d of %d).",
+                            project_dir.name,
+                            _chain[_cur_idx],
+                            _chain[_next_idx],
+                            _cur_idx,
+                            _next_idx,
+                            len(_chain) - 1,
+                        )
+                        chain_indices[project_dir] = _next_idx
+                        any_work_done = True  # Don't sleep between chain retries
+                    else:
+                        log.info(
+                            "[%s] Quota hit on '%s'; provider chain exhausted. "
+                            "Sleeping %ds before retrying from chain start.",
+                            project_dir.name,
+                            _chain[_cur_idx],
+                            quota_reset_sleep,
+                        )
+                        chain_indices[project_dir] = 0
+                        time.sleep(quota_reset_sleep)
                 continue
 
             if ai_exit_code != 0:
@@ -5326,6 +5433,25 @@ def main() -> None:
         default="",
         help="Feature name to include in FAILURE-REPORT.md (set by workflow run)",
     )
+    ai_run_parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Override the AI provider for this run (e.g. claude, ollama, openclaw). "
+            "Defaults to the provider configured in .ai/config.json."
+        ),
+    )
+    ai_run_parser.add_argument(
+        "--provider-chain",
+        dest="provider_chain",
+        default=None,
+        metavar="CHAIN",
+        help=(
+            "Comma-separated list of providers to try in order "
+            "(e.g. claude,ollama). The first provider in the chain is used; "
+            "rotation on quota exhaustion is handled by 'dtl workflow run'."
+        ),
+    )
     ai_run_parser.set_defaults(func=cmd_ai_run)
 
     # -- ai config-notify --
@@ -5545,6 +5671,17 @@ def main() -> None:
         help=(
             "Kill an AI session after N detected retry loops in output "
             "(default: 3; 0 = disabled). Passed through to 'dtl ai run'."
+        ),
+    )
+    wf_run_parser.add_argument(
+        "--quota-reset-sleep",
+        dest="quota_reset_sleep",
+        type=int,
+        default=3600,
+        metavar="SECONDS",
+        help=(
+            "Seconds to sleep after the provider chain is exhausted by quota limits "
+            "before retrying from the first provider (default: 3600 = 1 hour)."
         ),
     )
     wf_run_parser.set_defaults(func=cmd_workflow_run)

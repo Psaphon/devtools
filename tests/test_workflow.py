@@ -1,5 +1,7 @@
 """Tests for dtl workflow subcommands: plan parsing, branch logic, status updates."""
 
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,7 @@ from dtl import (
     _parse_devplan,
     _read_feature_state,
     _read_workflow_state,
+    _resolve_provider_chain,
     _run_lint_and_tests,
     _update_feature_status,
     _workflow_state_path,
@@ -1802,3 +1805,259 @@ class TestFeatureState:
         after = _read_feature_state(project_dir, "slow-feature")
         assert after["partial_work_branch"] == "feature/slow-feature"
         assert after["attempts_completed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Provider chain rotation
+# ---------------------------------------------------------------------------
+
+
+class TestProviderChain:
+    """Tests for provider chain rotation on INTERRUPTED_QUOTA."""
+
+    _SINGLE_FEATURE_PLAN = """\
+# Development Plan: Chain Test
+
+## Constraints
+
+- Single file, stdlib-only
+
+---
+
+## Feature: alpha-feature
+
+**Branch:** `feature/alpha-feature`
+**Depends on:** none
+**Status:** Not Started
+
+### Goal
+
+Test feature.
+
+### Acceptance Criteria
+
+- [ ] Done
+"""
+
+    def _make_project(
+        self,
+        tmp_path: Path,
+        provider_chain: list | None = None,
+        provider: str = "claude",
+    ) -> Path:
+        """Create a minimal project with optional .ai/config.json and a DEVPLAN.md."""
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(self._SINGLE_FEATURE_PLAN)
+        ai_dir = tmp_path / ".ai"
+        ai_dir.mkdir()
+        config: dict = {
+            "project_name": "chain-test",
+            "provider": provider,
+            "mode": "docker",
+            "model": None,
+            "key_source": "env",
+            "notify": {"provider": None, "telegram_token": None, "telegram_chat_id": None},
+        }
+        if provider_chain is not None:
+            config["provider_chain"] = provider_chain
+        (ai_dir / "config.json").write_text(json.dumps(config))
+        return tmp_path
+
+    # ------------------------------------------------------------------
+    # Unit tests for _resolve_provider_chain
+    # ------------------------------------------------------------------
+
+    def test_resolve_chain_no_config_returns_default(self, tmp_path):
+        """No .ai/config.json → returns ['claude']."""
+        assert _resolve_provider_chain(tmp_path) == ["claude"]
+
+    def test_resolve_chain_single_provider_backward_compat(self, tmp_path):
+        """Config without provider_chain falls back to [config['provider']]."""
+        self._make_project(tmp_path, provider="ollama")
+        # provider_chain key is absent from this config
+        chain = _resolve_provider_chain(tmp_path)
+        assert chain == ["ollama"]
+
+    def test_resolve_chain_explicit_chain(self, tmp_path):
+        """provider_chain list is returned directly."""
+        self._make_project(tmp_path, provider_chain=["claude", "ollama"])
+        assert _resolve_provider_chain(tmp_path) == ["claude", "ollama"]
+
+    def test_resolve_chain_empty_list_falls_back_to_provider(self, tmp_path):
+        """An empty provider_chain list falls back to config['provider']."""
+        self._make_project(tmp_path, provider_chain=[], provider="openclaw")
+        assert _resolve_provider_chain(tmp_path) == ["openclaw"]
+
+    # ------------------------------------------------------------------
+    # Integration tests for cmd_workflow_run chain rotation
+    # ------------------------------------------------------------------
+
+    def _make_args(self, project_dir: Path, quota_reset_sleep: int = 3600) -> MagicMock:
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.quota_reset_sleep = quota_reset_sleep
+        args.log = None
+        return args
+
+    def _fake_handle_interruption(self, project_dir, plan_path, feature, branch, outcome, *a, **kw):
+        """Revert plan 'In Progress' → 'Not Started' as the real function does via git."""
+        text = plan_path.read_text()
+        text = re.sub(r"\*\*Status:\*\* In Progress", "**Status:** Not Started", text)
+        plan_path.write_text(text)
+
+    def test_chain_rotates_to_next_provider_on_interrupted_quota(
+        self, tmp_path, monkeypatch
+    ):
+        """On INTERRUPTED_QUOTA the next subprocess call uses the next chain provider."""
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(
+            tmp_path / "proj", provider_chain=["claude", "ollama"]
+        )
+        args = self._make_args(project_dir)
+
+        call_providers: list[str | None] = []
+        ai_call_count = [0]
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if isinstance(cmd, list) and "--feature-name" in cmd:
+                # AI subprocess: extract --provider value
+                try:
+                    idx = cmd.index("--provider")
+                    call_providers.append(cmd[idx + 1])
+                except ValueError:
+                    call_providers.append(None)
+                ai_call_count[0] += 1
+                if ai_call_count[0] == 1:
+                    # First call: simulate quota exhaustion
+                    return MagicMock(
+                        returncode=1,
+                        stdout="<<<DTL:OUTCOME=INTERRUPTED_QUOTA>>>\n",
+                        stderr="",
+                    )
+                # Second call: stop the loop
+                raise SystemExit(0)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch(
+                "dtl._handle_interruption",
+                side_effect=lambda *a, **kw: self._fake_handle_interruption(*a, **kw),
+            ),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+            patch("dtl.time.sleep"),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl._preflight_auto_merge", return_value=None),
+        ):
+            with pytest.raises(SystemExit):
+                cmd_workflow_run(args)
+
+        assert len(call_providers) == 2, f"Expected 2 AI calls; got {call_providers}"
+        assert call_providers[0] == "claude"
+        assert call_providers[1] == "ollama"
+
+    def test_chain_exhaustion_sleeps_quota_reset_sleep(self, tmp_path, monkeypatch):
+        """When chain is exhausted, sleep(quota_reset_sleep) is called."""
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        # Single-provider chain so it's immediately exhausted on first quota hit
+        project_dir = self._make_project(
+            tmp_path / "proj", provider_chain=["claude"]
+        )
+        args = self._make_args(project_dir, quota_reset_sleep=999)
+
+        sleep_calls: list[float] = []
+        ai_call_count = [0]
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if isinstance(cmd, list) and "--feature-name" in cmd:
+                ai_call_count[0] += 1
+                if ai_call_count[0] == 1:
+                    return MagicMock(
+                        returncode=1,
+                        stdout="<<<DTL:OUTCOME=INTERRUPTED_QUOTA>>>\n",
+                        stderr="",
+                    )
+                raise SystemExit(0)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch(
+                "dtl._handle_interruption",
+                side_effect=lambda *a, **kw: self._fake_handle_interruption(*a, **kw),
+            ),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+            patch("dtl.time.sleep", side_effect=lambda s: sleep_calls.append(s)),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl._preflight_auto_merge", return_value=None),
+        ):
+            with pytest.raises(SystemExit):
+                cmd_workflow_run(args)
+
+        assert 999 in sleep_calls, (
+            f"Expected quota_reset_sleep=999 in sleep calls; got {sleep_calls}"
+        )
+
+    def test_chain_resets_after_exhaustion(self, tmp_path, monkeypatch):
+        """After chain exhaustion + sleep, the chain index resets to 0."""
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(
+            tmp_path / "proj", provider_chain=["claude", "ollama"]
+        )
+        args = self._make_args(project_dir, quota_reset_sleep=1)
+
+        call_providers: list[str | None] = []
+        ai_call_count = [0]
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if isinstance(cmd, list) and "--feature-name" in cmd:
+                try:
+                    idx = cmd.index("--provider")
+                    call_providers.append(cmd[idx + 1])
+                except ValueError:
+                    call_providers.append(None)
+                ai_call_count[0] += 1
+                if ai_call_count[0] <= 2:
+                    # Both chain members hit quota → exhaustion on second hit
+                    return MagicMock(
+                        returncode=1,
+                        stdout="<<<DTL:OUTCOME=INTERRUPTED_QUOTA>>>\n",
+                        stderr="",
+                    )
+                # Third call: stop the loop (chain has reset to index 0)
+                raise SystemExit(0)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch(
+                "dtl._handle_interruption",
+                side_effect=lambda *a, **kw: self._fake_handle_interruption(*a, **kw),
+            ),
+            patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
+            patch("dtl.time.sleep"),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch("dtl._preflight_auto_merge", return_value=None),
+        ):
+            with pytest.raises(SystemExit):
+                cmd_workflow_run(args)
+
+        # claude → ollama (chain exhausted, sleep) → claude again (chain reset)
+        assert len(call_providers) == 3, f"Expected 3 AI calls; got {call_providers}"
+        assert call_providers[0] == "claude"
+        assert call_providers[1] == "ollama"
+        assert call_providers[2] == "claude"
