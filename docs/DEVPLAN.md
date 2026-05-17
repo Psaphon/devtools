@@ -1019,7 +1019,7 @@ Make `dtl ai run` and `dtl workflow run` aware of an ordered list of AI provider
 
 **Branch:** `feature/install-staleness-guard`
 **Depends on:** none
-**Status:** In Progress
+**Status:** PR Open
 **Requires:** ai
 
 ### Goal
