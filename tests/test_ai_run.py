@@ -1,12 +1,13 @@
 """Tests for ai_run wall-clock timeout and retry-cap bail-out paths."""
 
+import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dtl import _run_ai_with_limits
+from dtl import _resolve_provider_chain, _run_ai_with_limits
 
 
 # ---------------------------------------------------------------------------
@@ -121,3 +122,75 @@ def test_run_ai_with_limits_nonzero_exit_passthrough(tmp_path):
     cmd = [sys.executable, "-c", "import sys; sys.exit(42)"]
     code, _ = _run_ai_with_limits(cmd, {}, max_wall_clock=30, max_ai_retries=0)
     assert code == 42
+
+
+# ---------------------------------------------------------------------------
+# _resolve_provider_chain — backward compat and chain resolution
+# ---------------------------------------------------------------------------
+
+
+def _write_ai_config(project_dir: Path, config: dict) -> None:
+    ai_dir = project_dir / ".ai"
+    ai_dir.mkdir(parents=True, exist_ok=True)
+    (ai_dir / "config.json").write_text(json.dumps(config))
+
+
+def test_resolve_chain_no_config_returns_claude(tmp_path):
+    """No .ai/config.json at all returns ['claude']."""
+    chain = _resolve_provider_chain(tmp_path)
+    assert chain == ["claude"]
+
+
+def test_resolve_chain_single_provider_backward_compat(tmp_path):
+    """Config without provider_chain field uses config['provider']."""
+    _write_ai_config(
+        tmp_path,
+        {"provider": "ollama", "mode": "docker", "model": None},
+    )
+    chain = _resolve_provider_chain(tmp_path)
+    assert chain == ["ollama"]
+
+
+def test_resolve_chain_explicit_provider_chain(tmp_path):
+    """provider_chain list is returned as-is."""
+    _write_ai_config(
+        tmp_path,
+        {
+            "provider": "claude",
+            "provider_chain": ["claude", "ollama"],
+            "mode": "docker",
+            "model": None,
+        },
+    )
+    chain = _resolve_provider_chain(tmp_path)
+    assert chain == ["claude", "ollama"]
+
+
+def test_resolve_chain_empty_list_falls_back_to_provider(tmp_path):
+    """An empty provider_chain falls back to [config['provider']]."""
+    _write_ai_config(
+        tmp_path,
+        {
+            "provider": "openclaw",
+            "provider_chain": [],
+            "mode": "docker",
+            "model": None,
+        },
+    )
+    chain = _resolve_provider_chain(tmp_path)
+    assert chain == ["openclaw"]
+
+
+def test_resolve_chain_three_providers(tmp_path):
+    """Three-element chain is returned completely."""
+    _write_ai_config(
+        tmp_path,
+        {
+            "provider": "claude",
+            "provider_chain": ["claude", "openclaw", "ollama"],
+            "mode": "docker",
+            "model": None,
+        },
+    )
+    chain = _resolve_provider_chain(tmp_path)
+    assert chain == ["claude", "openclaw", "ollama"]
