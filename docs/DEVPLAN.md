@@ -1013,3 +1013,56 @@ Make `dtl ai run` and `dtl workflow run` aware of an ordered list of AI provider
 - **Local Ollama is the only true no-quota fallback** today, but its `supports_autonomous` is False — this PR adds the autonomous adapter
 - **Model ID drift:** the current IDs (`claude-opus-4-20250514`) are pre-4.7. Update at merge time and document the bump convention
 
+---
+
+## Feature: install-staleness-guard
+
+**Branch:** `feature/install-staleness-guard`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Refuse to start (or warn loudly) when `dtl workflow *` is invoked against an installed `dtl.py` that differs from the source-of-truth repo `dtl.py`. Closes the gap that produced 2026-05-17's overnight: PR #38 (`per-feature-state`) merged at 17:18 EDT, the overnight was scheduled at 19:42 against a stale `/opt/devtools/dtl.py`, and ran code that pre-dated `_write_feature_state`. The existing `scheduled-run-freshness` ensures the child re-reads `/opt` at fire time but cannot detect that `/opt` itself is stale relative to the repo.
+
+### Acceptance Criteria
+
+- [ ] New helper `_check_install_freshness(schedule_mode: bool) -> None` in `dtl.py`:
+  - Resolves the running script: `Path(sys.argv[0]).resolve()`
+  - Resolves the source-of-truth: `Path.home() / "Projects" / "devtools" / "dtl.py"` (also `.resolve()`)
+  - Returns immediately if both paths resolve to the same file (running directly from repo)
+  - Returns immediately if the source-of-truth path does not exist (no repo to compare against)
+  - Compares file contents by sha256 hash
+  - On match: returns
+  - On mismatch: if `schedule_mode=True`, prints clear error to stderr (showing both paths + the exact `sudo install.sh` command) and `sys.exit(1)`; otherwise prints a warning to stderr and returns
+- [ ] Called at the top of `cmd_workflow_run` (with `schedule_mode=bool(args.schedule)`), `cmd_workflow_next`, `cmd_workflow_finish`, `cmd_workflow_list`, and `cmd_workflow_status` — always with `schedule_mode=False` except in `cmd_workflow_run`
+- [ ] Called BEFORE `_preflight_auto_merge` in `cmd_workflow_run` so staleness is reported before any GitHub API call
+- [ ] When `--schedule` is set and the guard passes at parent-launch time, the spawned child also runs the guard (automatic because the child re-enters `cmd_workflow_run`)
+- [ ] Tests in `tests/test_workflow.py`:
+  - Same content → no exception, no exit
+  - Different content + `schedule_mode=False` → returns, stderr contains "stale"
+  - Different content + `schedule_mode=True` → `SystemExit(1)`
+  - Source-of-truth missing → returns silently
+  - `sys.argv[0]` resolves to the source-of-truth path → returns silently (running from repo)
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_check_install_freshness`; call from all five `cmd_workflow_*` entry points |
+| `tests/test_workflow.py` | Modify | New `TestInstallFreshnessGuard` class covering the five scenarios above |
+
+### Key Decisions
+
+- **Hash comparison, not mtime or git rev**: hashes are unambiguous and survive `cp -p`. mtimes drift; git revs assume the running script comes from a clone (not always true on the ephemeral install).
+- **Hardcoded repo path** (`~/Projects/devtools/dtl.py`): matches the PM's filesystem convention documented in CLAUDE.md. A `--dev-repo` override is YAGNI for a single-user single-machine tool.
+- **Asymmetric failure mode**: `--schedule` hard-bails because an autonomous overnight against stale code wastes hours; interactive runs only warn because the human is at the keyboard and can decide. Mirrors the existing `preflight_auto_merge` asymmetry.
+- **Guard runs in every `workflow` subcommand**, not just `run`: `next` and `finish` also drive automation behavior that depends on current code.
+
+### Notes
+
+Origin: 2026-05-17 overnight reconciliation. Stale `/opt/devtools/dtl.py` (pre-PR #38) ran the workflow, producing 4 clean merges but skipping all `_write_feature_state` calls because that function did not yet exist in the installed copy. Per-feature state directory `~/.local/state/dtl/<project>/<feature>.json` was therefore never created. Complement to (not replacement for) `scheduled-run-freshness`.
+
