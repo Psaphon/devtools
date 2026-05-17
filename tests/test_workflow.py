@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dtl import (
     RunOutcome,
     _build_ai_prompt,
+    _check_install_freshness,
     _classify_run,
     _emit_notify_event,
     _feature_state_path,
@@ -1857,7 +1858,11 @@ Test feature.
             "mode": "docker",
             "model": None,
             "key_source": "env",
-            "notify": {"provider": None, "telegram_token": None, "telegram_chat_id": None},
+            "notify": {
+                "provider": None,
+                "telegram_token": None,
+                "telegram_chat_id": None,
+            },
         }
         if provider_chain is not None:
             config["provider_chain"] = provider_chain
@@ -1904,7 +1909,9 @@ Test feature.
         args.log = None
         return args
 
-    def _fake_handle_interruption(self, project_dir, plan_path, feature, branch, outcome, *a, **kw):
+    def _fake_handle_interruption(
+        self, project_dir, plan_path, feature, branch, outcome, *a, **kw
+    ):
         """Revert plan 'In Progress' → 'Not Started' as the real function does via git."""
         text = plan_path.read_text()
         text = re.sub(r"\*\*Status:\*\* In Progress", "**Status:** Not Started", text)
@@ -1970,9 +1977,7 @@ Test feature.
 
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
         # Single-provider chain so it's immediately exhausted on first quota hit
-        project_dir = self._make_project(
-            tmp_path / "proj", provider_chain=["claude"]
-        )
+        project_dir = self._make_project(tmp_path / "proj", provider_chain=["claude"])
         args = self._make_args(project_dir, quota_reset_sleep=999)
 
         sleep_calls: list[float] = []
@@ -2061,3 +2066,116 @@ Test feature.
         assert call_providers[0] == "claude"
         assert call_providers[1] == "ollama"
         assert call_providers[2] == "claude"
+
+
+# ---------------------------------------------------------------------------
+# Install staleness guard
+# ---------------------------------------------------------------------------
+
+
+class TestInstallFreshnessGuard:
+    """Tests for _check_install_freshness."""
+
+    def test_same_content_no_exception(self, tmp_path):
+        """Identical file contents → returns without error."""
+        content = b"# dtl source\nprint('hello')\n"
+        running = tmp_path / "running_dtl.py"
+        source = tmp_path / "Projects" / "devtools" / "dtl.py"
+        source.parent.mkdir(parents=True)
+        running.write_bytes(content)
+        source.write_bytes(content)
+
+        import dtl as dtl_module
+
+        def fake_home():
+            return tmp_path
+
+        with (
+            patch("sys.argv", [str(running)]),
+            patch.object(dtl_module.Path, "home", staticmethod(fake_home)),
+        ):
+            # Should not raise or exit
+            _check_install_freshness(schedule_mode=False)
+            _check_install_freshness(schedule_mode=True)
+
+    def test_different_content_warn_mode(self, tmp_path, capsys):
+        """Different content + schedule_mode=False → warning on stderr, no exit."""
+        running = tmp_path / "running_dtl.py"
+        source = tmp_path / "Projects" / "devtools" / "dtl.py"
+        source.parent.mkdir(parents=True)
+        running.write_bytes(b"old content")
+        source.write_bytes(b"new content")
+
+        import dtl as dtl_module
+
+        def fake_home():
+            return tmp_path
+
+        with (
+            patch("sys.argv", [str(running)]),
+            patch.object(dtl_module.Path, "home", staticmethod(fake_home)),
+        ):
+            _check_install_freshness(schedule_mode=False)
+
+        captured = capsys.readouterr()
+        assert "stale" in captured.err
+
+    def test_different_content_schedule_mode_exits(self, tmp_path):
+        """Different content + schedule_mode=True → SystemExit(1)."""
+        running = tmp_path / "running_dtl.py"
+        source = tmp_path / "Projects" / "devtools" / "dtl.py"
+        source.parent.mkdir(parents=True)
+        running.write_bytes(b"old content")
+        source.write_bytes(b"new content")
+
+        import dtl as dtl_module
+
+        def fake_home():
+            return tmp_path
+
+        with (
+            patch("sys.argv", [str(running)]),
+            patch.object(dtl_module.Path, "home", staticmethod(fake_home)),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                _check_install_freshness(schedule_mode=True)
+        assert exc_info.value.code == 1
+
+    def test_source_of_truth_missing_returns_silently(self, tmp_path):
+        """Source-of-truth path does not exist → returns without error."""
+        running = tmp_path / "running_dtl.py"
+        running.write_bytes(b"some content")
+        # Do NOT create the source-of-truth file
+
+        import dtl as dtl_module
+
+        def fake_home():
+            return tmp_path  # tmp_path / Projects / devtools / dtl.py won't exist
+
+        with (
+            patch("sys.argv", [str(running)]),
+            patch.object(dtl_module.Path, "home", staticmethod(fake_home)),
+        ):
+            # Should return silently, no exception
+            _check_install_freshness(schedule_mode=False)
+            _check_install_freshness(schedule_mode=True)
+
+    def test_running_from_repo_returns_silently(self, tmp_path):
+        """sys.argv[0] resolves to the source-of-truth path → returns silently."""
+        source = tmp_path / "Projects" / "devtools" / "dtl.py"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"canonical content")
+
+        import dtl as dtl_module
+
+        def fake_home():
+            return tmp_path
+
+        # Point sys.argv[0] at the same file as source_of_truth
+        with (
+            patch("sys.argv", [str(source)]),
+            patch.object(dtl_module.Path, "home", staticmethod(fake_home)),
+        ):
+            # Both paths resolve to the same file → immediate return
+            _check_install_freshness(schedule_mode=False)
+            _check_install_freshness(schedule_mode=True)

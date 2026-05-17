@@ -3986,6 +3986,7 @@ def _emit_notify_event(
 
 def cmd_workflow_finish(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow finish'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     project_dir = Path(args.project).resolve()
     watch = getattr(args, "watch", False)
@@ -4131,6 +4132,53 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
             sys.exit(1)
         elif state is None:
             log.info("Could not check PR state — will retry.")
+
+
+def _check_install_freshness(schedule_mode: bool) -> None:
+    """Warn (or abort) when the running dtl.py differs from the repo source-of-truth.
+
+    Compares SHA-256 hashes of the running script and ~/Projects/devtools/dtl.py.
+    - If both paths are the same file: returns immediately (running from repo).
+    - If source-of-truth does not exist: returns silently.
+    - On hash match: returns.
+    - On hash mismatch:
+        schedule_mode=True  → print error to stderr and sys.exit(1)
+        schedule_mode=False → print warning to stderr and return.
+    """
+    import hashlib
+
+    running = Path(sys.argv[0]).resolve()
+    source_of_truth = (Path.home() / "Projects" / "devtools" / "dtl.py").resolve()
+
+    # Same file — running directly from the repo, no comparison needed.
+    if running == source_of_truth:
+        return
+
+    # No repo to compare against.
+    if not source_of_truth.exists():
+        return
+
+    def _sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        h.update(path.read_bytes())
+        return h.hexdigest()
+
+    if _sha256(running) == _sha256(source_of_truth):
+        return
+
+    install_cmd = "sudo /home/comp/Projects/devtools/install.sh"
+    msg = (
+        f"dtl install is stale: the running script does not match the repo source.\n"
+        f"  running        : {running}\n"
+        f"  source-of-truth: {source_of_truth}\n"
+        f"  fix            : {install_cmd}"
+    )
+
+    if schedule_mode:
+        print(f"error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"warning: {msg}", file=sys.stderr)
 
 
 def _preflight_auto_merge(project_dir: Path) -> Optional[bool]:
@@ -4360,6 +4408,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
         "Notify config: %s",
         "loaded" if notify_cfg else "absent (notifications disabled)",
     )
+
+    _check_install_freshness(schedule_mode=bool(schedule_time))
 
     # Preflight: check allow_auto_merge on each project's GitHub repo
     failed_repos: list[str] = []
@@ -5066,6 +5116,7 @@ def cmd_watchdog_status(args: argparse.Namespace) -> None:
 
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow list'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     if not plan_path.exists():
         print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
@@ -5087,6 +5138,7 @@ def cmd_workflow_list(args: argparse.Namespace) -> None:
 
 def cmd_workflow_status(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow status'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     if not plan_path.exists():
         print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
@@ -5131,6 +5183,7 @@ def cmd_workflow_status(args: argparse.Namespace) -> None:
 
 def cmd_workflow_next(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow next'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     project_dir = (
         Path(args.project).resolve()
