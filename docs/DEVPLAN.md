@@ -1066,3 +1066,42 @@ Refuse to start (or warn loudly) when `dtl workflow *` is invoked against an ins
 
 Origin: 2026-05-17 overnight reconciliation. Stale `/opt/devtools/dtl.py` (pre-PR #38) ran the workflow, producing 4 clean merges but skipping all `_write_feature_state` calls because that function did not yet exist in the installed copy. Per-feature state directory `~/.local/state/dtl/<project>/<feature>.json` was therefore never created. Complement to (not replacement for) `scheduled-run-freshness`.
 
+---
+
+## Feature: scaffold-shellcheck-parity
+
+**Branch:** `feature/scaffold-shellcheck-parity`
+**Depends on:** none
+**Status:** Not Started
+
+### Goal
+
+Make shellcheck behave identically in the AI dev loop and in CI for every scaffolded repo, so source-following lint failures (SC1091) can never slip through to CI and stall auto-merge. Ship a repo-root `.shellcheckrc` with `external-sources=true`, install `shellcheck` in the scaffolded `claude-code` container so the AI can lint shell locally before committing, and ensure the generated CI shellcheck step is consistent with local.
+
+### Acceptance Criteria
+
+- [ ] `dtl` scaffolding writes a repo-root `.shellcheckrc` containing `external-sources=true` and `source-path=SCRIPTDIR` for newly scaffolded projects
+- [ ] The scaffolded inline `claude-code` Dockerfile template installs `shellcheck` (apt) so the containerized AI can run it pre-commit, matching CI
+- [ ] The generated CI lint workflow's shellcheck step succeeds on a script that `source`s a sibling file via a `# shellcheck source=` directive (regression for the hub PR #8 failure)
+- [ ] Backward-compatible: existing scaffolded projects are unaffected; `docs/` documents the one-line retrofit for repos already created
+- [ ] A test asserts the scaffolder emits `.shellcheckrc` with `external-sources=true`
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Emit `.shellcheckrc` in project scaffolding; add `shellcheck` to the inline `claude-code` Dockerfile template; align the generated CI shellcheck step |
+| `tests/test_*.py` | Modify | Assert scaffolded output includes `.shellcheckrc` (external-sources=true) |
+
+### Key Decisions
+
+- **`.shellcheckrc` with `external-sources=true` over per-line `disable=SC1091`**: fixes the root cause repo-wide and *honors* the `# shellcheck source=` hints the AI already writes, rather than suppressing them. A lint gate only *prevents* (vs merely *catches*) when local and CI run the same tool, flags, and config.
+- **Install shellcheck in the AI container**, not just CI: the host has no shellcheck, so "run lint before every commit" silently skips shell unless the container provides it.
+- **Additive only** (new file + one Dockerfile line): preserves the backward-compatibility constraint; existing repos keep working and opt in by re-scaffolding or the documented one-liner.
+
+### Notes
+
+Origin: hub PR #8 (2026-05-20) stalled on SC1091 — CI ran `shellcheck` without `-x` while `scripts/install-*.sh` carried `# shellcheck source=bootstrap/versions.env` hints (only honored with `-x`), and shellcheck was not in the dev loop to catch it locally. This feature is the scaffolder-level prevention; retrofitting existing repos (hub, loom, morning-brief) with `.shellcheckrc` is separate per-repo cleanup.
+
