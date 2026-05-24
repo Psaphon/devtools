@@ -7,10 +7,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
     AI_MODES,
+    make_ai_claude_dockerfile,
     make_ai_cloud_init,
     make_ai_makefile,
     make_ai_vm_compose,
     make_ai_vm_config,
+    make_shellcheckrc,
+    scaffold_project,
 )
 
 # ---------------------------------------------------------------------------
@@ -297,6 +300,51 @@ def test_vm_compose_no_claude_when_not_requested() -> None:
 def test_vm_compose_mcp_server_included() -> None:
     content = make_ai_vm_compose(["claude"], mcp_servers=["filesystem"])
     assert "mcp-filesystem:" in content
+
+
+# ---------------------------------------------------------------------------
+# make_shellcheckrc
+# ---------------------------------------------------------------------------
+
+
+def test_shellcheckrc_external_sources() -> None:
+    content = make_shellcheckrc()
+    assert "external-sources=true" in content
+
+
+def test_shellcheckrc_source_path() -> None:
+    content = make_shellcheckrc()
+    assert "source-path=SCRIPTDIR" in content
+
+
+# ---------------------------------------------------------------------------
+# make_ai_claude_dockerfile — shellcheck present
+# ---------------------------------------------------------------------------
+
+
+def test_ai_claude_dockerfile_contains_shellcheck() -> None:
+    content = make_ai_claude_dockerfile()
+    assert "shellcheck" in content
+
+
+# ---------------------------------------------------------------------------
+# scaffold_project — .shellcheckrc actually lands on disk (boundary test)
+# ---------------------------------------------------------------------------
+
+
+def test_scaffold_writes_shellcheckrc_to_disk(tmp_path: Path) -> None:
+    """The real scaffold must WRITE .shellcheckrc to disk — not merely have a
+    generator that returns the right string. The make_shellcheckrc() tests above
+    would still pass even if scaffold_project never called it."""
+    project_dir = scaffold_project(
+        name="demo",
+        stack_name="python",
+        services=[],
+        base_dir=tmp_path,
+    )
+    shellcheckrc = project_dir / ".shellcheckrc"
+    assert shellcheckrc.exists()
+    assert "external-sources=true" in shellcheckrc.read_text()
 
 
 # ---------------------------------------------------------------------------
