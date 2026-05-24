@@ -380,6 +380,11 @@ CLAUDE_MD_TEMPLATES: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+def make_shellcheckrc() -> str:
+    """Generate .shellcheckrc so shellcheck behaves identically locally and in CI."""
+    return "external-sources=true\nsource-path=SCRIPTDIR\n"
+
+
 def make_gitignore(stack: dict) -> str:
     """Generate .gitignore content for the given stack."""
     common = textwrap.dedent("""\
@@ -676,6 +681,16 @@ def make_ci_workflow(name: str, stack: dict) -> str:
               - uses: actions/checkout@v4
         {ci_setup}
 
+          shellcheck:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/checkout@v4
+              - name: Shellcheck
+                run: |
+                  mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
+                  [ ${{#scripts[@]}} -eq 0 ] && exit 0
+                  shellcheck "${{scripts[@]}}"
+
           security-scan:
             runs-on: ubuntu-latest
             steps:
@@ -731,6 +746,12 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
             run: |
               pip install pytest
               pytest --tb=short -q; RET=$?; [ $RET -eq 5 ] && exit 0 || exit $RET
+
+          - name: Shellcheck
+            run: |
+              mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
+              [ ${#scripts[@]} -eq 0 ] && exit 0
+              shellcheck "${scripts[@]}"
 """)
 
 
@@ -1142,6 +1163,7 @@ def make_ai_claude_dockerfile() -> str:
         RUN apt-get update && apt-get install -y --no-install-recommends \\
                 git \\
                 ripgrep \\
+                shellcheck \\
                 python3 \\
                 python3-pip \\
                 python3-venv \\
@@ -1643,6 +1665,7 @@ def scaffold_project(
 
     # -- files --
     files: Dict[Path, str] = {
+        project_dir / ".shellcheckrc": make_shellcheckrc(),
         project_dir / ".gitignore": make_gitignore(stack),
         project_dir / "README.md": make_readme(name, stack_name),
         project_dir / "CLAUDE.md": make_claude_md(

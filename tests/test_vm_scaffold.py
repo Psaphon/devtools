@@ -7,10 +7,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
     AI_MODES,
+    make_ai_claude_dockerfile,
     make_ai_cloud_init,
     make_ai_makefile,
     make_ai_vm_compose,
     make_ai_vm_config,
+    make_shellcheckrc,
 )
 
 # ---------------------------------------------------------------------------
@@ -297,6 +299,31 @@ def test_vm_compose_no_claude_when_not_requested() -> None:
 def test_vm_compose_mcp_server_included() -> None:
     content = make_ai_vm_compose(["claude"], mcp_servers=["filesystem"])
     assert "mcp-filesystem:" in content
+
+
+# ---------------------------------------------------------------------------
+# make_shellcheckrc
+# ---------------------------------------------------------------------------
+
+
+def test_shellcheckrc_external_sources() -> None:
+    content = make_shellcheckrc()
+    assert "external-sources=true" in content
+
+
+def test_shellcheckrc_source_path() -> None:
+    content = make_shellcheckrc()
+    assert "source-path=SCRIPTDIR" in content
+
+
+# ---------------------------------------------------------------------------
+# make_ai_claude_dockerfile — shellcheck present
+# ---------------------------------------------------------------------------
+
+
+def test_ai_claude_dockerfile_contains_shellcheck() -> None:
+    content = make_ai_claude_dockerfile()
+    assert "shellcheck" in content
 
 
 # ---------------------------------------------------------------------------
