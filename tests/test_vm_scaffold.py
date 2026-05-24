@@ -13,6 +13,7 @@ from dtl import (
     make_ai_vm_compose,
     make_ai_vm_config,
     make_shellcheckrc,
+    scaffold_project,
 )
 
 # ---------------------------------------------------------------------------
@@ -324,6 +325,26 @@ def test_shellcheckrc_source_path() -> None:
 def test_ai_claude_dockerfile_contains_shellcheck() -> None:
     content = make_ai_claude_dockerfile()
     assert "shellcheck" in content
+
+
+# ---------------------------------------------------------------------------
+# scaffold_project — .shellcheckrc actually lands on disk (boundary test)
+# ---------------------------------------------------------------------------
+
+
+def test_scaffold_writes_shellcheckrc_to_disk(tmp_path: Path) -> None:
+    """The real scaffold must WRITE .shellcheckrc to disk — not merely have a
+    generator that returns the right string. The make_shellcheckrc() tests above
+    would still pass even if scaffold_project never called it."""
+    project_dir = scaffold_project(
+        name="demo",
+        stack_name="python",
+        services=[],
+        base_dir=tmp_path,
+    )
+    shellcheckrc = project_dir / ".shellcheckrc"
+    assert shellcheckrc.exists()
+    assert "external-sources=true" in shellcheckrc.read_text()
 
 
 # ---------------------------------------------------------------------------
