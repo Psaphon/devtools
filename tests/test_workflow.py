@@ -1034,6 +1034,12 @@ class TestCmdWorkflowRunScheduleSubprocess:
             patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
             patch("dtl._setup_workflow_logger", return_value=MagicMock()),
             patch("dtl._preflight_auto_merge", return_value=None),
+            # The staleness guard sys.exit(1)s in schedule_mode when the running
+            # script differs from ~/Projects/devtools/dtl.py. On a dev host that
+            # path exists and never matches pytest, so without this patch the test
+            # passes only in CI (where the path is absent). Bypass it to test
+            # subprocess delegation in isolation.
+            patch("dtl._check_install_freshness"),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 cmd_workflow_run(args)
