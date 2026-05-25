@@ -1105,3 +1105,103 @@ Make shellcheck behave identically in the AI dev loop and in CI for every scaffo
 
 Origin: hub PR #8 (2026-05-20) stalled on SC1091 — CI ran `shellcheck` without `-x` while `scripts/install-*.sh` carried `# shellcheck source=bootstrap/versions.env` hints (only honored with `-x`), and shellcheck was not in the dev loop to catch it locally. This feature is the scaffolder-level prevention; retrofitting existing repos (hub, loom, morning-brief) with `.shellcheckrc` is separate per-repo cleanup.
 
+
+---
+
+## Feature: dtl-pm-install
+
+**Branch:** `feature/dtl-pm-install`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Add a `dtl pm install` subcommand that materializes the canonical PM coordination config (`pm/`) into a workspace — wrapping the logic already in `pm/install.sh` — so a rebuilt workstation (or hub first-boot) restores the PM layer with one command.
+
+### Acceptance Criteria
+
+- [ ] `dtl pm install [--dry-run] [--workspace DIR]` copies `pm/` (CLAUDE.md + the `.claude` payload: PROJECTS.md, rules/, commands/, scripts/, settings.json) into the target workspace (default `~/Projects`)
+- [ ] PRESERVES `.claude/settings.local.json` and `.claude/HANDOFF.md` if they already exist (never overwrite machine-local / volatile files)
+- [ ] Resolves the `pm/` source whether dtl runs from `/opt/devtools` or a dev clone
+- [ ] `dtl pm --help` documents the command
+- [ ] Unit test installs into a tmp workspace and asserts the files land AND a pre-existing settings.local.json is preserved (real boundary, not a string check)
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `pm` subcommand + `cmd_pm_install` (stdlib-only) |
+| `tests/test_pm_install.py` | Create | Install-to-tmp test + preservation assertion |
+
+### Notes
+
+`pm/install.sh` already implements the copy/preserve logic — reimplement in stdlib Python or shell out to it. Match existing dtl subcommand patterns.
+
+---
+
+## Feature: ci-aggregation-gate
+
+**Branch:** `feature/ci-aggregation-gate`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make scaffolded CI gate merges reliably even with matrix jobs. Add a single `ci-ok` aggregation job (`needs:` all other jobs) to the generated CI workflow so branch protection can require just `ci-ok` instead of brittle per-matrix-cell contexts (the exact gap that let untested code merge on hub/devtools).
+
+### Acceptance Criteria
+
+- [ ] The scaffolded CI workflow template in `dtl.py` includes a final `ci-ok` job that `needs` every other job, runs with `if: always()`, and FAILS if any needed job's result is not `success`
+- [ ] Scaffolded README/docs instruct requiring only `ci-ok` in branch protection
+- [ ] test-templates / test-scaffold assert the generated workflow contains `ci-ok` wired to the other jobs
+- [ ] Backward compatible — existing scaffolded repos unaffected
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `ci-ok` gate job to the CI workflow template |
+| `tests/` | Modify | Assert the gate job is generated and wired |
+
+### Notes
+
+Standard solution to "matrix jobs can't be required status checks." The result-check step should inspect `needs.*.result`.
+
+---
+
+## Feature: scaffold-security-scan
+
+**Branch:** `feature/scaffold-security-scan`
+**Depends on:** ci-aggregation-gate
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Make security scanning a scaffolding default so every new repo gets baseline AppSec without manual setup — the "right checks installed at scaffold time" principle extended to security.
+
+### Acceptance Criteria
+
+- [ ] Scaffolded CI includes a `security-scan` job: gitleaks (secrets) + `pip-audit` (python stack) / `npm audit` (node stack)
+- [ ] The `security-scan` job is wired into the `ci-ok` gate (or documented as required)
+- [ ] test-templates / test-scaffold assert the security-scan job is generated for the python and node stacks
+- [ ] Scaffolded docs note how to read findings and triage
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `security-scan` job to the CI workflow template |
+| `tests/` | Modify | Assert generation per stack |
+
+### Notes
+
+Complements `pm/weekly-review.sh` (scans existing repos); this bakes scanning into new repos from day one. devtools' own security model already references gitleaks/semgrep.
