@@ -2,7 +2,7 @@
 
 This file summarizes the repos in User's `~/Projects` directory and the cross-cutting conventions they share. Use it when proposing stacks or features during planning sessions. Prefer existing patterns unless there's a clear reason to deviate.
 
-**Last updated:** 2026-05-12
+**Last updated:** 2026-05-25
 
 ## Active Projects
 
@@ -11,7 +11,8 @@ This file summarizes the repos in User's `~/Projects` directory and the cross-cu
 | **devtools** | CLI scaffolder and AI dev orchestrator (`dtl`) | Python 3.11, stdlib-only, single-file |
 | **morning-brief** | Automated daily news dashboard pipeline | Python 3.11, async httpx, SQLite, Ollama (Qwen 2.5 7B), Jinja2, Rich, Click, Cloudflare Pages |
 | **loom** | Overnight music-video pipeline (ComfyUI + ffmpeg) | Python 3.11, Click, httpx (async), librosa, ffmpeg subprocess, TOML, systemd timer |
-| **usb-autoinstall-public** | Ephemeral security workstation USB installer (being deprecated by `hub`) | Bash, shellcheck, Ubuntu 25.10 autoinstall, 4-partition USB |
+| **hub** | Headless, Tailnet-native, **persistent** workstation; the substrate the other private projects run on (supersedes `usb-autoinstall-public`) | Ubuntu Server 24.04 LTS, Ansible (konstruktoid.hardening), Tailscale, Docker + NVIDIA Container Toolkit, Ollama, ntfy, Glance/Beszel, Python 3.11 + Bash, systemd |
+| **usb-autoinstall-public** | Ephemeral security workstation USB installer — **ARCHIVED on GitHub**, superseded by `hub` | Bash, shellcheck, Ubuntu 25.10 autoinstall, 4-partition USB |
 | **ollama** | Local LLM management (separate from morning-brief) | Ollama runtime |
 | **Prompt-Fishing** | (purpose TBD here — read its own CLAUDE.md) | Next.js, TypeScript |
 | **water-monitor-infra** | Water quality monitoring infrastructure | TBD |
@@ -24,7 +25,7 @@ Live planning artifacts in `~/Projects/NEW-PROJECTS/`. Scan this directory befor
 
 | Plan | Status | Will become |
 |---|---|---|
-| **hub** | DEVPLAN drafted; will be scaffolded as a private repo, manual development | Headless Ubuntu Server (the user's daily workstation), Tailscale-native, runs `dtl`, `loom`, Ollama, ntfy, voice/action handlers. Absorbs the earlier `hdlss-ws` (duplicate) and the server-side of `watch-ops`. Deprecates `usb-autoinstall-public` once shipped. |
+| _(none currently)_ | — | `hub` graduated to a live repo (see Active Projects) on 2026-05-12; ~10 features merged, host integrations (claude-agent-runner, dtl-workflow-scheduling, action/voice/watch handlers, break-glass, docs) still queued. `~/Projects/NEW-PROJECTS/` now holds only `ARCHIVE/`. |
 
 ## Cross-Cutting Conventions
 
@@ -36,14 +37,14 @@ Live planning artifacts in `~/Projects/NEW-PROJECTS/`. Scan this directory befor
 
 **Network segmentation & trust boundaries** — every project that binds to a non-loopback interface, holds credentials, accepts input from another device, or deploys to metal must declare its segmentation level explicitly in the `## Network Segmentation and Trust Boundaries` block of its `CLAUDE.md`. Bind addresses are never implicit: `127.0.0.1`, `tailscale0`, or `0.0.0.0` is a decision, not a default. The Tailnet is the perimeter for personal infrastructure; the public internet is never directly reachable inbound. New projects inherit this convention unless they explicitly opt out and justify the choice.
 
-**Repo visibility & scheduling eligibility** — the user is on GitHub Free. Public repos support branch protection + `gh pr merge --auto`, which is what `dtl workflow run --schedule HH:MM` depends on to chain features unattended overnight. Private repos on Free have neither: every PR must be merged by hand, so private repos are daytime-only and PM-driven (`dtl ai run` single-shot, manual `gh pr create`, manual merge). Each project's `PROJECT-BRIEF.md` declares its visibility; the PM uses that to choose between scheduled and manual flows. Don't propose `--schedule` against a private repo without first proposing upgrade to GitHub Pro (~$4/mo) or making the repo public.
+**Repo visibility & scheduling eligibility** — the user is on **GitHub Pro**. `gh pr merge --auto` is available on **both** public and private repos, so `dtl workflow run --schedule HH:MM` can chain features unattended overnight regardless of visibility. Visibility is therefore a *confidentiality* decision, not a scheduling constraint: keep infrastructure/security internals private (`hub`), keep portfolio-worthy tools public (`devtools`, `loom`, `morning-brief`). Each project's `PROJECT-BRIEF.md` declares its visibility. (Historical note: under the old GitHub Free plan, private repos could not auto-merge and were daytime/manual-only — that limitation no longer applies, so don't propose "make it public just to schedule it.")
 
-| Visibility | Auto-merge on Free | Development model | Examples |
+| Visibility | Auto-merge | Development model | Examples |
 |---|---|---|---|
-| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, usb-autoinstall-public, Prompt-Fishing, loom |
-| Private | no | daytime, manual PR approval per feature | future `hub` (workstation OS) |
+| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, loom, Prompt-Fishing, ollama |
+| Private | yes (on Pro) | overnight-scheduled, unattended | hub |
 
-**Ephemeral workstation** — User's development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent.
+**Ephemeral workstation** — User's current development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent. **Exception in progress:** `hub` is being stood up as a *persistent*, non-ephemeral box (LUKS+TPM2 auto-unlock, no weekly rebuild) intended to become the daily driver and host the other projects. Once hub is live on real hardware, the weekly-rebuild assumption applies only to break-glass recovery, not a routine cadence — and this Hardware section should be updated to hub's specs.
 
 **LLM strategy** — local-first. Use Ollama (Qwen 2.5 7B on RTX 2060) for bulk work. Use Claude API only for synthesis or high-reasoning tasks where quality matters more than cost. Budget: $5-10/week total.
 
