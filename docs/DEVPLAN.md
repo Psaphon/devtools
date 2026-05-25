@@ -1072,7 +1072,7 @@ Origin: 2026-05-17 overnight reconciliation. Stale `/opt/devtools/dtl.py` (pre-P
 
 **Branch:** `feature/scaffold-shellcheck-parity`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged
 
 ### Goal
 
