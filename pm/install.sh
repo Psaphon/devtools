@@ -45,6 +45,9 @@ for d in rules commands scripts; do
         run cp "${f}" "${CLAUDE_DIR}/${d}/$(basename "${f}")"
     done
 done
-run chmod +x "${CLAUDE_DIR}/scripts/weekly-review.sh"
+for f in "${CLAUDE_DIR}/scripts/"*.sh; do
+    [[ -e "${f}" ]] || continue
+    run chmod +x "${f}"
+done
 
 log "Done. Preserved (if present): ${CLAUDE_DIR}/settings.local.json, ${CLAUDE_DIR}/HANDOFF.md"
