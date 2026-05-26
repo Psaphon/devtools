@@ -66,6 +66,12 @@ echo "INFO: Launching ${UNIT} — schedule=${SCHEDULE} projects=${PROJECTS}" >&2
 echo "INFO: PATH for unit = ${RUN_PATH}" >&2
 echo "INFO: Log file = ${LOG_DEFAULT}" >&2
 
+# Drop any stale failed/loaded transient unit of the same name. systemd-run
+# refuses to re-register a unit name that is still loaded, even if it exited.
+# (Discovered 2026-05-26 when relaunching after a failed prior run blocked
+# the new unit with "Unit ... was already loaded or has a fragment file".)
+systemctl --user reset-failed "${UNIT}.service" 2>/dev/null || true
+
 exec systemd-run --user \
     --unit="${UNIT}" \
     --description="overnight dev run (PATH-fixed launcher)" \
