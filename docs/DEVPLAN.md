@@ -1112,7 +1112,7 @@ Origin: hub PR #8 (2026-05-20) stalled on SC1091 — CI ran `shellcheck` without
 
 **Branch:** `feature/dtl-pm-install`
 **Depends on:** none
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** ai
 
 ### Goal
