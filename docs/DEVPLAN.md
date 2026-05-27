@@ -1179,7 +1179,7 @@ Standard solution to "matrix jobs can't be required status checks." The result-c
 
 **Branch:** `feature/scaffold-security-scan`
 **Depends on:** ci-aggregation-gate
-**Status:** PR Open
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
