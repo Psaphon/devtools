@@ -53,6 +53,42 @@ def test_make_ci_workflow_ci_ok_present_for_all_stacks():
 
 
 # ---------------------------------------------------------------------------
+# security-scan job — per-stack dependency audit
+# ---------------------------------------------------------------------------
+
+
+def test_make_ci_workflow_security_scan_job_present_for_python():
+    content = make_ci_workflow("myproject", STACKS["python"])
+    assert "security-scan:" in content
+
+
+def test_make_ci_workflow_security_scan_job_present_for_node():
+    content = make_ci_workflow("myproject", STACKS["node"])
+    assert "security-scan:" in content
+
+
+def test_make_ci_workflow_python_stack_has_pip_audit():
+    content = make_ci_workflow("myproject", STACKS["python"])
+    assert "pip-audit" in content
+
+
+def test_make_ci_workflow_node_stack_has_npm_audit():
+    content = make_ci_workflow("myproject", STACKS["node"])
+    assert "npm audit" in content
+
+
+def test_make_ci_workflow_security_scan_present_for_all_stacks():
+    for stack_name, stack in STACKS.items():
+        content = make_ci_workflow(stack_name, stack)
+        assert "security-scan:" in content, (
+            f"security-scan job missing for stack {stack_name!r}"
+        )
+        assert "gitleaks" in content, (
+            f"gitleaks missing from security-scan for stack {stack_name!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # _CI_YML_SCAFFOLD — the --scaffold-ci fallback template
 # ---------------------------------------------------------------------------
 

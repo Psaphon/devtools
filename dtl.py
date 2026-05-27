@@ -103,6 +103,13 @@ STACKS: Dict[str, dict] = {
               - run: pytest --tb=short || true
         """),
         "claude_linter": "ruff check . && ruff format --check .",
+        "security_audit_step": textwrap.dedent("""\
+            - name: Dependency audit (pip-audit)
+              run: |
+                pip install pip-audit
+                if [ -f requirements.txt ]; then pip-audit -r requirements.txt; fi
+                if [ -f pyproject.toml ]; then pip-audit; fi
+        """),
     },
     "node": {
         "display": "Node.js 22 LTS",
@@ -142,6 +149,17 @@ STACKS: Dict[str, dict] = {
               - run: npm test || true
         """),
         "claude_linter": "npx eslint . && npx prettier --check .",
+        "security_audit_step": textwrap.dedent("""\
+            - uses: actions/setup-node@v4
+              with:
+                node-version: "22"
+            - name: Dependency audit (npm)
+              run: |
+                if [ -f package.json ]; then
+                  npm install --package-lock-only --ignore-scripts
+                  npm audit --audit-level=high
+                fi
+        """),
     },
     "go": {
         "display": "Go 1.23",
@@ -446,6 +464,25 @@ def make_readme(name: str, stack_name: str) -> str:
         In GitHub repository settings, require the `ci-ok` status check
         (rather than individual matrix job names) so that all CI jobs must
         pass before a pull request can merge.
+
+        ## Security Scanning
+
+        CI runs two security checks on every push:
+
+        - **Secret scanning** (gitleaks): detects committed credentials and API keys.
+        - **Dependency audit** (pip-audit / npm audit): flags packages with known CVEs.
+
+        ### Triaging findings
+
+        **Gitleaks** — if a secret is flagged:
+        1. Rotate the credential immediately (treat it as compromised).
+        2. Remove it from git history (`git filter-repo` or BFG Repo Cleaner).
+        3. If the match is a false positive, add a `.gitleaksignore` entry.
+
+        **Dependency audit** — if a vulnerable package is flagged:
+        1. Check the advisory for severity and whether your usage is affected.
+        2. Update to a patched version (`pip install -U <pkg>` / `npm update <pkg>`).
+        3. If no fix exists, assess workarounds or document the accepted risk.
     """)
 
 
@@ -667,57 +704,61 @@ def make_precommit_config() -> str:
 
 def make_ci_workflow(name: str, stack: dict) -> str:
     """Generate .github/workflows/ci.yml."""
-    ci_setup = stack["ci_setup"].rstrip()
-    return textwrap.dedent(f"""\
-        name: CI
+    ci_setup = textwrap.indent(stack["ci_setup"].rstrip(), "      ")
+    security_audit_step = stack.get("security_audit_step", "").rstrip()
+    audit_block = (
+        textwrap.indent(security_audit_step, "      ") if security_audit_step else ""
+    )
+    return f"""\
+name: CI
 
-        on:
-          push:
-            branches: [main, develop, "feature/**", "release/**", "hotfix/**"]
-          pull_request:
-            branches: [main, develop]
+on:
+  push:
+    branches: [main, develop, "feature/**", "release/**", "hotfix/**"]
+  pull_request:
+    branches: [main, develop]
 
-        permissions:
-          contents: read
+permissions:
+  contents: read
 
-        jobs:
-          lint-and-test:
-            runs-on: ubuntu-latest
-            steps:
-              - uses: actions/checkout@v4
-        {ci_setup}
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+{ci_setup}
 
-          shellcheck:
-            runs-on: ubuntu-latest
-            steps:
-              - uses: actions/checkout@v4
-              - name: Shellcheck
-                run: |
-                  mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
-                  [ ${{#scripts[@]}} -eq 0 ] && exit 0
-                  shellcheck "${{scripts[@]}}"
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: |
+          mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
+          [ ${{#scripts[@]}} -eq 0 ] && exit 0
+          shellcheck "${{scripts[@]}}"
 
-          security-scan:
-            runs-on: ubuntu-latest
-            steps:
-              - uses: actions/checkout@v4
-              - uses: gitleaks/gitleaks-action@v2
-                env:
-                  GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
-
-          ci-ok:
-            runs-on: ubuntu-latest
-            needs: [lint-and-test, shellcheck, security-scan]
-            if: always()
-            steps:
-              - name: Check job results
-                run: |
-                  if [[ "${{{{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}}}" == "true" ]]; then
-                    echo "One or more required jobs did not succeed."
-                    exit 1
-                  fi
-                  echo "All required jobs succeeded."
-    """)
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
+{audit_block}
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, shellcheck, security-scan]
+    if: always()
+    steps:
+      - name: Check job results
+        run: |
+          if [[ "${{{{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}}}" == "true" ]]; then
+            echo "One or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "All required jobs succeeded."
+"""
 
 
 _CI_YML_SCAFFOLD = textwrap.dedent("""\
