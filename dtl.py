@@ -5261,6 +5261,94 @@ def cmd_workflow_next(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PM commands
+# ---------------------------------------------------------------------------
+
+
+def _pm_source_dir() -> Path:
+    """Return the pm/ directory adjacent to dtl.py (dev clone or installed)."""
+    candidate = Path(__file__).parent / "pm"
+    if candidate.is_dir():
+        return candidate
+    installed = Path("/opt/devtools/pm")
+    if installed.is_dir():
+        return installed
+    raise FileNotFoundError(
+        f"pm/ source not found next to {__file__} or at /opt/devtools/pm"
+    )
+
+
+def cmd_pm_install(args: argparse.Namespace) -> None:
+    """Handle 'dtl pm install'."""
+    workspace = Path(args.workspace).expanduser().resolve()
+    dry_run: bool = args.dry_run
+
+    try:
+        pm_src = _pm_source_dir()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    claude_dir = workspace / ".claude"
+    preserve = {
+        claude_dir / "settings.local.json",
+        claude_dir / "HANDOFF.md",
+    }
+
+    def _log(msg: str) -> None:
+        print(f"[dtl pm install] {msg}")
+
+    def _cp(src: Path, dst: Path) -> None:
+        if dst in preserve and dst.exists():
+            _log(f"  preserve  {dst.relative_to(workspace)}")
+            return
+        if dry_run:
+            _log(f"  [dry-run] copy {src.name} -> {dst.relative_to(workspace)}")
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+        _log(f"  copy      {dst.relative_to(workspace)}")
+
+    _log(f"source:    {pm_src}")
+    _log(f"workspace: {workspace}")
+
+    if not dry_run:
+        for subdir in ("rules", "commands", "scripts"):
+            (claude_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    # workspace/CLAUDE.md
+    _cp(pm_src / "CLAUDE.md", workspace / "CLAUDE.md")
+
+    # .claude/settings.json and PROJECTS.md
+    _cp(pm_src / "settings.json", claude_dir / "settings.json")
+    _cp(pm_src / "PROJECTS.md", claude_dir / "PROJECTS.md")
+
+    # subdirs: rules, commands, scripts
+    for subdir in ("rules", "commands", "scripts"):
+        src_subdir = pm_src / subdir
+        if not src_subdir.is_dir():
+            continue
+        for src_file in sorted(src_subdir.iterdir()):
+            if not src_file.is_file():
+                continue
+            _cp(src_file, claude_dir / subdir / src_file.name)
+
+    # chmod +x scripts
+    if not dry_run:
+        scripts_dir = claude_dir / "scripts"
+        if scripts_dir.is_dir():
+            for script in scripts_dir.iterdir():
+                if script.suffix == ".sh":
+                    script.chmod(script.stat().st_mode | 0o111)
+
+    preserved_present = sorted(p for p in preserve if p.exists())
+    if preserved_present:
+        names = ", ".join(str(p.relative_to(workspace)) for p in preserved_present)
+        _log(f"Preserved:  {names}")
+    _log("Done.")
+
+
+# ---------------------------------------------------------------------------
 # Main CLI
 # ---------------------------------------------------------------------------
 
@@ -5792,6 +5880,31 @@ def main() -> None:
     )
     nt_test_parser.set_defaults(func=cmd_notify_test)
 
+    # -- pm (subcommand group) --
+    pm_parser = subparsers.add_parser(
+        "pm",
+        help="PM coordination layer management",
+    )
+    pm_subparsers = pm_parser.add_subparsers(dest="pm_command")
+
+    # -- pm install --
+    pm_install_parser = pm_subparsers.add_parser(
+        "install",
+        help="Materialize the canonical PM config (pm/) into a workspace",
+    )
+    pm_install_parser.add_argument(
+        "--workspace",
+        default="~/Projects",
+        help="Target workspace directory (default: ~/Projects)",
+    )
+    pm_install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Show what would be copied without making changes",
+    )
+    pm_install_parser.set_defaults(func=cmd_pm_install)
+
     # -- Parse and dispatch --
     args = parser.parse_args()
     if not args.command:
@@ -5820,6 +5933,12 @@ def main() -> None:
     if args.command == "notify":
         if not getattr(args, "notify_command", None):
             notify_parser.print_help()
+            sys.exit(1)
+
+    # Handle 'pm' subcommand group
+    if args.command == "pm":
+        if not getattr(args, "pm_command", None):
+            pm_parser.print_help()
             sys.exit(1)
 
     args.func(args)
