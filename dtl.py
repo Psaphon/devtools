@@ -440,6 +440,12 @@ def make_readme(name: str, stack_name: str) -> str:
 
         All development happens inside the devcontainer. See `CLAUDE.md`
         for commit conventions and workflow rules.
+
+        ## Branch Protection
+
+        In GitHub repository settings, require the `ci-ok` status check
+        (rather than individual matrix job names) so that all CI jobs must
+        pass before a pull request can merge.
     """)
 
 
@@ -698,6 +704,19 @@ def make_ci_workflow(name: str, stack: dict) -> str:
               - uses: gitleaks/gitleaks-action@v2
                 env:
                   GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
+
+          ci-ok:
+            runs-on: ubuntu-latest
+            needs: [lint-and-test, shellcheck, security-scan]
+            if: always()
+            steps:
+              - name: Check job results
+                run: |
+                  if [[ "${{{{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}}}" == "true" ]]; then
+                    echo "One or more required jobs did not succeed."
+                    exit 1
+                  fi
+                  echo "All required jobs succeeded."
     """)
 
 
@@ -752,6 +771,19 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
               mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
               [ ${#scripts[@]} -eq 0 ] && exit 0
               shellcheck "${scripts[@]}"
+
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test]
+    if: always()
+    steps:
+      - name: Check job results
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "All required jobs succeeded."
 """)
 
 
