@@ -1146,7 +1146,7 @@ Add a `dtl pm install` subcommand that materializes the canonical PM coordinatio
 
 **Branch:** `feature/ci-aggregation-gate`
 **Depends on:** none
-**Status:** PR Open
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
