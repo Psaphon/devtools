@@ -1205,3 +1205,45 @@ Make security scanning a scaffolding default so every new repo gets baseline App
 ### Notes
 
 Complements `pm/weekly-review.sh` (scans existing repos); this bakes scanning into new repos from day one. devtools' own security model already references gitleaks/semgrep.
+
+---
+
+## Feature: scaffold-ci-greenable
+
+**Branch:** `fix/scaffold-ci-template`
+**Depends on:** scaffold-security-scan, ci-aggregation-gate
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+A freshly scaffolded repo must pass its own CI on the very first push. Today `dtl new` (python stack) produces a repo that fails CI out of the box on four independent template defects — all found standing up the `atrade` repo 2026-06-05 and patched by hand there. Fix them at the source in `dtl.py` so every future scaffold is green from birth, and add a test that actually exercises the generated CI logic (not just its shape).
+
+### Background — the four defects (all in `dtl.py` inline templates)
+
+1. **`pytest` never gates.** The CI `lint-and-test` job runs `pytest --tb=short || true`, so test failures can never fail the build. Combined with the `ci-ok` aggregation gate, a repo can auto-merge broken tests (green-but-blind). The `|| true` exists only to tolerate pytest exit code 5 ("no tests collected") on an empty scaffold.
+2. **`notify.py` ships unformatted.** The scaffolded `.ai/notify.py` fails `ruff format --check .`, so the first push red-fails `lint-and-test`.
+3. **`gitleaks-action` is brittle on PRs.** It requires `GITHUB_TOKEN` and `pull-requests: write`, and even with both it returns "Unexpected exit code 1" on a clean PR commit-range scan. The `security-scan` job fails on every PR.
+4. **`security-scan` perms too narrow.** Top-level `permissions: contents: read` is insufficient for any action that comments on PRs.
+
+### Acceptance Criteria
+
+- [ ] Scaffolded CI gates pytest: replace `pytest ... || true` with `pytest --tb=short || { rc=$?; [ "$rc" -eq 5 ] && exit 0 || exit "$rc"; }` (tolerate only exit 5)
+- [ ] Scaffolded `.ai/notify.py` passes `ruff format --check` as generated (template is pre-formatted; assert in a test)
+- [ ] `security-scan` uses the gitleaks **CLI** against the working tree (`gitleaks dir .`) instead of `gitleaks-action`; no `GITHUB_TOKEN` / `pull-requests: write` needed; exits non-zero only on a real finding
+- [ ] A test scaffolds a python project and asserts the generated `ci.yml` (a) gates pytest and (b) uses the gitleaks CLI, not the action
+- [ ] A test asserts the generated `notify.py` is already ruff-formatted
+- [ ] Backward-compatible — does not break existing scaffolded repos
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Fix the inline CI workflow + `notify.py` templates (4 defects above) |
+| `tests/` | Modify | Assert pytest-gating, gitleaks-CLI, and pre-formatted notify.py in generated output |
+
+### Notes
+
+The reference fix is the atrade `ci.yml` after PR #1 (`Psaphon/atrade`), which is green across all four jobs. The deeper lesson: `scaffold-security-scan`'s tests asserted the job was *generated*, never that a scaffold *passes* — so add a test that runs the generated CI logic, not just diffs the YAML. Tracked in PM memory `project_dtl_scaffold_ci_pytest_gate`.
