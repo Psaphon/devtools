@@ -1561,10 +1561,18 @@ def make_run_script(provider: str) -> str:
             echo "[dtl ai run] Prompt: $PROMPT"
 
             # Run Claude Code in print mode (non-interactive, autonomous)
+            #
+            # Capture the REAL exit status. `|| EXIT_CODE=$?` records what
+            # actually happened while stopping `set -e` from aborting first.
+            #
+            # Do NOT go back to `|| true` + ${PIPESTATUS[0]}: `|| true` runs a
+            # successful command, which resets PIPESTATUS, so the recorded
+            # status was unconditionally 0. Every failure — expired OAuth,
+            # crash, wall-clock kill — was reported as success.
+            EXIT_CODE=0
             RESULT=$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" \\
                 run --rm claude-code \\
-                claude --print -p "$PROMPT" 2>&1) || true
-            EXIT_CODE=${PIPESTATUS[0]:-$?}
+                claude --print -p "$PROMPT" 2>&1) || EXIT_CODE=$?
 
             echo "$RESULT"
 
