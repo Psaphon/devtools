@@ -19,8 +19,16 @@ jobs:
           python-version: "3.12"
       - name: Check syntax
         run: python -m py_compile dtl.py
+      # Ruff is PINNED deliberately. An unpinned `pip install ruff` means any
+      # upstream release can turn CI red with no change on our side — which is
+      # exactly what happened on 2026-08-26, when 0.16.4 expanded the default
+      # rule set and produced 134 errors in an unmodified dtl.py (0.15.7: zero).
+      # Every open PR was blocked, including one-line doc changes.
+      #
+      # Bump this deliberately, in its own PR, alongside the fixes the new
+      # version demands. Never unpin it.
       - name: Run ruff lint
-        run: pip install ruff && ruff check dtl.py
+        run: pip install ruff==0.15.7 && ruff check dtl.py
       - name: Run ruff format check
         run: ruff format --check dtl.py
 
