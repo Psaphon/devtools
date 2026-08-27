@@ -1,13 +1,15 @@
 """Tests for ai_run wall-clock timeout and retry-cap bail-out paths."""
 
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dtl import _resolve_provider_chain, _run_ai_with_limits
+from dtl import _resolve_provider_chain, _run_ai_with_limits, make_run_script
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +196,88 @@ def test_resolve_chain_three_providers(tmp_path):
     )
     chain = _resolve_provider_chain(tmp_path)
     assert chain == ["claude", "openclaw", "ollama"]
+
+
+# ---------------------------------------------------------------------------
+# make_run_script — the generated runner must report the REAL exit status
+#
+# Regression: the claude template used `... || true` followed by
+# EXIT_CODE=${PIPESTATUS[0]:-$?}. `|| true` runs a successful command, which
+# resets PIPESTATUS, so EXIT_CODE was unconditionally 0 and every failure
+# (expired OAuth, crash, wall-clock kill) was reported as success.
+#
+# The pre-existing exit-code tests all targeted _run_ai_with_limits — the
+# Python wrapper *around* run.sh — so none of them touched the layer that
+# actually swallowed the status.
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_docker(bin_dir: Path, exit_code: int) -> None:
+    """Put a `docker` on PATH that prints to stdout and exits `exit_code`."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "docker"
+    fake.write_text(
+        f'#!/usr/bin/env bash\necho "fake docker output"\nexit {exit_code}\n'
+    )
+    fake.chmod(0o755)
+
+
+def _run_generated_script(tmp_path: Path, docker_exit: int):
+    """Generate the claude run.sh, stub docker, execute it, return the result."""
+    script = tmp_path / "run.sh"
+    script.write_text(make_run_script("claude"))
+    script.chmod(0o755)
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+
+    bin_dir = tmp_path / "bin"
+    _write_fake_docker(bin_dir, docker_exit)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    return subprocess.run(
+        [str(script), "do the thing"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+
+def test_generated_run_script_propagates_failure_exit_code(tmp_path):
+    """A failing container run must surface as a non-zero exit, not success."""
+    result = _run_generated_script(tmp_path, docker_exit=42)
+    assert result.returncode == 42, (
+        f"run.sh swallowed the failure and exited {result.returncode}; "
+        "the container's real status must reach the caller"
+    )
+
+
+def test_generated_run_script_success_exits_zero(tmp_path):
+    """The success path must still exit 0."""
+    result = _run_generated_script(tmp_path, docker_exit=0)
+    assert result.returncode == 0
+
+
+def test_generated_run_script_still_prints_output_on_failure(tmp_path):
+    """Failure must not cost us the diagnostics — the output is how we debug."""
+    result = _run_generated_script(tmp_path, docker_exit=42)
+    assert "fake docker output" in result.stdout
+
+
+def test_generated_run_script_has_no_pipestatus_antipattern(tmp_path):
+    """Guard the specific construct that caused the silent-success bug.
+
+    Comment lines are stripped first: the template deliberately *describes* the
+    antipattern so a future reader does not reintroduce it, and that prose must
+    not trip the check. Only executable lines are inspected.
+    """
+    code = "\n".join(
+        line
+        for line in make_run_script("claude").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "PIPESTATUS" not in code, (
+        "PIPESTATUS is reset by `|| true`; use `|| EXIT_CODE=$?` instead"
+    )
+    assert "2>&1) || true" not in code, "`|| true` discards the real exit status"
+    assert "|| EXIT_CODE=$?" in code
