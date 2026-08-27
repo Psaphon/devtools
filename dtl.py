@@ -2048,6 +2048,7 @@ def _write_failure_snapshot(
             cwd=project_dir,
             capture_output=True,
             text=True,
+            check=False,
         )
         git_status = git_status_result.stdout
 
@@ -2057,6 +2058,7 @@ def _write_failure_snapshot(
             cwd=project_dir,
             capture_output=True,
             text=True,
+            check=False,
         )
         diff_stat = diff_stat_result.stdout
 
@@ -2066,6 +2068,7 @@ def _write_failure_snapshot(
             cwd=project_dir,
             capture_output=True,
             text=True,
+            check=False,
         )
         diff_lines = diff_result.stdout.splitlines(keepends=True)
         diff_truncated = len(diff_lines) > 5000
@@ -2077,6 +2080,7 @@ def _write_failure_snapshot(
             cwd=project_dir,
             capture_output=True,
             text=True,
+            check=False,
         )
         untracked = untracked_result.stdout.strip()
 
@@ -2325,6 +2329,7 @@ def ai_run(
                     ],
                     capture_output=True,
                     timeout=30,
+                    check=False,
                 )
 
             # Send notification
@@ -2400,6 +2405,7 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
             text=True,
             timeout=15,
             env={**os.environ},
+            check=False,
         )
     except Exception as e:
         print(f"[dtl ai] Notification failed: {e}", file=sys.stderr)
@@ -2408,7 +2414,7 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
 def _run_cmd(cmd: list[str]) -> int:
     """Run a command, printing output in real time. Returns exit code."""
     try:
-        result = subprocess.run(cmd, env={**os.environ})
+        result = subprocess.run(cmd, env={**os.environ}, check=False)
         return result.returncode
     except FileNotFoundError:
         print(f"Error: command not found: {cmd[0]}", file=sys.stderr)
@@ -2631,28 +2637,29 @@ def cmd_new(args: argparse.Namespace) -> None:
     # Validate services
     services: list[str] = []
     if args.services:
-        for s in args.services.split(","):
-            s = s.strip()
-            if s not in SERVICES:
+        for raw in args.services.split(","):
+            service = raw.strip()
+            if service not in SERVICES:
                 print(
-                    f"Error: unknown service '{s}'. Available: {', '.join(sorted(SERVICES))}",
+                    f"Error: unknown service '{service}'. Available: {', '.join(sorted(SERVICES))}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            services.append(s)
+            services.append(service)
 
     # Validate AI providers
     ai_providers: list[str] = []
     if args.ai:
-        for a in args.ai.split(","):
-            a = a.strip()
-            if a not in AI_PROVIDERS:
+        for raw in args.ai.split(","):
+            provider = raw.strip()
+            if provider not in AI_PROVIDERS:
                 print(
-                    f"Error: unknown AI provider '{a}'. Available: {', '.join(AI_PROVIDERS)}",
+                    f"Error: unknown AI provider '{provider}'. "
+                    f"Available: {', '.join(AI_PROVIDERS)}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            ai_providers.append(a)
+            ai_providers.append(provider)
 
     # Validate AI mode
     ai_mode = getattr(args, "mode", "docker") or "docker"
@@ -3196,6 +3203,7 @@ def _git_is_dirty(project_dir: Path) -> bool:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return bool(result.stdout.strip())
 
@@ -3206,6 +3214,7 @@ def _git_current_branch(project_dir: Path) -> str:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.stdout.strip()
 
@@ -3340,6 +3349,7 @@ def _maybe_notify_stalled(
             [sys.executable, str(notify_script), "1", message],
             capture_output=True,
             timeout=30,
+            check=False,
         )
         log.info(
             "[%s] Stall notification sent after %d consecutive skips (%s).",
@@ -3469,6 +3479,7 @@ def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         project_str = str(project_dir)
         for line in result.stdout.splitlines():
@@ -3490,6 +3501,7 @@ def _watchdog_check_dirty_age(project_dir: Path) -> str | None:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
     if not lines:
@@ -3537,6 +3549,7 @@ def _watchdog_check_pr_activity(project_dir: Path) -> str | None:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
         if result.returncode != 0:
             return None  # gh unavailable or not a GitHub repo — skip
@@ -3626,6 +3639,7 @@ def _watchdog_notify_project(
             [sys.executable, str(notify_script), "1", message],
             capture_output=True,
             timeout=30,
+            check=False,
         )
         log.info(
             "[%s] Watchdog notification sent (%d anomaly/anomalies).",
@@ -3708,7 +3722,9 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
             "--quiet",
             "--break-system-packages",
         ]
-        pip_result = subprocess.run(pip_cmd, cwd=project_dir, capture_output=True, text=True)
+        pip_result = subprocess.run(
+            pip_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+        )
         if pip_result.returncode != 0:
             pip_cmd = [
                 sys.executable,
@@ -3720,19 +3736,25 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
                 "--quiet",
                 "--break-system-packages",
             ]
-            pip_result = subprocess.run(pip_cmd, cwd=project_dir, capture_output=True, text=True)
+            pip_result = subprocess.run(
+                pip_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+            )
         output_parts.append(f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}")
         if pip_result.returncode != 0:
             return False, "\n".join(output_parts)
 
     if lint_cmd:
-        result = subprocess.run(lint_cmd, cwd=project_dir, capture_output=True, text=True)
+        result = subprocess.run(
+            lint_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+        )
         output_parts.append(f"=== lint ({' '.join(lint_cmd)}) ===\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return False, "\n".join(output_parts)
 
     if test_cmd:
-        result = subprocess.run(test_cmd, cwd=project_dir, capture_output=True, text=True)
+        result = subprocess.run(
+            test_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+        )
         output_parts.append(f"=== test ({' '.join(test_cmd)}) ===\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return False, "\n".join(output_parts)
@@ -3747,6 +3769,7 @@ def _git_push_branch(project_dir: Path, branch: str) -> bool:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode == 0
 
@@ -3760,6 +3783,7 @@ def _gh_create_pr(
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode == 0:
         return result.stdout.strip()
@@ -3770,6 +3794,7 @@ def _gh_create_pr(
             cwd=project_dir,
             capture_output=True,
             text=True,
+            check=False,
         )
         if view.returncode == 0:
             return view.stdout.strip()
@@ -3783,6 +3808,7 @@ def _gh_enable_auto_merge(project_dir: Path, branch: str) -> bool:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode == 0
 
@@ -3794,6 +3820,7 @@ def _gh_pr_state(project_dir: Path, branch: str) -> str | None:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode == 0:
         return result.stdout.strip()
@@ -4101,16 +4128,19 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
         ["git", "add", str(plan_path)],
         cwd=project_dir,
         capture_output=True,
+        check=False,
     )
     subprocess.run(
         ["git", "commit", "-m", f"chore: update {feature['name']} status to PR Open"],
         cwd=project_dir,
         capture_output=True,
+        check=False,
     )
     subprocess.run(
         ["git", "push"],
         cwd=project_dir,
         capture_output=True,
+        check=False,
     )
 
     if not watch:
@@ -4124,17 +4154,21 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
         if state == "MERGED":
             log.info("PR merged! Updating status.")
             # Checkout develop and pull to get merge
-            subprocess.run(["git", "checkout", "develop"], cwd=project_dir, capture_output=True)
+            subprocess.run(
+                ["git", "checkout", "develop"], cwd=project_dir, capture_output=True, check=False
+            )
             subprocess.run(
                 ["git", "pull", "origin", "develop"],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
             _update_feature_status(plan_path, feature["name"], "Merged")
             subprocess.run(
                 ["git", "add", str(plan_path)],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
             subprocess.run(
                 [
@@ -4145,8 +4179,9 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
                 ],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
-            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True)
+            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True, check=False)
             break
         elif state == "CLOSED":
             log.info("PR was closed without merging. Stopping.")
@@ -4219,6 +4254,7 @@ def _preflight_auto_merge(project_dir: Path) -> bool | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         if result.returncode != 0:
             return None
@@ -4244,6 +4280,7 @@ def _preflight_auto_merge(project_dir: Path) -> bool | None:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
         if result.returncode != 0:
             return None  # gh unavailable or API error
@@ -4379,11 +4416,13 @@ def _handle_interruption(
         ["git", "checkout", "--", str(rel_plan)],
         cwd=project_dir,
         capture_output=True,
+        check=False,
     )
     subprocess.run(
         ["git", "checkout", "develop"],
         cwd=project_dir,
         capture_output=True,
+        check=False,
     )
 
 
@@ -4501,7 +4540,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
         ]
         if log_arg is not None:
             child_argv += ["--log", log_arg]
-        result = subprocess.run(child_argv)
+        result = subprocess.run(child_argv, check=False)
         sys.exit(result.returncode)
 
     log.info("=== dtl workflow run starting ===")
@@ -4565,11 +4604,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 ["git", "checkout", "develop"],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
             subprocess.run(
                 ["git", "pull", "origin", "develop"],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
 
             # Create branch
@@ -4647,6 +4688,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     capture_output=True,
                     text=True,
                     env={**os.environ},
+                    check=False,
                 )
                 ai_exit_code = result.returncode
                 ai_output = result.stdout + result.stderr
@@ -4663,6 +4705,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         text=True,
                         timeout=max_wall_clock or None,
                         env={**os.environ},
+                        check=False,
                     )
                     ai_exit_code = result.returncode
                     ai_output = result.stdout + result.stderr
@@ -4798,6 +4841,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ["git", "checkout", "develop"],
                     cwd=project_dir,
                     capture_output=True,
+                    check=False,
                 )
                 continue
 
@@ -4827,7 +4871,9 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
 
             # Commit any remaining changes
             if _git_is_dirty(project_dir):
-                subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
+                subprocess.run(
+                    ["git", "add", "-A"], cwd=project_dir, capture_output=True, check=False
+                )
                 subprocess.run(
                     [
                         "git",
@@ -4837,6 +4883,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ],
                     cwd=project_dir,
                     capture_output=True,
+                    check=False,
                 )
 
             # Push
@@ -4875,6 +4922,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 ["git", "add", str(plan_path)],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
             subprocess.run(
                 [
@@ -4885,8 +4933,9 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 ],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
-            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True)
+            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True, check=False)
 
             # Poll for merge
             log.info("[%s] Waiting for PR merge...", project_dir.name)
@@ -4899,17 +4948,20 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         ["git", "checkout", "develop"],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
                     subprocess.run(
                         ["git", "pull", "origin", "develop"],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
                     _update_feature_status(plan_path, next_feature["name"], "Merged")
                     subprocess.run(
                         ["git", "add", str(plan_path)],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
                     subprocess.run(
                         [
@@ -4920,11 +4972,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         ],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
                     subprocess.run(
                         ["git", "push"],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
                     # Reset per-feature state on success
                     _fstate = _read_feature_state(project_dir, next_feature["name"])
@@ -5092,6 +5146,7 @@ def cmd_watchdog_status(args: argparse.Namespace) -> None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         if result.returncode == 0:
             for line in result.stdout.splitlines():
