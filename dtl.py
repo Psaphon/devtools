@@ -49,6 +49,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -2124,7 +2125,7 @@ def _write_failure_snapshot(
         snapshot_path.write_text("".join(lines))
         log.info("failure snapshot written: %s", snapshot_path)
         return snapshot_path
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — best-effort diagnostic snapshot; already logged, must not mask the real error
         log.info("Failed to write failure snapshot: %s", exc)
         return None
 
@@ -2407,7 +2408,7 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
             env={**os.environ},
             check=False,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — notification is best-effort; already printed, never fail the run over it
         print(f"[dtl ai] Notification failed: {e}", file=sys.stderr)
 
 
@@ -3357,7 +3358,7 @@ def _maybe_notify_stalled(
             consecutive_skips,
             skip_reason,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — notify.py is user-supplied; already logged, must not break the workflow
         log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
 
 
@@ -3485,7 +3486,7 @@ def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
         for line in result.stdout.splitlines():
             if "workflow" in line and "run" in line and project_str in line:
                 return None  # process found — no anomaly
-    except Exception:
+    except Exception:  # noqa: S110,BLE001 — pgrep unavailable means 'cannot tell'; caller treats that as no-anomaly
         pass
 
     return (
@@ -3554,7 +3555,14 @@ def _watchdog_check_pr_activity(project_dir: Path) -> str | None:
         if result.returncode != 0:
             return None  # gh unavailable or not a GitHub repo — skip
         prs: list[dict] = json.loads(result.stdout or "[]")
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — a watchdog must not crash the run
+        # Returning None reads downstream as "no anomaly", so a failure here
+        # silently DISABLES this check. Record it rather than failing open mute.
+        logging.getLogger("dtl.watchdog").warning(
+            "[%s] PR-activity check could not run (%s) — check skipped this cycle.",
+            project_dir.name,
+            exc,
+        )
         return None
 
     if not prs:
@@ -3646,7 +3654,7 @@ def _watchdog_notify_project(
             project_dir.name,
             len(anomalies),
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — notify.py is user-supplied; already logged, must not break the watchdog
         log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
 
 
@@ -3960,7 +3968,14 @@ def _load_notify_config() -> dict | None:
 
         with config_path.open("rb") as fh:
             return tomllib.load(fh)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — never let config parsing crash a run
+        # A malformed config file used to return None silently, which turns
+        # ALL notifications off with no signal at all. Say so.
+        logging.getLogger("dtl.notify").warning(
+            "Notify config at %s could not be read (%s) — notifications are DISABLED.",
+            config_path,
+            exc,
+        )
         return None
 
 
@@ -3989,6 +4004,19 @@ def _emit_notify_event(
     if not url:
         return
 
+    # Only ever POST over http(s). urlopen honours whatever scheme it is given,
+    # so a `file:` or custom scheme in the config would turn this notifier into
+    # a local-file reader — and an Authorization header read from disk is
+    # attached below. Reject anything else loudly rather than silently doing
+    # something other than a network call.
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        log.error(
+            "Notify: refusing to send to unsupported URL scheme %r (only http/https are allowed).",
+            scheme or "<none>",
+        )
+        return
+
     # Stable event_id for deduplication — survives retries and hub restarts
     id_src = f"{event_type}:{json.dumps(payload, sort_keys=True)}"
     event_id = hashlib.sha256(id_src.encode()).hexdigest()[:16]
@@ -4008,16 +4036,24 @@ def _emit_notify_event(
             auth_value = Path(auth_file).read_text().strip()
             if auth_value:
                 headers["Authorization"] = auth_value
-        except Exception:
-            pass  # auth file missing or unreadable — proceed without auth
+        except Exception as exc:  # noqa: BLE001 — notification must not crash a run
+            # Proceeding without auth is deliberate, but it means the request
+            # goes out UNAUTHENTICATED to an endpoint that was configured to
+            # expect a credential. That is worth saying out loud.
+            log.warning(
+                "Notify: auth header file %s unreadable (%s) — "
+                "sending request WITHOUT authentication.",
+                auth_file,
+                exc,
+            )
 
     retry_seconds: list = config.get("retry_seconds", [1, 5, 30])
     data = json.dumps(body).encode()
 
     for attempt, delay in enumerate(retry_seconds):
         try:
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")  # noqa: S310 — scheme is validated to http/https above before this call
+            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 — scheme is validated to http/https above before this call
                 if resp.status < 300:
                     log.info("Notify: %s delivered (event_id=%s).", event_type, event_id)
                     return
@@ -4027,7 +4063,7 @@ def _emit_notify_event(
                     resp.status,
                     attempt + 1,
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — retry loop; already logged per attempt, exhausts retries rather than crashing
             log.info("Notify: attempt %d failed for %s: %s", attempt + 1, event_type, exc)
         if attempt < len(retry_seconds) - 1 and delay > 0:
             time.sleep(delay)
@@ -4259,7 +4295,7 @@ def _preflight_auto_merge(project_dir: Path) -> bool | None:
         if result.returncode != 0:
             return None
         remote_url = result.stdout.strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 — git remote lookup is best-effort; None means 'unknown remote'
         return None
 
     # Parse owner/name from GitHub remote URLs
@@ -4290,7 +4326,7 @@ def _preflight_auto_merge(project_dir: Path) -> bool | None:
         if value == "false":
             return False
         return None  # unexpected output
-    except Exception:
+    except Exception:  # noqa: BLE001 — gh auto-merge probe is best-effort; None means 'cannot determine'
         return None
 
 
@@ -4378,7 +4414,7 @@ def _handle_interruption(
             ai_output,
             log,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — state snapshot is best-effort; already logged, must not lose the run
         log.info("Snapshot write failed: %s", exc)
 
     # Write per-feature state: interruptions increment attempts_interrupted only,
@@ -4391,7 +4427,7 @@ def _handle_interruption(
         if outcome == RunOutcome.INTERRUPTED_WALL_CLOCK:
             _fstate["partial_work_branch"] = branch
         _write_feature_state(project_dir, feature["name"], _fstate)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — interrupt-path state write; already logged, must not mask the interrupt
         log.info("Failed to write feature state on interruption: %s", exc)
 
     _emit_notify_event(
@@ -4787,7 +4823,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         ai_output,
                         log,
                     )
-                except Exception as _snap_exc:
+                except Exception as _snap_exc:  # noqa: BLE001 — nested snapshot write inside an error path; already logged
                     log.info("Unexpected error writing failure snapshot: %s", _snap_exc)
                 _emit_notify_event(
                     notify_cfg,
@@ -5153,7 +5189,7 @@ def cmd_watchdog_status(args: argparse.Namespace) -> None:
                 if "dtl-watchdog" in line:
                     print(f"\nNext scheduled run (systemd):\n  {line.strip()}")
                     break
-    except Exception:
+    except Exception:  # noqa: S110,BLE001 — systemctl output is cosmetic status display only
         pass
 
 

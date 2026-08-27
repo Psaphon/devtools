@@ -32,6 +32,9 @@ select = [
     "ANN", # flake8-annotations
     "RUF", # ruff-specific
     "PLW", # pylint warnings
+    "BLE", # flake8-blind-except
+    "S110",# try-except-pass (bandit) — silent failure
+    "S310",# URL open scheme audit (bandit)
 ]
 
 # E501 (line length) is enforced by `ruff format` for real code and is left off
