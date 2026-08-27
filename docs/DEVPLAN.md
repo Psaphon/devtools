@@ -442,7 +442,7 @@ A locally-scheduled watchdog that periodically checks all `dtl`-managed projects
 - [x] Check detects: (a) `dtl workflow run` process absent when DEVPLAN has Not Started features; (b) dirty tree older than 24h; (c) no PR activity in 48h when Not Started features exist; (d) log growth > 100MB/day in `~/.local/state/dtl/`
 - [x] On any anomaly, invokes every project's `.ai/notify.py` with a structured message
 - [x] `dtl watchdog status` prints last run result and next scheduled run
-- [ ] [HUMAN] Install the timer via `systemctl --user enable --now dtl-watchdog.timer`
+- [x] [HUMAN] Install the timer via `systemctl --user enable --now dtl-watchdog.timer`
 - [x] Test: fixture projects exercising each anomaly type trigger exactly one notify call
 - [x] Lint clean, tests pass
 
