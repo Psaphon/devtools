@@ -296,6 +296,64 @@ class TestWatchdogCheckPrActivity:
             result = dtl._watchdog_check_pr_activity(project)
         assert result is None
 
+    def test_recent_pr_activity_with_github_z_suffix_timestamp(self, tmp_path):
+        """GitHub returns '...Z', not '...+00:00' — parse the real wire format.
+
+        The other tests in this class build timestamps with
+        `datetime.now(tz).isoformat()`, which yields a '+00:00' offset. The
+        `gh pr list --json updatedAt` API actually returns a 'Z' suffix, so
+        those tests never exercised the format this code really receives.
+
+        The parse is wrapped in `except (ValueError, AttributeError): pass`, so
+        a failure is SILENT and FAILS OPEN: every PR is skipped, `most_recent`
+        stays None, the staleness branch is never reached, and the function
+        returns None. The watchdog would stop reporting stale PRs entirely —
+        a false negative, which is the worse direction for a watchdog to fail.
+
+        This case alone cannot detect that (it also expects None), which is why
+        it is paired with the stale-timestamp test below; that one does.
+        """
+        recent = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            hours=1
+        )
+        # Explicitly the GitHub wire format: trailing Z, no offset.
+        z_stamp = recent.strftime("%Y-%m-%dT%H:%M:%SZ")
+        assert z_stamp.endswith("Z")
+
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"])
+        prs = [{"number": 1, "updatedAt": z_stamp}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=json.dumps(prs), returncode=0)
+            result = dtl._watchdog_check_pr_activity(project)
+        assert result is None, (
+            "a Z-suffixed timestamp one hour old must count as recent activity; "
+            "if this fails the timestamp did not parse and every PR was skipped"
+        )
+
+    def test_stale_pr_with_github_z_suffix_timestamp(self, tmp_path):
+        """A stale Z-suffixed timestamp must still raise the anomaly.
+
+        This is the case with teeth. If the Z format stops parsing, every PR is
+        skipped, `most_recent` stays None, and the function returns None — so
+        this assertion fails where the recent-timestamp case would not.
+        Verified by mutation: breaking the parse fails this test and only this
+        test.
+        """
+        stale = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            hours=60
+        )
+        z_stamp = stale.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"])
+        prs = [{"number": 1, "updatedAt": z_stamp}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=json.dumps(prs), returncode=0)
+            result = dtl._watchdog_check_pr_activity(project)
+        assert result is not None
+        assert "PR activity" in result
+
     def test_stale_pr_with_not_started_returns_anomaly(self, tmp_path):
         project = make_project(tmp_path)
         write_devplan(project, ["Not Started"])

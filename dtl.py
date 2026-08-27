@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -895,7 +896,7 @@ def make_ai_cloud_init() -> str:
             shell: /bin/bash
             sudo: ALL=(ALL) NOPASSWD:ALL
             ssh_authorized_keys:
-              - {pub_key if pub_key else "# NO KEY FOUND -- run: ssh-keygen -t ed25519 -f ~/.ssh/ai-sandbox-key -N ''"}
+              - {pub_key or "# NO KEY FOUND -- run: ssh-keygen -t ed25519 -f ~/.ssh/ai-sandbox-key -N ''"}
 
         package_update: true
         packages:
@@ -1906,7 +1907,7 @@ def _load_ai_config(project_dir: Path) -> dict:
             file=sys.stderr,
         )
         sys.exit(1)
-    with open(config_path) as f:
+    with config_path.open() as f:
         return json.load(f)
 
 
@@ -1926,7 +1927,7 @@ def _resolve_provider_chain(project_dir: Path) -> list[str]:
     config_path = project_dir / ".ai" / "config.json"
     if not config_path.exists():
         return ["claude"]
-    with open(config_path) as f:
+    with config_path.open() as f:
         config = json.load(f)
     chain = config.get("provider_chain")
     if chain and isinstance(chain, list) and chain:
@@ -2198,10 +2199,8 @@ def _run_ai_with_limits(
             if proc.poll() is not None:
                 break
 
-    try:
+    with contextlib.suppress(OSError):
         proc.stdout.close()
-    except OSError:
-        pass
     proc.wait()
 
     if kill_reason is not None:
@@ -2363,7 +2362,7 @@ def ai_run(
             try:
                 subprocess.run(
                     ["bash", str(run_script), prompt],
-                    timeout=max_wall_clock if max_wall_clock else None,
+                    timeout=max_wall_clock or None,
                     check=False,
                 )
             except subprocess.TimeoutExpired:
@@ -2383,7 +2382,7 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
     if not config_path.exists():
         return
 
-    with open(config_path) as f:
+    with config_path.open() as f:
         config = json.load(f)
 
     notify = config.get("notify", {})
@@ -2919,7 +2918,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
                 "Error: no CI workflow found at .github/workflows/*.yml",
                 file=sys.stderr,
             )
-            print("", file=sys.stderr)
+            print(file=sys.stderr)
             print(
                 "CI is required because 'gh pr merge --auto --squash' needs a passing",
                 file=sys.stderr,
@@ -2929,7 +2928,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             print("for merge.", file=sys.stderr)
-            print("", file=sys.stderr)
+            print(file=sys.stderr)
             print("Options:", file=sys.stderr)
             print(
                 "  --scaffold-ci   write a standard .github/workflows/ci.yml and continue",
@@ -3286,7 +3285,7 @@ def _read_workflow_state(project_dir: Path) -> dict:
     state_path = _workflow_state_path(project_dir)
     if state_path.exists():
         try:
-            with open(state_path) as f:
+            with state_path.open() as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -3315,10 +3314,8 @@ def _write_workflow_state(
             json.dump(state, f, indent=2)
         Path(tmp).rename(state_path)
     except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink()
         raise
 
 
@@ -3385,7 +3382,7 @@ def _read_feature_state(project_dir: Path, feature_name: str) -> dict:
     p = _feature_state_path(project_dir, feature_name)
     if p.exists():
         try:
-            with open(p) as f:
+            with p.open() as f:
                 data = json.load(f)
             # Merge with defaults so new keys are always present
             return {**_FEATURE_STATE_DEFAULT, **data}
@@ -3402,15 +3399,13 @@ def _write_feature_state(project_dir: Path, feature_name: str, state: dict) -> N
     p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
     try:
-        os.chmod(tmp_path, 0o600)
+        Path(tmp_path).chmod(0o600)
         with os.fdopen(fd, "w") as f:
             json.dump(state, f, indent=2)
-        os.replace(tmp_path, p)
+        Path(tmp_path).replace(p)
     except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(tmp_path).unlink()
         raise
 
 
@@ -3424,7 +3419,7 @@ def _watchdog_read_state() -> dict:
     p = _watchdog_state_path()
     if p.exists():
         try:
-            with open(p) as f:
+            with p.open() as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -3441,10 +3436,8 @@ def _watchdog_write_state(state: dict) -> None:
             json.dump(state, f, indent=2)
         Path(tmp).rename(p)
     except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink()
         raise
 
 
@@ -3564,7 +3557,7 @@ def _watchdog_check_pr_activity(project_dir: Path) -> str | None:
     for pr in prs:
         updated_str = pr.get("updatedAt", "")
         try:
-            updated = datetime.datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+            updated = datetime.datetime.fromisoformat(updated_str)
             if most_recent is None or updated > most_recent:
                 most_recent = updated
         except (ValueError, AttributeError):
@@ -3589,10 +3582,8 @@ def _watchdog_check_log_growth(prev_state: dict) -> tuple[str | None, int]:
     if state_dir.exists():
         for entry in state_dir.iterdir():
             if entry.is_file() and entry.suffix in (".log", ".txt", ".json"):
-                try:
+                with contextlib.suppress(OSError):
                     total_bytes += entry.stat().st_size
-                except OSError:
-                    pass
 
     anomaly: str | None = None
     prev_bytes: int = prev_state.get("log_size_bytes", 0)
@@ -3940,7 +3931,7 @@ def _load_notify_config() -> dict | None:
     try:
         import tomllib  # Python 3.11+ stdlib
 
-        with open(config_path, "rb") as fh:
+        with config_path.open("rb") as fh:
             return tomllib.load(fh)
     except Exception:
         return None
@@ -4670,7 +4661,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         cwd=project_dir,
                         capture_output=True,
                         text=True,
-                        timeout=max_wall_clock if max_wall_clock else None,
+                        timeout=max_wall_clock or None,
                         env={**os.environ},
                     )
                     ai_exit_code = result.returncode
@@ -5153,7 +5144,7 @@ def cmd_workflow_status(args: argparse.Namespace) -> None:
     # Workflow skip state (lifecycle)
     state_path = _workflow_state_path(project_dir)
     if state_path.exists():
-        with open(state_path) as f:
+        with state_path.open() as f:
             wf_state = json.load(f)
         print(f"Project:           {project_dir.name}")
         print(f"Last skip reason:  {wf_state.get('last_skip_reason', 'none')}")
@@ -5889,34 +5880,29 @@ def main() -> None:
         sys.exit(1)
 
     # Handle 'ai' subcommand group
-    if args.command == "ai":
-        if not getattr(args, "ai_command", None):
-            ai_parser.print_help()
-            sys.exit(1)
+    if args.command == "ai" and not getattr(args, "ai_command", None):
+        ai_parser.print_help()
+        sys.exit(1)
 
     # Handle 'workflow' subcommand group
-    if args.command == "workflow":
-        if not getattr(args, "workflow_command", None):
-            workflow_parser.print_help()
-            sys.exit(1)
+    if args.command == "workflow" and not getattr(args, "workflow_command", None):
+        workflow_parser.print_help()
+        sys.exit(1)
 
     # Handle 'watchdog' subcommand group
-    if args.command == "watchdog":
-        if not getattr(args, "watchdog_command", None):
-            watchdog_parser.print_help()
-            sys.exit(1)
+    if args.command == "watchdog" and not getattr(args, "watchdog_command", None):
+        watchdog_parser.print_help()
+        sys.exit(1)
 
     # Handle 'notify' subcommand group
-    if args.command == "notify":
-        if not getattr(args, "notify_command", None):
-            notify_parser.print_help()
-            sys.exit(1)
+    if args.command == "notify" and not getattr(args, "notify_command", None):
+        notify_parser.print_help()
+        sys.exit(1)
 
     # Handle 'pm' subcommand group
-    if args.command == "pm":
-        if not getattr(args, "pm_command", None):
-            pm_parser.print_help()
-            sys.exit(1)
+    if args.command == "pm" and not getattr(args, "pm_command", None):
+        pm_parser.print_help()
+        sys.exit(1)
 
     args.func(args)
 
