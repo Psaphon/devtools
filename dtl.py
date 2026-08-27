@@ -45,18 +45,17 @@ import re
 import select
 import subprocess
 import sys
-import textwrap
 import tempfile
+import textwrap
 import time
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Stack definitions
 # ---------------------------------------------------------------------------
 
-STACKS: Dict[str, dict] = {
+STACKS: dict[str, dict] = {
     "python": {
         "display": "Python 3.12",
         "image": "python:3.12-slim",
@@ -231,7 +230,7 @@ STACKS: Dict[str, dict] = {
     },
 }
 
-SERVICES: Dict[str, dict] = {
+SERVICES: dict[str, dict] = {
     "postgres": {
         "image": "postgres:16-alpine",
         "environment": {
@@ -254,7 +253,7 @@ SERVICES: Dict[str, dict] = {
 # AI provider, mode, and model definitions
 # ---------------------------------------------------------------------------
 
-AI_PROVIDERS_CONFIG: Dict[str, dict] = {
+AI_PROVIDERS_CONFIG: dict[str, dict] = {
     "claude": {
         "display": "Claude Code",
         "description": "Anthropic Claude Code CLI in a container",
@@ -313,7 +312,7 @@ WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers
 # CLAUDE.md template categories
 # ---------------------------------------------------------------------------
 
-CLAUDE_MD_TEMPLATES: Dict[str, str] = {
+CLAUDE_MD_TEMPLATES: dict[str, str] = {
     "general": "",  # uses make_claude_md default
     "terraform": textwrap.dedent("""\
 
@@ -508,7 +507,7 @@ def make_dockerfile(stack: dict) -> str:
 def make_devcontainer_json(
     name: str,
     stack: dict,
-    services: List[str],
+    services: list[str],
 ) -> str:
     """Generate devcontainer.json (returned as formatted JSON string)."""
     config: dict = {
@@ -537,14 +536,14 @@ def make_devcontainer_json(
 
 
 def make_docker_compose(
-    services_requested: List[str],
+    services_requested: list[str],
 ) -> str:
     """Generate docker-compose.yml for optional services."""
     lines = [
         "services:",
     ]
 
-    volumes_needed: List[str] = []
+    volumes_needed: list[str] = []
 
     for svc_name in services_requested:
         svc = SERVICES[svc_name]
@@ -706,9 +705,7 @@ def make_ci_workflow(name: str, stack: dict) -> str:
     """Generate .github/workflows/ci.yml."""
     ci_setup = textwrap.indent(stack["ci_setup"].rstrip(), "      ")
     security_audit_step = stack.get("security_audit_step", "").rstrip()
-    audit_block = (
-        textwrap.indent(security_audit_step, "      ") if security_audit_step else ""
-    )
+    audit_block = textwrap.indent(security_audit_step, "      ") if security_audit_step else ""
     return f"""\
 name: CI
 
@@ -860,7 +857,7 @@ def make_cd_workflow(name: str) -> str:
     """)
 
 
-def make_env_example(services: List[str]) -> str:
+def make_env_example(services: list[str]) -> str:
     """Generate .env.example with placeholder values."""
     lines = ["# Copy to .env and fill in real values", ""]
     if "postgres" in services:
@@ -955,7 +952,7 @@ def make_ai_cloud_init() -> str:
     """)
 
 
-def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
+def make_ai_vm_config(name: str, ai_providers: list[str]) -> str:
     """Generate QEMU launch script for the AI sandbox VM."""
     # Build restricted SLIRP network: SSH + Anthropic API proxy + optional Ollama
     # restrict=on blocks all outbound traffic; guestfwd creates explicit allowlist
@@ -1158,8 +1155,8 @@ def make_ai_makefile(name: str) -> str:
 
 
 def make_ai_vm_compose(
-    ai_providers: List[str],
-    mcp_servers: List[str] | None = None,
+    ai_providers: list[str],
+    mcp_servers: list[str] | None = None,
 ) -> str:
     """Generate docker-compose.yml for containers inside the AI sandbox VM."""
     lines = ["services:"]
@@ -1202,7 +1199,7 @@ def make_ai_vm_compose(
     return "\n".join(lines) + "\n"
 
 
-def _mcp_compose_entry(server_name: str) -> List[str]:
+def _mcp_compose_entry(server_name: str) -> list[str]:
     """Return docker-compose lines for a single isolated MCP server."""
     return [
         f"  mcp-{server_name}:",
@@ -1262,8 +1259,8 @@ def make_ai_claude_dockerfile() -> str:
 
 
 def make_ai_claude_settings(
-    ai_providers: List[str],
-    mcp_servers: List[str] | None = None,
+    ai_providers: list[str],
+    mcp_servers: list[str] | None = None,
 ) -> str:
     """Generate Claude Code settings for the sandbox."""
     mcp_config: dict = {}
@@ -1308,7 +1305,7 @@ def make_ai_claude_settings(
 def make_ai_docker_compose(
     provider: str,
     model: str | None = None,
-    mcp_servers: List[str] | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> str:
     """Generate docker-compose.yml for Docker-mode AI setup."""
     lines = ["services:"]
@@ -1410,7 +1407,7 @@ def make_ai_docker_compose(
             lines.extend(_mcp_compose_entry(srv))
 
     # Volumes
-    vol_lines: List[str] = []
+    vol_lines: list[str] = []
     compose_text = "\n".join(lines)
     if "claude-data:" in compose_text:
         vol_lines.append("  claude-data:")
@@ -1659,7 +1656,7 @@ def make_run_script(provider: str) -> str:
 # Well-known MCP server packages (npm).  Keys are short names used with
 # ``add-mcp --name <key>``.  Unknown names are treated as raw npm package
 # identifiers so users can bring any server they want.
-MCP_KNOWN_PACKAGES: Dict[str, str] = {
+MCP_KNOWN_PACKAGES: dict[str, str] = {
     "filesystem": "@modelcontextprotocol/server-filesystem",
     "github": "@modelcontextprotocol/server-github",
     "memory": "@modelcontextprotocol/server-memory",
@@ -1716,9 +1713,9 @@ def make_mcp_server_config(server_name: str, project_path: str) -> str:
 def scaffold_project(
     name: str,
     stack_name: str,
-    services: List[str],
+    services: list[str],
     base_dir: Path,
-    ai_providers: List[str] | None = None,
+    ai_providers: list[str] | None = None,
     ai_mode: str = "docker",
     ai_model: str | None = None,
     claude_md_template: str = "general",
@@ -1745,13 +1742,11 @@ def scaffold_project(
         d.mkdir(parents=True, exist_ok=True)
 
     # -- files --
-    files: Dict[Path, str] = {
+    files: dict[Path, str] = {
         project_dir / ".shellcheckrc": make_shellcheckrc(),
         project_dir / ".gitignore": make_gitignore(stack),
         project_dir / "README.md": make_readme(name, stack_name),
-        project_dir / "CLAUDE.md": make_claude_md(
-            name, stack_name, stack, claude_md_template
-        ),
+        project_dir / "CLAUDE.md": make_claude_md(name, stack_name, stack, claude_md_template),
         project_dir / ".pre-commit-config.yaml": make_precommit_config(),
         project_dir / ".github" / "workflows" / "ci.yml": make_ci_workflow(name, stack),
         project_dir / ".github" / "workflows" / "release.yml": make_cd_workflow(name),
@@ -1822,10 +1817,8 @@ def _ai_attach_docker(
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
-    files: Dict[Path, str] = {
-        ai_dir / "config.json": make_ai_config(
-            name, provider, "docker", model, key_source
-        ),
+    files: dict[Path, str] = {
+        ai_dir / "config.json": make_ai_config(name, provider, "docker", model, key_source),
         ai_dir / "docker-compose.yml": make_ai_docker_compose(provider, model),
         ai_dir / "notify.py": make_notify_script(),
         ai_dir / "run.sh": make_run_script(provider),
@@ -1834,9 +1827,7 @@ def _ai_attach_docker(
 
     if provider == "claude":
         files[ai_dir / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
-        files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings(
-            [provider]
-        )
+        files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings([provider])
 
     for path, content in files.items():
         path.write_text(content)
@@ -1870,25 +1861,21 @@ def _ai_attach_vm(
 
     ai_providers_list = [provider]
 
-    files: Dict[Path, str] = {
+    files: dict[Path, str] = {
         ai_dir / "config.json": make_ai_config(name, provider, "vm", model, key_source),
         ai_dir / "Makefile": make_ai_makefile(name),
         ai_dir / "vm" / "cloud-init.yaml": make_ai_cloud_init(),
         ai_dir / "vm" / "vm-config.sh": make_ai_vm_config(name, ai_providers_list),
-        ai_dir / "containers" / "docker-compose.yml": make_ai_vm_compose(
-            ai_providers_list
-        ),
+        ai_dir / "containers" / "docker-compose.yml": make_ai_vm_compose(ai_providers_list),
         ai_dir / "containers" / "mcp-servers" / ".gitkeep": "",
         ai_dir / "notify.py": make_notify_script(),
         ai_dir / "run.sh": make_run_script(provider),
     }
 
     if provider == "claude":
-        files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = (
-            make_ai_claude_dockerfile()
-        )
-        files[ai_dir / "containers" / "claude-code" / "settings.json"] = (
-            make_ai_claude_settings(ai_providers_list)
+        files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
+        files[ai_dir / "containers" / "claude-code" / "settings.json"] = make_ai_claude_settings(
+            ai_providers_list
         )
 
     for path, content in files.items():
@@ -1969,7 +1956,8 @@ def ai_start(project_dir: Path) -> None:
         elif provider == "ollama":
             print("[dtl ai] Ollama running on port 11434")
             print(
-                f"[dtl ai] Pull a model: docker compose -f {compose_file} exec ollama ollama pull llama3"
+                f"[dtl ai] Pull a model: docker compose -f {compose_file} "
+                "exec ollama ollama pull llama3"
             )
 
     elif mode == "vm":
@@ -2034,8 +2022,8 @@ def _write_failure_snapshot(
     ai_exit_code: int,
     duration_secs: float,
     ai_output: str,
-    log: "logging.Logger",
-) -> Optional[Path]:
+    log: logging.Logger,
+) -> Path | None:
     """Write a triage bundle to ~/.local/state/dtl/ on AI non-zero exit.
 
     Returns the snapshot path on success, None on failure.  Never raises.
@@ -2044,11 +2032,9 @@ def _write_failure_snapshot(
         state_dir = _dtl_state_dir()
         state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        now_utc = datetime.datetime.now(datetime.UTC)
         iso_ts = now_utc.strftime("%Y%m%dT%H%M%SZ")
-        snapshot_path = (
-            state_dir / f"{project_dir.name}-{feature['name']}-failure-{iso_ts}.md"
-        )
+        snapshot_path = state_dir / f"{project_dir.name}-{feature['name']}-failure-{iso_ts}.md"
 
         # Last 200 combined lines (already interleaved in ai_output)
         all_lines = ai_output.splitlines(keepends=True)
@@ -2138,7 +2124,7 @@ def _write_failure_snapshot(
         return None
 
 
-def _latest_failure_snapshot(project_dir: Path) -> Optional[Path]:
+def _latest_failure_snapshot(project_dir: Path) -> Path | None:
     """Return the most recent failure snapshot path for a project, or None."""
     state_dir = _dtl_state_dir()
     prefix = f"{project_dir.name}-"
@@ -2245,11 +2231,7 @@ def ai_run(
         print(
             f"Error: provider '{provider}' does not support autonomous mode.\n"
             f"  Providers with autonomous support: "
-            + ", ".join(
-                p
-                for p, c in AI_PROVIDERS_CONFIG.items()
-                if c.get("supports_autonomous")
-            ),
+            + ", ".join(p for p, c in AI_PROVIDERS_CONFIG.items() if c.get("supports_autonomous")),
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2331,8 +2313,7 @@ def ai_run(
             if exit_code in (124, 125):
                 limit_hit = "wall_clock" if exit_code == 124 else "retry_cap"
                 print(
-                    f"\n[dtl ai run] Limit reached ({limit_hit}). "
-                    "Stopping container...",
+                    f"\n[dtl ai run] Limit reached ({limit_hit}). Stopping container...",
                     file=sys.stderr,
                 )
                 subprocess.run(
@@ -2373,9 +2354,7 @@ def ai_run(
                     "openclaw-gateway",
                 ]
             )
-            _send_notification(
-                ai_dir, 0, "OpenClaw gateway started. Send commands via Telegram."
-            )
+            _send_notification(ai_dir, 0, "OpenClaw gateway started. Send commands via Telegram.")
 
     elif mode == "vm":
         run_script = ai_dir / "run.sh"
@@ -2427,7 +2406,7 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
         print(f"[dtl ai] Notification failed: {e}", file=sys.stderr)
 
 
-def _run_cmd(cmd: List[str]) -> int:
+def _run_cmd(cmd: list[str]) -> int:
     """Run a command, printing output in real time. Returns exit code."""
     try:
         result = subprocess.run(cmd, env={**os.environ})
@@ -2612,12 +2591,8 @@ def validate_project(project_dir: Path) -> bool:
                 if not srv_dir.is_dir() or srv_dir.name.startswith("."):
                     continue
                 srv = srv_dir.name
-                check(
-                    f"mcp-{srv}: Dockerfile exists", (srv_dir / "Dockerfile").exists()
-                )
-                check(
-                    f"mcp-{srv}: config.json exists", (srv_dir / "config.json").exists()
-                )
+                check(f"mcp-{srv}: Dockerfile exists", (srv_dir / "Dockerfile").exists())
+                check(f"mcp-{srv}: config.json exists", (srv_dir / "config.json").exists())
 
     # Legacy ai-sandbox/ checks (backward compat)
     sandbox = project_dir / "ai-sandbox"
@@ -2649,35 +2624,32 @@ def cmd_new(args: argparse.Namespace) -> None:
     # Validate stack
     if stack_name not in STACKS:
         print(
-            f"Error: unknown stack '{stack_name}'. "
-            f"Available: {', '.join(sorted(STACKS))}",
+            f"Error: unknown stack '{stack_name}'. Available: {', '.join(sorted(STACKS))}",
             file=sys.stderr,
         )
         sys.exit(1)
 
     # Validate services
-    services: List[str] = []
+    services: list[str] = []
     if args.services:
         for s in args.services.split(","):
             s = s.strip()
             if s not in SERVICES:
                 print(
-                    f"Error: unknown service '{s}'. "
-                    f"Available: {', '.join(sorted(SERVICES))}",
+                    f"Error: unknown service '{s}'. Available: {', '.join(sorted(SERVICES))}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
             services.append(s)
 
     # Validate AI providers
-    ai_providers: List[str] = []
+    ai_providers: list[str] = []
     if args.ai:
         for a in args.ai.split(","):
             a = a.strip()
             if a not in AI_PROVIDERS:
                 print(
-                    f"Error: unknown AI provider '{a}'. "
-                    f"Available: {', '.join(AI_PROVIDERS)}",
+                    f"Error: unknown AI provider '{a}'. Available: {', '.join(AI_PROVIDERS)}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -2772,9 +2744,7 @@ def cmd_list_stacks(args: argparse.Namespace) -> None:
         print(f"  {key:12s}  {pconfig['display']}{auto}")
         if pconfig["models"]:
             models = ", ".join(sorted(pconfig["models"].keys()))
-            print(
-                f"  {' ':12s}  Models: {models} (default: {pconfig['default_model']})"
-            )
+            print(f"  {' ':12s}  Models: {models} (default: {pconfig['default_model']})")
 
     print("\nAI modes:\n")
     print("  docker      Lightweight — containers on host Docker")
@@ -2829,17 +2799,15 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
 
     # Write Dockerfile and config
     (srv_dir / "Dockerfile").write_text(make_mcp_server_dockerfile(server_name))
-    (srv_dir / "config.json").write_text(
-        make_mcp_server_config(server_name, project_path)
-    )
+    (srv_dir / "config.json").write_text(make_mcp_server_config(server_name, project_path))
 
     # Discover all MCP servers
-    existing_servers: List[str] = sorted(
+    existing_servers: list[str] = sorted(
         d.name for d in mcp_dir.iterdir() if d.is_dir() and not d.name.startswith(".")
     )
 
     # Detect active AI providers from existing compose
-    ai_providers: List[str] = []
+    ai_providers: list[str] = []
     if compose_path.exists():
         compose_text = compose_path.read_text()
         if "claude-code:" in compose_text:
@@ -2848,9 +2816,7 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
         ai_providers = ["claude"]
 
     # Regenerate docker-compose and settings with all MCP servers
-    compose_path.write_text(
-        make_ai_vm_compose(ai_providers, mcp_servers=existing_servers)
-    )
+    compose_path.write_text(make_ai_vm_compose(ai_providers, mcp_servers=existing_servers))
 
     settings_path = settings_dir / "settings.json"
     if settings_path.parent.is_dir():
@@ -2969,9 +2935,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
                 "  --scaffold-ci   write a standard .github/workflows/ci.yml and continue",
                 file=sys.stderr,
             )
-            print(
-                "  --no-ci         skip this check (not recommended)", file=sys.stderr
-            )
+            print("  --no-ci         skip this check (not recommended)", file=sys.stderr)
             sys.exit(1)
 
     print(f"Attaching {pconfig['display']} to {project_dir.name}")
@@ -2999,9 +2963,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
     if mode == "docker":
         print(f"  dtl ai start --project {project_dir}")
         if provider == "claude":
-            print(
-                f"  # Then: docker compose -f {ai_dir}/docker-compose.yml run --rm claude-code"
-            )
+            print(f"  # Then: docker compose -f {ai_dir}/docker-compose.yml run --rm claude-code")
         elif provider == "openclaw":
             print("  # Then connect via Telegram")
     elif mode == "vm":
@@ -3184,9 +3146,7 @@ def _parse_devplan(text: str) -> tuple[str, list[dict]]:
 
         # Extract **Branch:**
         branch_match = re.search(r"\*\*Branch:\*\*\s*`?([^`\n]+)`?", body)
-        branch = (
-            branch_match.group(1).strip() if branch_match else f"feature/{heading_name}"
-        )
+        branch = branch_match.group(1).strip() if branch_match else f"feature/{heading_name}"
 
         # Extract **Depends on:**
         depends_match = re.search(r"\*\*Depends on:\*\*\s*(.+)", body)
@@ -3287,7 +3247,7 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
     return "\n".join(parts)
 
 
-def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
+def _setup_workflow_logger(log_path: Path | None = None) -> logging.Logger:
     """Set up a logger that writes to both stderr and a log file."""
     logger = logging.getLogger("dtl.workflow")
     if logger.handlers:
@@ -3488,7 +3448,7 @@ def _watchdog_write_state(state: dict) -> None:
         raise
 
 
-def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
+def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
     """Anomaly A: 'dtl workflow run' absent when DEVPLAN has Not Started features."""
     plan_path = project_dir / "docs" / "DEVPLAN.md"
     if not plan_path.exists():
@@ -3503,8 +3463,7 @@ def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
     # intentionally — suppressing a spurious anomaly.
     human_attention = (RunOutcome.INTERRUPTED_AUTH, RunOutcome.INTERRUPTED_QUOTA)
     all_intentionally_halted = all(
-        _read_feature_state(project_dir, f["name"]).get("last_outcome")
-        in human_attention
+        _read_feature_state(project_dir, f["name"]).get("last_outcome") in human_attention
         for f in not_started
     )
     if all_intentionally_halted:
@@ -3531,7 +3490,7 @@ def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
     )
 
 
-def _watchdog_check_dirty_age(project_dir: Path) -> Optional[str]:
+def _watchdog_check_dirty_age(project_dir: Path) -> str | None:
     """Anomaly B: dirty working tree whose most-recent change is older than WATCHDOG_DIRTY_HOURS."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -3568,7 +3527,7 @@ def _watchdog_check_dirty_age(project_dir: Path) -> Optional[str]:
     return None
 
 
-def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
+def _watchdog_check_pr_activity(project_dir: Path) -> str | None:
     """Anomaly C: no open-PR activity for WATCHDOG_PR_IDLE_HOURS when Not Started features exist."""
     plan_path = project_dir / "docs" / "DEVPLAN.md"
     if not plan_path.exists():
@@ -3600,25 +3559,19 @@ def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
         return f"{project_dir.name}: features 'In Progress' but no open PRs found"
 
     # Find the most-recently-updated PR and check its age.
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        hours=WATCHDOG_PR_IDLE_HOURS
-    )
-    most_recent: Optional[datetime.datetime] = None
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=WATCHDOG_PR_IDLE_HOURS)
+    most_recent: datetime.datetime | None = None
     for pr in prs:
         updated_str = pr.get("updatedAt", "")
         try:
-            updated = datetime.datetime.fromisoformat(
-                updated_str.replace("Z", "+00:00")
-            )
+            updated = datetime.datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
             if most_recent is None or updated > most_recent:
                 most_recent = updated
         except (ValueError, AttributeError):
             pass
 
     if most_recent is not None and most_recent < cutoff:
-        idle_hours = (
-            datetime.datetime.now(datetime.timezone.utc) - most_recent
-        ).total_seconds() / 3600.0
+        idle_hours = (datetime.datetime.now(datetime.UTC) - most_recent).total_seconds() / 3600.0
         return (
             f"{project_dir.name}: no PR activity for {idle_hours:.0f}h "
             f"(threshold: {WATCHDOG_PR_IDLE_HOURS}h) with Not Started features"
@@ -3626,7 +3579,7 @@ def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
     return None
 
 
-def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
+def _watchdog_check_log_growth(prev_state: dict) -> tuple[str | None, int]:
     """Anomaly D: dtl log growth > WATCHDOG_LOG_GROWTH_MB_DAY MB/day.
 
     Returns (anomaly_message_or_None, current_total_bytes).
@@ -3641,7 +3594,7 @@ def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
                 except OSError:
                     pass
 
-    anomaly: Optional[str] = None
+    anomaly: str | None = None
     prev_bytes: int = prev_state.get("log_size_bytes", 0)
     prev_ts_str: str = prev_state.get("log_size_timestamp", "")
     if prev_ts_str and prev_bytes >= 0:
@@ -3650,9 +3603,7 @@ def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
             elapsed_hours = (datetime.datetime.now() - prev_ts).total_seconds() / 3600.0
             if elapsed_hours > 0:
                 growth_bytes = max(0, total_bytes - prev_bytes)
-                growth_mb_per_day = (growth_bytes / (1024 * 1024)) / (
-                    elapsed_hours / 24.0
-                )
+                growth_mb_per_day = (growth_bytes / (1024 * 1024)) / (elapsed_hours / 24.0)
                 if growth_mb_per_day > WATCHDOG_LOG_GROWTH_MB_DAY:
                     anomaly = (
                         f"dtl log growth {growth_mb_per_day:.1f} MB/day "
@@ -3674,9 +3625,7 @@ def _watchdog_notify_project(
         return
     notify_script = project_dir / ".ai" / "notify.py"
     if not notify_script.exists():
-        log.info(
-            "[%s] No .ai/notify.py found; skipping notification.", project_dir.name
-        )
+        log.info("[%s] No .ai/notify.py found; skipping notification.", project_dir.name)
         return
     message = f"[dtl watchdog] Anomalies detected in {project_dir.name}:\n" + "\n".join(
         f"  • {a}" for a in anomalies
@@ -3768,9 +3717,7 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
             "--quiet",
             "--break-system-packages",
         ]
-        pip_result = subprocess.run(
-            pip_cmd, cwd=project_dir, capture_output=True, text=True
-        )
+        pip_result = subprocess.run(pip_cmd, cwd=project_dir, capture_output=True, text=True)
         if pip_result.returncode != 0:
             pip_cmd = [
                 sys.executable,
@@ -3782,32 +3729,20 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
                 "--quiet",
                 "--break-system-packages",
             ]
-            pip_result = subprocess.run(
-                pip_cmd, cwd=project_dir, capture_output=True, text=True
-            )
-        output_parts.append(
-            f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}"
-        )
+            pip_result = subprocess.run(pip_cmd, cwd=project_dir, capture_output=True, text=True)
+        output_parts.append(f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}")
         if pip_result.returncode != 0:
             return False, "\n".join(output_parts)
 
     if lint_cmd:
-        result = subprocess.run(
-            lint_cmd, cwd=project_dir, capture_output=True, text=True
-        )
-        output_parts.append(
-            f"=== lint ({' '.join(lint_cmd)}) ===\n{result.stdout}{result.stderr}"
-        )
+        result = subprocess.run(lint_cmd, cwd=project_dir, capture_output=True, text=True)
+        output_parts.append(f"=== lint ({' '.join(lint_cmd)}) ===\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return False, "\n".join(output_parts)
 
     if test_cmd:
-        result = subprocess.run(
-            test_cmd, cwd=project_dir, capture_output=True, text=True
-        )
-        output_parts.append(
-            f"=== test ({' '.join(test_cmd)}) ===\n{result.stdout}{result.stderr}"
-        )
+        result = subprocess.run(test_cmd, cwd=project_dir, capture_output=True, text=True)
+        output_parts.append(f"=== test ({' '.join(test_cmd)}) ===\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return False, "\n".join(output_parts)
 
@@ -3827,7 +3762,7 @@ def _git_push_branch(project_dir: Path, branch: str) -> bool:
 
 def _gh_create_pr(
     project_dir: Path, branch: str, title: str, body: str, base: str = "develop"
-) -> Optional[str]:
+) -> str | None:
     """Create a PR using gh CLI. Returns the PR URL or None on failure."""
     result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body, "--base", base],
@@ -3861,7 +3796,7 @@ def _gh_enable_auto_merge(project_dir: Path, branch: str) -> bool:
     return result.returncode == 0
 
 
-def _gh_pr_state(project_dir: Path, branch: str) -> Optional[str]:
+def _gh_pr_state(project_dir: Path, branch: str) -> str | None:
     """Check PR state via gh CLI. Returns 'MERGED', 'OPEN', 'CLOSED', or None."""
     result = subprocess.run(
         ["gh", "pr", "view", branch, "--json", "state", "-q", ".state"],
@@ -3980,7 +3915,7 @@ def _classify_run(exit_code: int, output_lines: list[str]) -> str:
     return RunOutcome.FAILED_AI
 
 
-def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict]:
+def _find_feature_for_branch(features: list[dict], branch: str) -> dict | None:
     """Find the feature dict matching the given branch name."""
     for f in features:
         if f["branch"] == branch:
@@ -3993,7 +3928,7 @@ def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict
 # ---------------------------------------------------------------------------
 
 
-def _load_notify_config() -> Optional[dict]:
+def _load_notify_config() -> dict | None:
     """Load ~/.config/dtl/notify.toml.
 
     Returns the parsed config dict, or None if the file is absent or unparseable.
@@ -4012,10 +3947,10 @@ def _load_notify_config() -> Optional[dict]:
 
 
 def _emit_notify_event(
-    config: Optional[dict],
+    config: dict | None,
     event_type: str,
     payload: dict,
-    log: "logging.Logger",
+    log: logging.Logger,
 ) -> None:
     """POST a structured notification event to the configured HTTP endpoint.
 
@@ -4043,7 +3978,7 @@ def _emit_notify_event(
     body: dict = {
         "event": event_type,
         "event_id": event_id,
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "actions": [],
     }
     body.update(payload)
@@ -4066,9 +4001,7 @@ def _emit_notify_event(
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status < 300:
-                    log.info(
-                        "Notify: %s delivered (event_id=%s).", event_type, event_id
-                    )
+                    log.info("Notify: %s delivered (event_id=%s).", event_type, event_id)
                     return
                 log.info(
                     "Notify: %s HTTP %d on attempt %d.",
@@ -4077,15 +4010,11 @@ def _emit_notify_event(
                     attempt + 1,
                 )
         except Exception as exc:
-            log.info(
-                "Notify: attempt %d failed for %s: %s", attempt + 1, event_type, exc
-            )
+            log.info("Notify: attempt %d failed for %s: %s", attempt + 1, event_type, exc)
         if attempt < len(retry_seconds) - 1 and delay > 0:
             time.sleep(delay)
 
-    log.info(
-        "Notify: giving up on %s after %d attempts.", event_type, len(retry_seconds)
-    )
+    log.info("Notify: giving up on %s after %d attempts.", event_type, len(retry_seconds))
 
 
 def cmd_workflow_finish(args: argparse.Namespace) -> None:
@@ -4204,9 +4133,7 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
         if state == "MERGED":
             log.info("PR merged! Updating status.")
             # Checkout develop and pull to get merge
-            subprocess.run(
-                ["git", "checkout", "develop"], cwd=project_dir, capture_output=True
-            )
+            subprocess.run(["git", "checkout", "develop"], cwd=project_dir, capture_output=True)
             subprocess.run(
                 ["git", "pull", "origin", "develop"],
                 cwd=project_dir,
@@ -4285,7 +4212,7 @@ def _check_install_freshness(schedule_mode: bool) -> None:
         print(f"warning: {msg}", file=sys.stderr)
 
 
-def _preflight_auto_merge(project_dir: Path) -> Optional[bool]:
+def _preflight_auto_merge(project_dir: Path) -> bool | None:
     """Check whether the GitHub repo for project_dir has allow_auto_merge enabled.
 
     Returns:
@@ -4363,7 +4290,7 @@ def cmd_notify_test(args: argparse.Namespace) -> None:
         log.setLevel(logging.INFO)
 
     event_type = getattr(args, "event", "idle")
-    now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_ts = datetime.datetime.now(datetime.UTC).isoformat()
 
     _synthetic: dict[str, dict] = {
         "ai-failure": {
@@ -4401,8 +4328,8 @@ def _handle_interruption(
     ai_exit_code: int,
     ai_output: str,
     ai_start: float,
-    log: "logging.Logger",
-    notify_cfg: Optional[dict],
+    log: logging.Logger,
+    notify_cfg: dict | None,
 ) -> None:
     """Record an interruption: snapshot, notify, restore clean tree on develop.
 
@@ -4412,7 +4339,7 @@ def _handle_interruption(
     cleanly so the next loop iteration can retry the feature without
     tripping the dirty-tree skip.
     """
-    snapshot_path: Optional[Path] = None
+    snapshot_path: Path | None = None
     try:
         snapshot_path = _write_failure_snapshot(
             project_dir,
@@ -4431,9 +4358,7 @@ def _handle_interruption(
     try:
         _fstate = _read_feature_state(project_dir, feature["name"])
         _fstate["last_outcome"] = outcome
-        _fstate["last_run_iso"] = datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat()
+        _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
         _fstate["attempts_interrupted"] = _fstate["attempts_interrupted"] + 1
         if outcome == RunOutcome.INTERRUPTED_WALL_CLOCK:
             _fstate["partial_work_branch"] = branch
@@ -4629,9 +4554,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 continue
 
             branch = next_feature["branch"]
-            log.info(
-                "[%s] Starting feature: %s", project_dir.name, next_feature["name"]
-            )
+            log.info("[%s] Starting feature: %s", project_dir.name, next_feature["name"])
 
             # Ensure clean tree and on develop
             if _git_is_dirty(project_dir):
@@ -4665,9 +4588,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 log.info("[%s] Failed to create branch %s.", project_dir.name, branch)
                 _fstate = _read_feature_state(project_dir, next_feature["name"])
                 _fstate["last_outcome"] = RunOutcome.FAILED_INFRA
-                _fstate["last_run_iso"] = datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat()
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                 _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
                 _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _reason = "branch_create_failed"
@@ -4692,9 +4613,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             constraints_block, _ = _parse_devplan(plan_path.read_text())
             prompt = _build_ai_prompt(constraints_block, next_feature)
 
-            log.info(
-                "[%s] Launching AI for %s...", project_dir.name, next_feature["name"]
-            )
+            log.info("[%s] Launching AI for %s...", project_dir.name, next_feature["name"])
 
             ai_dir = project_dir / ".ai"
             ai_config_path = ai_dir / "config.json"
@@ -4794,8 +4713,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     _next_idx = _cur_idx + 1
                     if _next_idx < len(_chain):
                         log.info(
-                            "[%s] Quota hit on '%s'; rotating to '%s' "
-                            "(chain index %d → %d of %d).",
+                            "[%s] Quota hit on '%s'; rotating to '%s' (chain index %d → %d of %d).",
                             project_dir.name,
                             _chain[_cur_idx],
                             _chain[_next_idx],
@@ -4824,7 +4742,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_exit_code,
                     next_feature["name"],
                 )
-                _snapshot_path: Optional[Path] = None
+                _snapshot_path: Path | None = None
                 try:
                     _snapshot_path = _write_failure_snapshot(
                         project_dir,
@@ -4844,9 +4762,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         "project": project_dir.name,
                         "feature": next_feature["name"],
                         "exit_code": ai_exit_code,
-                        "failure_snapshot_path": str(_snapshot_path)
-                        if _snapshot_path
-                        else None,
+                        "failure_snapshot_path": str(_snapshot_path) if _snapshot_path else None,
                     },
                     log,
                 )
@@ -4856,9 +4772,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 _fstate["last_outcome"] = (
                     outcome if outcome != RunOutcome.COMPLETED else RunOutcome.FAILED_AI
                 )
-                _fstate["last_run_iso"] = datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat()
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                 if ai_exit_code in (124, 125):
                     log.info(
                         "[%s] Bail-out limit hit for %s — marking as permanently failed.",
@@ -4884,9 +4798,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 )
                 _fstate = _read_feature_state(project_dir, next_feature["name"])
                 _fstate["last_outcome"] = RunOutcome.FAILED_AI
-                _fstate["last_run_iso"] = datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat()
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                 _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
                 _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
@@ -4924,9 +4836,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
 
             # Commit any remaining changes
             if _git_is_dirty(project_dir):
-                subprocess.run(
-                    ["git", "add", "-A"], cwd=project_dir, capture_output=True
-                )
+                subprocess.run(["git", "add", "-A"], cwd=project_dir, capture_output=True)
                 subprocess.run(
                     [
                         "git",
@@ -4943,9 +4853,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 log.info("[%s] Push failed for %s.", project_dir.name, branch)
                 _fstate = _read_feature_state(project_dir, next_feature["name"])
                 _fstate["last_outcome"] = RunOutcome.FAILED_INFRA
-                _fstate["last_run_iso"] = datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat()
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                 _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
                 _write_feature_state(project_dir, next_feature["name"], _fstate)
                 continue
@@ -4955,12 +4863,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             goal_match = re.search(
                 r"### Goal\s*\n(.*?)(?=###|\Z)", next_feature["block"], re.DOTALL
             )
-            goal_text = (
-                goal_match.group(1).strip() if goal_match else next_feature["name"]
-            )
-            pr_body = (
-                f"## Summary\n\n{goal_text}\n\n---\n*Automated by `dtl workflow run`*"
-            )
+            goal_text = goal_match.group(1).strip() if goal_match else next_feature["name"]
+            pr_body = f"## Summary\n\n{goal_text}\n\n---\n*Automated by `dtl workflow run`*"
             pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
             if pr_url:
                 log.info("[%s] PR created: %s", project_dir.name, pr_url)
@@ -4999,9 +4903,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 time.sleep(60)
                 state = _gh_pr_state(project_dir, branch)
                 if state == "MERGED":
-                    log.info(
-                        "[%s] PR merged for %s!", project_dir.name, next_feature["name"]
-                    )
+                    log.info("[%s] PR merged for %s!", project_dir.name, next_feature["name"])
                     subprocess.run(
                         ["git", "checkout", "develop"],
                         cwd=project_dir,
@@ -5036,9 +4938,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     # Reset per-feature state on success
                     _fstate = _read_feature_state(project_dir, next_feature["name"])
                     _fstate["last_outcome"] = RunOutcome.COMPLETED
-                    _fstate["last_run_iso"] = datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat()
+                    _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                     _fstate["attempts_completed"] = 0
                     _fstate["partial_work_branch"] = None
                     _write_feature_state(project_dir, next_feature["name"], _fstate)
@@ -5050,9 +4950,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         {
                             "project": project_dir.name,
                             "feature": next_feature["name"],
-                            "pr_number": int(_pr_num_match.group(1))
-                            if _pr_num_match
-                            else None,
+                            "pr_number": int(_pr_num_match.group(1)) if _pr_num_match else None,
                         },
                         log,
                     )
@@ -5071,7 +4969,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             _emit_notify_event(
                 notify_cfg,
                 "idle",
-                {"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+                {"timestamp": datetime.datetime.now(datetime.UTC).isoformat()},
                 log,
             )
             break
@@ -5266,7 +5164,8 @@ def cmd_workflow_status(args: argparse.Namespace) -> None:
 
     print()
     print(
-        f"{'Feature':<30}  {'DEVPLAN':<14}  {'Last outcome':<24}  {'Done':<4}  {'Int':<4}  Partial branch"
+        f"{'Feature':<30}  {'DEVPLAN':<14}  {'Last outcome':<24}  "
+        f"{'Done':<4}  {'Int':<4}  Partial branch"
     )
     print("-" * 100)
     for f in features:
@@ -5307,7 +5206,7 @@ def cmd_workflow_next(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Find next unstarted feature
-    next_feature: Optional[dict] = None
+    next_feature: dict | None = None
     for f in features:
         if f["status"] == "Not Started":
             next_feature = f
@@ -5354,9 +5253,7 @@ def _pm_source_dir() -> Path:
     installed = Path("/opt/devtools/pm")
     if installed.is_dir():
         return installed
-    raise FileNotFoundError(
-        f"pm/ source not found next to {__file__} or at /opt/devtools/pm"
-    )
+    raise FileNotFoundError(f"pm/ source not found next to {__file__} or at /opt/devtools/pm")
 
 
 def cmd_pm_install(args: argparse.Namespace) -> None:
@@ -5668,8 +5565,7 @@ def main() -> None:
         default=3,
         metavar="N",
         help=(
-            "Kill the session after N detected retry loops in AI output "
-            "(default: 3; 0 = disabled)"
+            "Kill the session after N detected retry loops in AI output (default: 3; 0 = disabled)"
         ),
     )
     ai_run_parser.add_argument(

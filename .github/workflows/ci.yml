@@ -27,8 +27,11 @@ jobs:
       #
       # Bump this deliberately, in its own PR, alongside the fixes the new
       # version demands. Never unpin it.
+      #
+      # 0.15.7 -> 0.16.4 done that way: ruff.toml now declares an explicit
+      # rule set, so a future release's default changes cannot reach us.
       - name: Run ruff lint
-        run: pip install ruff==0.15.7 && ruff check dtl.py
+        run: pip install ruff==0.16.4 && ruff check dtl.py
       - name: Run ruff format check
         run: ruff format --check dtl.py
 

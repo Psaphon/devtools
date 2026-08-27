@@ -1,0 +1,52 @@
+# Explicit lint configuration for dtl.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# devtools previously had no ruff config, so it inherited ruff's *default*
+# rule set — meaning every ruff release renegotiated this project's lint
+# policy on its behalf. On 2026-08-26 ruff 0.16.4 expanded those defaults and
+# produced 134 errors in an unmodified dtl.py, turning every open PR red,
+# including one-line documentation changes.
+#
+# Declaring the rule set explicitly makes the standard OURS. A future ruff
+# release can add whatever defaults it likes; this project's policy only
+# changes when this file changes.
+#
+# The selection matches loom's, the closest sibling project.
+
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+]
+
+# E501 (line length) is enforced by `ruff format` for real code and is left off
+# here. dtl.py is roughly half EMBEDDED TEMPLATES — GitHub Actions YAML,
+# generated shell scripts, the scaffolded notify.py — and E501 on those lines
+# measures the length of GENERATED OUTPUT, not of this file's source.
+#
+# Those lines cannot be suppressed: a `# noqa: E501` inside a triple-quoted
+# template literal is not a directive, it becomes part of the emitted file.
+# And wrapping them changes what dtl writes into scaffolded projects; breaking
+# a GitHub Actions `if: ${{ ... }}` condition would produce a broken workflow.
+#
+# The 2 over-length lines in dtl's OWN code were fixed rather than exempted.
+ignore = ["E501"]
+
+# NOT selected, deliberately:
+#   PTH  — flake8-use-pathlib would impose a NEW standard (13 findings), not
+#          enforce an existing one. devtools' CLAUDE.md does not mandate
+#          pathlib the way hub's does. Worth adopting later as its own change.
+#   S, ANN, PL, BLE, DTZ, SIM — likewise new standards. Several are genuine
+#          smells (blind excepts, naive datetimes, subprocess without an
+#          explicit check=) and are tracked as follow-up work, but adopting
+#          them belongs in a change that fixes them, not one that declares
+#          the baseline.
