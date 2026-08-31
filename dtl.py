@@ -3482,10 +3482,26 @@ def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
             timeout=10,
             check=False,
         )
-        project_str = str(project_dir)
+        # Only the --projects argument says which projects a run actually covers.
+        # Testing the whole command line for the path as a substring was wrong:
+        # every 'dtl workflow run' line contains the location of dtl.py itself,
+        # so a run launched for one project made the repo hosting dtl.py look
+        # covered. In practice devtools could never be watched while any workflow
+        # was running anywhere — its anomaly vanished the moment a run was armed.
+        target = project_dir.expanduser().resolve()
         for line in result.stdout.splitlines():
-            if "workflow" in line and "run" in line and project_str in line:
-                return None  # process found — no anomaly
+            if "workflow" not in line or "run" not in line:
+                continue
+            match = re.search(r"--projects[=\s]+(\S+)", line)
+            if not match:
+                continue
+            for raw in match.group(1).split(","):
+                candidate = raw.strip()
+                if not candidate:
+                    continue
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    if Path(candidate).expanduser().resolve() == target:
+                        return None  # a run covering THIS project exists
     except Exception:  # noqa: S110,BLE001 — pgrep unavailable means 'cannot tell'; caller treats that as no-anomaly
         pass
 

@@ -203,6 +203,85 @@ class TestWatchdogCheckMissingRunner:
             "FAILED_AI state should NOT suppress missing-runner anomaly"
         )
 
+    # ------------------------------------------------------------------
+    # Which running workflow actually covers this project.
+    #
+    # The check used to test the whole `ps` line for the project path as a
+    # substring. Every 'dtl workflow run' command line contains the path to
+    # dtl.py itself, so a run for ANY project silently marked the repo hosting
+    # dtl.py as covered — observed live on 2026-08-31, where arming a run for
+    # atrade made devtools' real anomaly disappear.
+    # ------------------------------------------------------------------
+
+    def test_dtl_py_location_in_cmdline_does_not_count_as_coverage(self, tmp_path):
+        """A run for another project must not cover the repo hosting dtl.py."""
+        devtools = make_project(tmp_path, name="devtools")
+        write_devplan(devtools, ["Not Started"])
+        atrade = tmp_path / "atrade"
+        atrade.mkdir()
+        # The real shape: dtl.py lives in devtools, the run targets atrade.
+        fake_ps = (
+            f"user 1234 0.0 0.1 python3 {devtools}/dtl.py workflow run "
+            f"--projects {atrade} --schedule 02:00\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
+            result = dtl._watchdog_check_missing_runner(devtools)
+        assert result is not None, (
+            "devtools has Not Started work and no run of its own — the presence "
+            "of its path as the dtl.py location must not suppress the anomaly"
+        )
+
+    def test_project_named_in_projects_list_counts_as_coverage(self, tmp_path):
+        """The targeted project itself is still correctly considered covered."""
+        devtools = make_project(tmp_path, name="devtools")
+        atrade = make_project(tmp_path, name="atrade")
+        write_devplan(atrade, ["Not Started"])
+        fake_ps = (
+            f"user 1234 0.0 0.1 python3 {devtools}/dtl.py workflow run "
+            f"--projects {atrade} --schedule 02:00\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
+            result = dtl._watchdog_check_missing_runner(atrade)
+        assert result is None
+
+    def test_multi_project_run_covers_each_listed_project(self, tmp_path):
+        """A comma-separated --projects list covers every entry."""
+        devtools = make_project(tmp_path, name="devtools")
+        loom = make_project(tmp_path, name="loom")
+        atrade = make_project(tmp_path, name="atrade")
+        write_devplan(loom, ["Not Started"])
+        fake_ps = (
+            f"user 1234 0.0 0.1 python3 {devtools}/dtl.py workflow run "
+            f"--projects {atrade},{loom}\n"
+        )
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
+            result = dtl._watchdog_check_missing_runner(loom)
+        assert result is None
+
+    def test_trailing_slash_and_dot_segments_still_match(self, tmp_path):
+        """Path spelling differences must not create a false anomaly."""
+        loom = make_project(tmp_path, name="loom")
+        write_devplan(loom, ["Not Started"])
+        odd = f"{tmp_path}/./loom/"
+        fake_ps = f"user 1 0.0 0.1 python3 dtl.py workflow run --projects {odd}\n"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
+            result = dtl._watchdog_check_missing_runner(loom)
+        assert result is None
+
+    def test_run_without_projects_flag_is_not_coverage(self, tmp_path):
+        """A 'workflow run' line with no --projects argument covers nothing."""
+        loom = make_project(tmp_path, name="loom")
+        write_devplan(loom, ["Not Started"])
+        fake_ps = f"user 1 0.0 0.1 python3 {loom}/dtl.py workflow run --help\n"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
+            result = dtl._watchdog_check_missing_runner(loom)
+        assert result is not None
+
 
 # ---------------------------------------------------------------------------
 # Check B: dirty tree age
