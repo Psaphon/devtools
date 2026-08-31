@@ -3643,19 +3643,45 @@ def _watchdog_notify_project(
         f"  • {a}" for a in anomalies
     )
     try:
-        subprocess.run(
+        result = subprocess.run(
             [sys.executable, str(notify_script), "1", message],
             capture_output=True,
             timeout=30,
             check=False,
         )
-        log.info(
-            "[%s] Watchdog notification sent (%d anomaly/anomalies).",
+    except Exception as exc:  # noqa: BLE001 — notify.py is user-supplied; must not break the watchdog
+        log.warning(
+            "[%s] Failed to invoke notify.py (%s) — %d anomaly/anomalies NOT delivered.",
             project_dir.name,
+            exc,
             len(anomalies),
         )
-    except Exception as exc:  # noqa: BLE001 — notify.py is user-supplied; already logged, must not break the watchdog
-        log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
+        return
+
+    # This used to log "notification sent" unconditionally, with check=False and
+    # the captured output discarded. notify.py exits 1 when it has no credentials,
+    # so an entire fleet could go months delivering nothing while the journal
+    # reported success every 30 minutes. A watchdog that lies about its own alerting
+    # is worse than no watchdog: it converts a visible outage into a silent one.
+    if result.returncode != 0:
+        stderr = result.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        detail = f" stderr: {stderr.strip()[:500]}" if stderr.strip() else ""
+        log.warning(
+            "[%s] notify.py FAILED (exit %d) — %d anomaly/anomalies NOT delivered.%s",
+            project_dir.name,
+            result.returncode,
+            len(anomalies),
+            detail,
+        )
+        return
+
+    log.info(
+        "[%s] Watchdog notification sent (%d anomaly/anomalies).",
+        project_dir.name,
+        len(anomalies),
+    )
 
 
 def _make_watchdog_service(projects_str: str) -> str:

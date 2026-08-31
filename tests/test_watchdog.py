@@ -502,6 +502,74 @@ class TestWatchdogNotifyProject:
         assert "issue alpha" in message
         assert "issue beta" in message
 
+    # ------------------------------------------------------------------
+    # Delivery-failure reporting.
+    #
+    # These deliberately run a REAL notify.py subprocess instead of patching
+    # subprocess.run. The bug these cover — "notification sent" logged even when
+    # notify.py exited non-zero — was invisible to every mocked test above,
+    # because a MagicMock never fails the way the real script does.
+    # ------------------------------------------------------------------
+
+    def test_failing_notify_script_does_not_claim_success(self, tmp_path, caplog):
+        """A notify.py that exits 1 must NOT produce a 'notification sent' line."""
+        project = make_project(tmp_path)
+        ai_dir = project / ".ai"
+        ai_dir.mkdir()
+        # Mirrors the real notify.py's no-credentials path.
+        (ai_dir / "notify.py").write_text(
+            "import sys\n"
+            "print('[notify] Telegram not configured.', file=sys.stderr)\n"
+            "sys.exit(1)\n"
+        )
+
+        with caplog.at_level(logging.INFO):
+            dtl._watchdog_notify_project(project, ["an anomaly"], self._log())
+
+        assert "Watchdog notification sent" not in caplog.text
+        assert "NOT delivered" in caplog.text
+        assert "exit 1" in caplog.text
+
+    def test_failing_notify_script_surfaces_stderr(self, tmp_path, caplog):
+        """The reason for the failure must reach the log, not be discarded."""
+        project = make_project(tmp_path)
+        ai_dir = project / ".ai"
+        ai_dir.mkdir()
+        (ai_dir / "notify.py").write_text(
+            "import sys\nprint('missing chat_id', file=sys.stderr)\nsys.exit(1)\n"
+        )
+
+        with caplog.at_level(logging.INFO):
+            dtl._watchdog_notify_project(project, ["an anomaly"], self._log())
+
+        assert "missing chat_id" in caplog.text
+
+    def test_successful_notify_script_still_reports_sent(self, tmp_path, caplog):
+        """The success path must keep working — a real script exiting 0."""
+        project = make_project(tmp_path)
+        ai_dir = project / ".ai"
+        ai_dir.mkdir()
+        (ai_dir / "notify.py").write_text("import sys\nsys.exit(0)\n")
+
+        with caplog.at_level(logging.INFO):
+            dtl._watchdog_notify_project(project, ["a", "b"], self._log())
+
+        assert "Watchdog notification sent (2 anomaly/anomalies)" in caplog.text
+        assert "NOT delivered" not in caplog.text
+
+    def test_watchdog_survives_notify_script_that_crashes(self, tmp_path, caplog):
+        """A notify.py that raises must be reported, not swallowed as success."""
+        project = make_project(tmp_path)
+        ai_dir = project / ".ai"
+        ai_dir.mkdir()
+        (ai_dir / "notify.py").write_text("raise RuntimeError('boom')\n")
+
+        with caplog.at_level(logging.INFO):
+            dtl._watchdog_notify_project(project, ["an anomaly"], self._log())
+
+        assert "Watchdog notification sent" not in caplog.text
+        assert "NOT delivered" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Unit template generators
