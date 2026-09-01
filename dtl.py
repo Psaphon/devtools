@@ -310,6 +310,14 @@ WATCHDOG_DIRTY_HOURS: int = 24  # dirty tree older than this triggers anomaly
 WATCHDOG_PR_IDLE_HOURS: int = 48  # no PR activity for this long triggers anomaly
 WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers anomaly
 
+# Merge-wait bounds. The overnight loop used to poll `gh pr view` forever waiting
+# for a state of MERGED or CLOSED. A PR whose CI has gone red is neither -- it sits
+# at OPEN indefinitely -- so a single red check silently consumed an entire batch
+# and every later feature went unattempted (observed on atrade 2026-09-01, PR #7).
+# The loop now also inspects the check rollup and gives up after a hard deadline.
+MERGE_WAIT_POLL_S: int = 60  # seconds between PR state polls
+MERGE_WAIT_TIMEOUT_S: int = 3600  # abandon a PR that has neither merged nor failed
+
 # ---------------------------------------------------------------------------
 # CLAUDE.md template categories
 # ---------------------------------------------------------------------------
@@ -3877,6 +3885,76 @@ def _gh_pr_state(project_dir: Path, branch: str) -> str | None:
     return None
 
 
+# Conclusions that mean a check has definitively failed. Anything else that has
+# completed (SUCCESS, NEUTRAL, SKIPPED) is treated as not-blocking.
+_CHECK_FAILURE_CONCLUSIONS = frozenset(
+    {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE", "ERROR"}
+)
+
+
+def _gh_pr_checks(project_dir: Path, branch: str) -> tuple[str, list[str]]:
+    """Summarise a PR's check rollup.
+
+    Returns ``(state, failing_names)`` where state is one of:
+
+    - ``"FAILING"`` -- at least one check has definitively failed; the PR can
+      never auto-merge and waiting on it is pointless.
+    - ``"PENDING"`` -- checks still running, or none reported yet.
+    - ``"PASSING"`` -- every reported check completed without failing.
+    - ``"UNKNOWN"`` -- gh call failed or returned unparseable output. Treated as
+      PENDING by callers so a transient network blip never abandons a good PR.
+
+    Handles both CheckRun (status/conclusion) and StatusContext (state) entries,
+    since a rollup can legitimately contain either.
+    """
+    result = subprocess.run(
+        ["gh", "pr", "view", branch, "--json", "statusCheckRollup", "-q", ".statusCheckRollup"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "UNKNOWN", []
+    raw = result.stdout.strip()
+    if not raw or raw == "null":
+        return "PENDING", []
+    try:
+        checks = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return "UNKNOWN", []
+    if not isinstance(checks, list) or not checks:
+        return "PENDING", []
+
+    failing: list[str] = []
+    pending = False
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name") or check.get("context") or "unnamed-check"
+        # StatusContext uses `state`; CheckRun uses `status` + `conclusion`.
+        if "conclusion" in check or "status" in check:
+            status = (check.get("status") or "").upper()
+            conclusion = (check.get("conclusion") or "").upper()
+            if status and status != "COMPLETED":
+                pending = True
+                continue
+            if conclusion in _CHECK_FAILURE_CONCLUSIONS:
+                failing.append(name)
+            elif not conclusion:
+                pending = True
+        else:
+            state = (check.get("state") or "").upper()
+            if state in _CHECK_FAILURE_CONCLUSIONS:
+                failing.append(name)
+            elif state != "SUCCESS":
+                pending = True
+
+    if failing:
+        return "FAILING", failing
+    return ("PENDING", []) if pending else ("PASSING", [])
+
+
 class RunOutcome:
     """Structured outcomes of an AI run, used by _classify_run.
 
@@ -5015,10 +5093,12 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             )
             subprocess.run(["git", "push"], cwd=project_dir, capture_output=True, check=False)
 
-            # Poll for merge
+            # Poll for merge. Bounded: a PR whose checks have gone red will never
+            # reach MERGED, so waiting on it starves every remaining feature.
             log.info("[%s] Waiting for PR merge...", project_dir.name)
+            merge_deadline = time.monotonic() + MERGE_WAIT_TIMEOUT_S
             while True:
-                time.sleep(60)
+                time.sleep(MERGE_WAIT_POLL_S)
                 state = _gh_pr_state(project_dir, branch)
                 if state == "MERGED":
                     log.info("[%s] PR merged for %s!", project_dir.name, next_feature["name"])
@@ -5085,6 +5165,64 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         next_feature["name"],
                     )
                     _update_feature_status(plan_path, next_feature["name"], "Closed")
+                    break
+
+                # Still OPEN. Decide whether waiting is still worth it.
+                check_state, failing = _gh_pr_checks(project_dir, branch)
+                pr_ref = pr_url or branch
+                if check_state == "FAILING":
+                    log.info(
+                        "[%s] CI FAILED for %s (%s) -- checks: %s. "
+                        "Abandoning the wait and moving to the next feature.",
+                        project_dir.name,
+                        next_feature["name"],
+                        pr_ref,
+                        ", ".join(failing) or "unknown",
+                    )
+                    _update_feature_status(
+                        plan_path,
+                        next_feature["name"],
+                        f"Blocked (CI red on {pr_ref}: {', '.join(failing) or 'unknown'})",
+                    )
+                    _emit_notify_event(
+                        notify_cfg,
+                        "ci-failed",
+                        {
+                            "project": project_dir.name,
+                            "feature": next_feature["name"],
+                            "pr_url": pr_url,
+                            "failing_checks": failing,
+                        },
+                        log,
+                    )
+                    break
+
+                if time.monotonic() > merge_deadline:
+                    log.info(
+                        "[%s] Timed out after %d min waiting on %s (%s); checks are %s. "
+                        "Moving to the next feature.",
+                        project_dir.name,
+                        MERGE_WAIT_TIMEOUT_S // 60,
+                        next_feature["name"],
+                        pr_ref,
+                        check_state,
+                    )
+                    _update_feature_status(
+                        plan_path,
+                        next_feature["name"],
+                        f"Blocked (merge wait timed out on {pr_ref})",
+                    )
+                    _emit_notify_event(
+                        notify_cfg,
+                        "merge-timeout",
+                        {
+                            "project": project_dir.name,
+                            "feature": next_feature["name"],
+                            "pr_url": pr_url,
+                            "check_state": check_state,
+                        },
+                        log,
+                    )
                     break
 
         if not any_work_done:

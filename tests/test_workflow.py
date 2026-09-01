@@ -1,5 +1,6 @@
 """Tests for dtl workflow subcommands: plan parsing, branch logic, status updates."""
 
+import contextlib
 import json
 import re
 import subprocess
@@ -148,9 +149,7 @@ class TestParseDevplan:
         assert features == []
 
     def test_no_constraints_section(self):
-        minimal = (
-            "## Feature: solo\n\n**Branch:** `feature/solo`\n**Status:** Not Started\n"
-        )
+        minimal = "## Feature: solo\n\n**Branch:** `feature/solo`\n**Status:** Not Started\n"
         constraints, features = _parse_devplan(minimal)
         assert constraints == ""
         assert len(features) == 1
@@ -259,9 +258,7 @@ class TestGitIsDirty:
         )
         f = tmp_path / "file.txt"
         f.write_text("original")
-        subprocess.run(
-            ["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True
-        )
+        subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
         subprocess.run(
             ["git", "commit", "-m", "init"],
             cwd=tmp_path,
@@ -269,9 +266,7 @@ class TestGitIsDirty:
             capture_output=True,
         )
         f.write_text("changed")
-        subprocess.run(
-            ["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True
-        )
+        subprocess.run(["git", "add", "file.txt"], cwd=tmp_path, check=True, capture_output=True)
         assert _git_is_dirty(tmp_path) is True
 
 
@@ -373,9 +368,7 @@ class TestCmdWorkflowNext:
             cmd_workflow_next(args)
 
         # beta-feature is first "Not Started"
-        mock_branch.assert_called_once_with(
-            tmp_path, "feature/beta-feature", base="develop"
-        )
+        mock_branch.assert_called_once_with(tmp_path, "feature/beta-feature", base="develop")
         mock_ai.assert_called_once()
 
         # Status updated in file
@@ -466,9 +459,7 @@ class TestCmdWorkflowRunDirtyTreeNoSpin:
         )
 
         # Verify the dirty-skip log message fired at least once
-        skip_calls = [
-            c for c in mock_logger.info.call_args_list if "dirty" in str(c).lower()
-        ]
+        skip_calls = [c for c in mock_logger.info.call_args_list if "dirty" in str(c).lower()]
         assert skip_calls, "Expected at least one 'dirty' skip log message"
 
     def test_floor_sleep_fires_when_work_is_done(self, tmp_path):
@@ -488,9 +479,7 @@ class TestCmdWorkflowRunDirtyTreeNoSpin:
             sleep_calls.append(secs)
 
         # Simulate: first iteration tree is clean (work done), second is all-done
-        dirty_responses = iter(
-            [False]
-        )  # clean on first real check; will raise StopIteration after
+        dirty_responses = iter([False])  # clean on first real check; will raise StopIteration after
 
         def fake_is_dirty(path):
             try:
@@ -758,9 +747,7 @@ class TestMaybeNotifyStalled:
             "dtl.subprocess.run",
             side_effect=lambda *a, **kw: calls.append(a) or MagicMock(returncode=0),
         ):
-            _maybe_notify_stalled(
-                project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD, MagicMock()
-            )
+            _maybe_notify_stalled(project_dir, "dirty_tree", WORKFLOW_STALL_THRESHOLD, MagicMock())
 
         assert len(calls) == 1
         assert "notify.py" in str(calls[0])
@@ -1075,9 +1062,7 @@ class TestPreflightAutoMerge:
         (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
         return tmp_path
 
-    def test_schedule_exits_nonzero_when_auto_merge_disabled(
-        self, tmp_path, monkeypatch
-    ):
+    def test_schedule_exits_nonzero_when_auto_merge_disabled(self, tmp_path, monkeypatch):
         """With --schedule and allow_auto_merge=False, cmd_workflow_run exits non-zero
         and time.sleep is never called."""
         from dtl import cmd_workflow_run
@@ -1162,9 +1147,7 @@ class TestAiFailureSnapshot:
         (docs_dir / "DEVPLAN.md").write_text(SAMPLE_PLAN)
         return tmp_path
 
-    def test_ai_exit1_produces_snapshot_with_required_sections(
-        self, tmp_path, monkeypatch
-    ):
+    def test_ai_exit1_produces_snapshot_with_required_sections(self, tmp_path, monkeypatch):
         """Simulated AI exit-1 writes a snapshot file containing all required sections."""
         from dtl import cmd_workflow_run
 
@@ -1213,9 +1196,7 @@ Beta goal.
 
         def fake_subprocess_run(cmd, **kwargs):
             # AI subprocess call returns exit code 1 with recognisable output
-            if sys.executable in str(cmd) or (
-                isinstance(cmd, list) and "claude" in cmd[0]
-            ):
+            if sys.executable in str(cmd) or (isinstance(cmd, list) and "claude" in cmd[0]):
                 return MagicMock(
                     returncode=1,
                     stdout="stdout line 1\n",
@@ -1282,9 +1263,7 @@ Beta goal.
         args.log = None
 
         def fake_subprocess_run(cmd, **kwargs):
-            if sys.executable in str(cmd) or (
-                isinstance(cmd, list) and "claude" in cmd[0]
-            ):
+            if sys.executable in str(cmd) or (isinstance(cmd, list) and "claude" in cmd[0]):
                 return MagicMock(returncode=1, stdout="", stderr="")
             return MagicMock(returncode=0, stdout="", stderr="")
 
@@ -1429,9 +1408,7 @@ Beta goal.
             patch("dtl.ai_run"),
             patch("dtl._run_lint_and_tests", return_value=(True, "")),
             patch("dtl._git_push_branch", return_value=True),
-            patch(
-                "dtl._gh_create_pr", return_value="https://github.com/org/repo/pull/7"
-            ),
+            patch("dtl._gh_create_pr", return_value="https://github.com/org/repo/pull/7"),
             patch("dtl._gh_enable_auto_merge", return_value=True),
             patch("dtl._gh_pr_state", return_value="MERGED"),
             patch("dtl._update_feature_status", side_effect=fake_update_status),
@@ -1583,9 +1560,7 @@ class TestRunClassification:
         assert _classify_run(0, ["normal work\n"]) == RunOutcome.COMPLETED
 
     def test_exit_code_124_wall_clock(self):
-        assert (
-            _classify_run(124, ["normal work\n"]) == RunOutcome.INTERRUPTED_WALL_CLOCK
-        )
+        assert _classify_run(124, ["normal work\n"]) == RunOutcome.INTERRUPTED_WALL_CLOCK
 
     def test_exit_code_125_retry_cap_is_failed_ai(self):
         # 125 was the retry-cap kill — AI was looping on tests, treat as failure.
@@ -1752,9 +1727,7 @@ class TestFeatureState:
         assert recovered["attempts_interrupted"] == 3
         assert recovered["partial_work_branch"] == "feature/restart-feature"
 
-    def test_interrupted_quota_does_not_increment_attempts_completed(
-        self, tmp_path, monkeypatch
-    ):
+    def test_interrupted_quota_does_not_increment_attempts_completed(self, tmp_path, monkeypatch):
         """INTERRUPTED_QUOTA must only increment attempts_interrupted, not attempts_completed."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
         project_dir = tmp_path / "proj"
@@ -1772,9 +1745,7 @@ class TestFeatureState:
         _write_feature_state(project_dir, "quota-feature", fstate)
 
         after = _read_feature_state(project_dir, "quota-feature")
-        assert after["attempts_completed"] == 0, (
-            "INTERRUPTED_QUOTA must not burn the retry budget"
-        )
+        assert after["attempts_completed"] == 0, "INTERRUPTED_QUOTA must not burn the retry budget"
         assert after["attempts_interrupted"] == 1
 
     def test_failed_ai_increments_attempts_completed(self, tmp_path, monkeypatch):
@@ -1788,16 +1759,9 @@ class TestFeatureState:
             fstate["last_outcome"] = RunOutcome.FAILED_AI
             fstate["attempts_completed"] = fstate["attempts_completed"] + 1
             _write_feature_state(project_dir, "failing-feature", fstate)
-            assert (
-                _read_feature_state(project_dir, "failing-feature")[
-                    "attempts_completed"
-                ]
-                == i
-            )
+            assert _read_feature_state(project_dir, "failing-feature")["attempts_completed"] == i
 
-    def test_partial_work_branch_set_on_wall_clock_interruption(
-        self, tmp_path, monkeypatch
-    ):
+    def test_partial_work_branch_set_on_wall_clock_interruption(self, tmp_path, monkeypatch):
         """partial_work_branch is populated on INTERRUPTED_WALL_CLOCK."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
         project_dir = tmp_path / "proj"
@@ -1915,24 +1879,18 @@ Test feature.
         args.log = None
         return args
 
-    def _fake_handle_interruption(
-        self, project_dir, plan_path, feature, branch, outcome, *a, **kw
-    ):
+    def _fake_handle_interruption(self, project_dir, plan_path, feature, branch, outcome, *a, **kw):
         """Revert plan 'In Progress' → 'Not Started' as the real function does via git."""
         text = plan_path.read_text()
         text = re.sub(r"\*\*Status:\*\* In Progress", "**Status:** Not Started", text)
         plan_path.write_text(text)
 
-    def test_chain_rotates_to_next_provider_on_interrupted_quota(
-        self, tmp_path, monkeypatch
-    ):
+    def test_chain_rotates_to_next_provider_on_interrupted_quota(self, tmp_path, monkeypatch):
         """On INTERRUPTED_QUOTA the next subprocess call uses the next chain provider."""
         from dtl import cmd_workflow_run
 
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-        project_dir = self._make_project(
-            tmp_path / "proj", provider_chain=["claude", "ollama"]
-        )
+        project_dir = self._make_project(tmp_path / "proj", provider_chain=["claude", "ollama"])
         args = self._make_args(project_dir)
 
         call_providers: list[str | None] = []
@@ -2025,9 +1983,7 @@ Test feature.
         from dtl import cmd_workflow_run
 
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-        project_dir = self._make_project(
-            tmp_path / "proj", provider_chain=["claude", "ollama"]
-        )
+        project_dir = self._make_project(tmp_path / "proj", provider_chain=["claude", "ollama"])
         args = self._make_args(project_dir, quota_reset_sleep=1)
 
         call_providers: list[str | None] = []
@@ -2185,3 +2141,188 @@ class TestInstallFreshnessGuard:
             # Both paths resolve to the same file → immediate return
             _check_install_freshness(schedule_mode=False)
             _check_install_freshness(schedule_mode=True)
+
+
+class TestGhPrChecks:
+    """_gh_pr_checks summarises a PR's check rollup into a wait/abandon decision."""
+
+    def _run(self, stdout: str, returncode: int = 0):
+        from dtl import _gh_pr_checks
+
+        with patch(
+            "dtl.subprocess.run",
+            return_value=MagicMock(returncode=returncode, stdout=stdout, stderr=""),
+        ):
+            return _gh_pr_checks(Path("/tmp/proj"), "feature/x")
+
+    def test_failure_conclusion_reports_failing_with_names(self):
+        rollup = json.dumps(
+            [
+                {"name": "lint-and-test", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"name": "shellcheck", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ]
+        )
+        state, failing = self._run(rollup)
+        assert state == "FAILING"
+        assert failing == ["lint-and-test"]
+
+    def test_all_success_reports_passing(self):
+        rollup = json.dumps(
+            [
+                {"name": "lint-and-test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "ci-ok", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ]
+        )
+        assert self._run(rollup) == ("PASSING", [])
+
+    def test_in_progress_check_reports_pending(self):
+        rollup = json.dumps(
+            [
+                {"name": "lint-and-test", "status": "IN_PROGRESS", "conclusion": None},
+                {"name": "ci-ok", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            ]
+        )
+        assert self._run(rollup) == ("PENDING", [])
+
+    def test_skipped_and_neutral_do_not_block(self):
+        rollup = json.dumps(
+            [
+                {"name": "optional", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                {"name": "advisory", "status": "COMPLETED", "conclusion": "NEUTRAL"},
+            ]
+        )
+        assert self._run(rollup) == ("PASSING", [])
+
+    def test_status_context_entries_are_understood(self):
+        """A rollup may contain StatusContext (state) rather than CheckRun entries."""
+        rollup = json.dumps([{"context": "legacy/ci", "state": "FAILURE"}])
+        state, failing = self._run(rollup)
+        assert state == "FAILING"
+        assert failing == ["legacy/ci"]
+
+    def test_empty_rollup_is_pending_not_passing(self):
+        """No checks reported yet must not be mistaken for success."""
+        assert self._run("[]") == ("PENDING", [])
+        assert self._run("null") == ("PENDING", [])
+
+    def test_gh_failure_is_unknown_so_a_blip_never_abandons_a_pr(self):
+        assert self._run("", returncode=1) == ("UNKNOWN", [])
+        assert self._run("not json") == ("UNKNOWN", [])
+
+
+class TestMergeWaitTerminates:
+    """Regression: a red-CI PR stays OPEN forever and used to hang the whole batch.
+
+    Before this fix the poll loop broke only on MERGED or CLOSED, so one failing
+    check starved every remaining feature (atrade 2026-09-01, PR #7).
+    """
+
+    def _make_project(self, tmp_path: Path) -> Path:
+        plan = """\
+# Development Plan: Test
+
+## Feature: beta-feature
+
+**Branch:** `feature/beta-feature`
+**Depends on:** none
+**Status:** Not Started
+
+### Goal
+
+Beta goal.
+
+### Acceptance Criteria
+
+- [ ] Beta criterion
+"""
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "DEVPLAN.md").write_text(plan)
+        return tmp_path
+
+    def _args(self, project_dir: Path):
+        args = MagicMock()
+        args.projects = str(project_dir)
+        args.schedule = None
+        args.max_failures = 3
+        args.max_wall_clock = 1800
+        args.max_ai_retries = 3
+        args.log = None
+        return args
+
+    def _run_loop(self, tmp_path, monkeypatch, checks_return, monotonic=None):
+        from dtl import cmd_workflow_run
+
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        project_dir = self._make_project(tmp_path / "myproject")
+        plan_path = project_dir / "docs" / "DEVPLAN.md"
+
+        emitted: list[dict] = []
+
+        def fake_emit(cfg, event_type, payload, log):
+            emitted.append({"event": event_type, **payload})
+
+        stack = [
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_create_branch"),
+            patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            patch(
+                "dtl._load_notify_config",
+                return_value={"url": "https://example.com", "events": []},
+            ),
+            patch("dtl._emit_notify_event", side_effect=fake_emit),
+            patch(
+                "dtl.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="", stderr=""),
+            ),
+            patch("dtl.ai_run"),
+            patch("dtl._run_lint_and_tests", return_value=(True, "")),
+            patch("dtl._git_push_branch", return_value=True),
+            patch("dtl._gh_create_pr", return_value="https://github.com/org/repo/pull/7"),
+            patch("dtl._gh_enable_auto_merge", return_value=True),
+            # The PR never merges and is never closed -- the hang condition.
+            patch("dtl._gh_pr_state", return_value="OPEN"),
+            patch("dtl._gh_pr_checks", return_value=checks_return),
+            patch("dtl.time.sleep"),
+        ]
+        if monotonic is not None:
+            stack.append(patch("dtl.time.monotonic", side_effect=monotonic))
+
+        with contextlib.ExitStack() as es:
+            for ctx in stack:
+                es.enter_context(ctx)
+            cmd_workflow_run(self._args(project_dir))
+
+        return emitted, plan_path.read_text()
+
+    def test_red_ci_breaks_the_wait_and_marks_the_feature_blocked(self, tmp_path, monkeypatch):
+        emitted, plan_text = self._run_loop(tmp_path, monkeypatch, ("FAILING", ["lint-and-test"]))
+
+        assert "**Status:** Blocked (CI red" in plan_text
+        assert "lint-and-test" in plan_text
+        ci_failed = [e for e in emitted if e["event"] == "ci-failed"]
+        assert ci_failed, f"Expected a ci-failed event; got {emitted}"
+        assert ci_failed[0]["failing_checks"] == ["lint-and-test"]
+
+    def test_pending_forever_gives_up_at_the_deadline(self, tmp_path, monkeypatch):
+        """Checks that never complete must not wait past MERGE_WAIT_TIMEOUT_S."""
+        import dtl
+
+        # A clock that advances a full timeout per call. time.monotonic is consulted
+        # in several places in the loop, so we cannot assume which call sets the
+        # deadline -- an always-advancing clock guarantees the deadline is passed
+        # whichever call it was, without ever exhausting.
+        clock = {"t": 0.0}
+
+        def fake_monotonic() -> float:
+            clock["t"] += float(dtl.MERGE_WAIT_TIMEOUT_S)
+            return clock["t"]
+
+        emitted, plan_text = self._run_loop(
+            tmp_path, monkeypatch, ("PENDING", []), monotonic=fake_monotonic
+        )
+
+        assert "**Status:** Blocked (merge wait timed out" in plan_text
+        assert [e for e in emitted if e["event"] == "merge-timeout"], (
+            f"Expected a merge-timeout event; got {emitted}"
+        )
