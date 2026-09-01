@@ -28,6 +28,25 @@ dtl is a single-file Python scaffolder for containerized dev environments with A
 
 Add a `dtl workflow next` command that reads a DEVPLAN.md, finds the next unstarted feature, creates a feature branch off develop, and launches the AI with the feature spec as context.
 
+7. **CI installs a hand-listed dependency set, not the project's declared one.**
+   The template runs `pip install pytest` (and `pip install ruff`, unpinned). A repo
+   that declares test dependencies the correct way -- in `[project.optional-dependencies]
+   dev` or `requirements.txt` -- has them silently ignored by CI. On 2026-09-01 the
+   atrade overnight batch added `respx` to the `dev` extra, passed the local preflight
+   (which installs `-e .[dev]`), and red-failed CI on `ModuleNotFoundError: respx`.
+   The local preflight and CI must install from the SAME declaration.
+
+### Goal (addendum) -- CI parity entrypoint
+
+Defect 7 is a symptom of a structural problem: the steps CI runs are defined in
+`ci.yml`, and the steps the local preflight runs are defined separately in
+`_run_lint_and_tests`. Two definitions that must agree by discipline will
+eventually disagree, and the disagreement is only discovered on a PR at 02:00.
+
+Generate a single `scripts/ci.sh` holding the lint/format/test sequence. The
+scaffolded `ci.yml` invokes it, and `_run_lint_and_tests` invokes it when present.
+One script, two callers -- they cannot drift, because there is only one of them.
+
 ### Acceptance Criteria
 
 - [x] `dtl workflow next --plan docs/DEVPLAN.md` parses the plan and identifies the next feature with status "Not Started"
@@ -1236,6 +1255,13 @@ Defects 1–4 were found on the empty scaffold; 5–6 surfaced only once the fir
 - [ ] Scaffolded `.ai/notify.py` passes `ruff format --check` as generated (template is pre-formatted; assert in a test)
 - [ ] `security-scan` uses the gitleaks **CLI** against the working tree (`gitleaks dir .`) instead of `gitleaks-action`; no `GITHUB_TOKEN` / `pull-requests: write` needed; exits non-zero only on a real finding
 - [ ] `lint-and-test` installs the package before pytest (`pip install -e . ...`) so src-layout tests import cleanly
+- [ ] `lint-and-test` installs from the project's own declaration -- `-e '.[dev]'` when a `dev` extra exists, else `-r requirements.txt` -- and NEVER hand-lists test packages on the pip line
+- [ ] The generated install step has no `|| pip install ...` fallback; a broken extra must fail CI loudly rather than degrade to an incomplete environment
+- [ ] Scaffolded `ruff` install is pinned (`ruff==<version>`), matching the fleet convention
+- [ ] A generated `scripts/ci.sh` holds the lint/format/test sequence; the generated `ci.yml` calls it rather than restating the steps
+- [ ] `_run_lint_and_tests` runs `scripts/ci.sh` when the project has one, and falls back to today's behaviour when it does not (existing repos keep working)
+- [ ] A test asserts the generated `ci.yml` and `_run_lint_and_tests` execute the SAME script, so CI/local parity is enforced by a test rather than by discipline
+- [ ] A test scaffolds a project, adds a test that imports a package declared ONLY in the `dev` extra, and asserts the generated CI installs it (the exact atrade PR #7 failure)
 - [ ] `pip-audit` audits the project's deps in a clean venv (`python -m venv … && pip install -e . && pip-audit --skip-editable`), not the runner's ambient packages
 - [ ] A test scaffolds a python project and asserts the generated `ci.yml` (a) gates pytest, (b) uses the gitleaks CLI not the action, (c) installs the package before pytest, and (d) audits an isolated venv
 - [ ] A test asserts the generated `notify.py` is already ruff-formatted
