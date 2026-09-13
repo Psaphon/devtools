@@ -11,10 +11,11 @@ This file summarizes the repos in User's `~/Projects` directory and the cross-cu
 | **devtools** | CLI scaffolder and AI dev orchestrator (`dtl`) | Python 3.11, stdlib-only, single-file |
 | **morning-brief** | Automated daily news dashboard pipeline | Python 3.11, async httpx, SQLite, Ollama (Qwen 2.5 7B), Jinja2, Rich, Click, Cloudflare Pages |
 | **loom** | Overnight music-video pipeline (ComfyUI + ffmpeg) | Python 3.11, Click, httpx (async), librosa, ffmpeg subprocess, TOML, systemd timer |
-| **hub** | Headless, Tailnet-native, **persistent** workstation; the substrate the other private projects run on (supersedes `usb-autoinstall-public`) | Ubuntu Server 24.04 LTS, Ansible (konstruktoid.hardening), Tailscale, Docker + NVIDIA Container Toolkit, Ollama, ntfy, Glance/Beszel, Python 3.11 + Bash, systemd |
+| **hub** | Headless, Tailnet-native, **persistent** workstation; the substrate the other private projects run on (supersedes `usb-autoinstall-public`) | Ubuntu Server 26.04 LTS, Ansible (konstruktoid.hardening), Tailscale, Docker + NVIDIA Container Toolkit, Ollama, ntfy, Glance/Beszel, distro `python3` + Bash, systemd |
 | **usb-autoinstall-public** | Ephemeral security workstation USB installer — **ARCHIVED on GitHub**, superseded by `hub` | Bash, shellcheck, Ubuntu 25.10 autoinstall, 4-partition USB |
 | **ollama** | Local LLM management (separate from morning-brief) | Ollama runtime |
-| **Prompt-Fishing** | (purpose TBD here — read its own CLAUDE.md) | Next.js, TypeScript |
+| **atrade** | Low-frequency autonomous paper-trading bot; consumes morning-brief signals | Python |
+| **Prompt-Fishing** | **Parked indefinitely** — do not propose features | Next.js, TypeScript |
 | **water-monitor-infra** | Water quality monitoring infrastructure | TBD |
 | **log-sentinel** | Security log analysis | TBD |
 | **impact-etl** | Data pipeline for impact metrics | TBD |
@@ -41,14 +42,14 @@ Live planning artifacts in `~/Projects/NEW-PROJECTS/`. Scan this directory befor
 
 | Visibility | Auto-merge | Development model | Examples |
 |---|---|---|---|
-| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, loom, Prompt-Fishing, ollama |
-| Private | yes (on Pro) | overnight-scheduled, unattended | hub |
+| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, loom |
+| Private | yes (on Pro) | overnight-scheduled, unattended | hub, atrade |
 
 **Ephemeral workstation** — User's current development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent. **Exception in progress:** `hub` is being stood up as a *persistent*, non-ephemeral box (LUKS+TPM2 auto-unlock, no weekly rebuild) intended to become the daily driver and host the other projects. Once hub is live on real hardware, the weekly-rebuild assumption applies only to break-glass recovery, not a routine cadence — and this Hardware section should be updated to hub's specs.
 
 **LLM strategy** — local-first. Use Ollama (Qwen 2.5 7B on RTX 2060) for bulk work. Use Claude API only for synthesis or high-reasoning tasks where quality matters more than cost. Budget: $5-10/week total.
 
-**Remote access** — Tailscale mesh VPN. Phone access via Terminus SSH over Tailscale. the user manages projects from his phone via claude.ai and SSH terminal.
+**Remote access** — Tailscale mesh VPN. Phone access via Terminus SSH over Tailscale. the user manages projects from their phone via claude.ai and SSH terminal.
 
 **Scheduling** — systemd user units (`.service` + `.timer`) for batch jobs. `dtl workflow run --schedule HH:MM` for overnight autonomous development, typically 02:00 for off-peak electricity. GPU tenants share the 00:00–05:30 window: loom (00:00–05:30), morning-brief (starts 05:30).
 
