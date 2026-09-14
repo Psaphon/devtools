@@ -1,6 +1,6 @@
 # AI Development Prompt — scaffold-ci-greenable
 
-**Branch:** `feature/scaffold-ci-greenable`
+**Branch:** `fix/scaffold-ci-template`
 **Base:** `develop`
 
 Read `CLAUDE.md` for project context and `docs/DEVPLAN.md` for the full feature
@@ -69,6 +69,13 @@ That is how six defects shipped. Add, in `tests/`:
 - a test that the generated `notify.py` is already `ruff format` clean
 - the strongest one: scaffold a project, add one trivial importing test, and assert
   the generated CI logic actually goes green
+
+## Test that must not skip
+
+The "scaffold goes green" test must actually execute the generated `scripts/ci.sh`
+(in a temp dir, with a fresh venv) and assert exit 0. Do not mark it skip/xfail when
+something is missing: a skipped proof is the green-but-blind failure this feature
+exists to remove. The PM will rerun it on the host.
 
 ## Rules
 

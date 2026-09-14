@@ -152,6 +152,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install pytest
+        # ruff is a test dependency: tests run `ruff format --check` on generated files.
+        run: pip install pytest ruff==0.16.4
       - name: Run unit tests
         run: pytest tests/ -v
