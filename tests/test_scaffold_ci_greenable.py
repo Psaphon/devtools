@@ -10,7 +10,6 @@ Verifies that:
   [dev] but CI installed a hand-listed package set and never saw it).
 """
 
-import os
 import subprocess
 import sys
 import textwrap
@@ -29,7 +28,6 @@ from dtl import (
     make_notify_script,
     scaffold_project,
 )
-
 
 # ---------------------------------------------------------------------------
 # Defect 2: notify.py must ship ruff-formatted so the first push is green
@@ -165,9 +163,7 @@ def test_ci_parity_enforced_by_structure(tmp_path):
 
     called_cmd = mock_run.call_args_list[0][0][0]
     assert called_cmd[0] == "bash", "_run_lint_and_tests must use bash"
-    assert "ci.sh" in called_cmd[1], (
-        f"_run_lint_and_tests must invoke ci.sh, got {called_cmd[1]!r}"
-    )
+    assert "ci.sh" in called_cmd[1], f"_run_lint_and_tests must invoke ci.sh, got {called_cmd[1]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -185,14 +181,15 @@ def test_ci_yml_uses_gitleaks_cli_not_action():
     assert "gitleaks-action" not in content, (
         "ci.yml must not use gitleaks-action@v2 — needs GITHUB_TOKEN, fails on clean PRs"
     )
-    assert "gitleaks detect" in content, "ci.yml must use gitleaks CLI (gitleaks detect)"
+    assert "gitleaks dir ." in content, "ci.yml must scan the working tree with the gitleaks CLI"
+    assert "-C /usr/local/bin" not in content, "the runner user cannot write /usr/local/bin"
 
 
 def test_ci_yml_gitleaks_present_all_stacks():
     """gitleaks CLI must appear in all stack-generated CI workflows."""
     for stack_name, stack in STACKS.items():
         content = make_ci_workflow(stack_name, stack)
-        assert "gitleaks detect" in content, (
+        assert "gitleaks dir ." in content, (
             f"gitleaks CLI missing from generated ci.yml for stack {stack_name!r}"
         )
         assert "gitleaks-action" not in content, (
@@ -213,7 +210,7 @@ def test_ci_yml_pip_audit_uses_isolated_venv():
     The security-scan job always fails.  Audit a clean venv instead.
     """
     content = make_ci_workflow("myproject", STACKS["python"])
-    assert "python -m venv .audit-venv" in content, (
+    assert "python -m venv /tmp/auditenv" in content, (
         "pip-audit must run in an isolated venv, not the runner's ambient environment"
     )
     assert "--skip-editable" in content, (
@@ -249,72 +246,76 @@ def test_ci_scaffold_yml_no_hand_listed_test_deps():
 
 
 def test_scaffold_goes_green(tmp_path):
-    """A freshly scaffolded Python project with one importing test must pass CI.
+    """An untouched python scaffold plus one importing test must pass its own CI.
 
-    Executes the generated scripts/ci.sh in a fresh venv and asserts exit 0.
-    This catches the whole class of green-but-blind template bugs — not just the
-    known instances.  If something is missing in the generated CI logic this test
-    will fail, not silently pass.
+    Runs the generated scripts/ci.sh in a fresh venv and asserts exit 0. Three
+    things keep this honest:
+
+    - The scaffold's own pyproject.toml is used as generated, never rewritten, so
+      a scaffold that declares no test dependencies fails here as it would on CI.
+    - The test imports ``devonlyprobe``, a local package declared ONLY in the dev
+      extra. A CI that hand-lists its test packages cannot install it, so this is
+      the atrade PR #7 failure (respx declared in [dev], missing in CI) as a test.
+    - The subprocess cannot see the host's user site or ~/.local/bin, so a pytest
+      installed on the developer's machine cannot stand in for a missing one.
     """
     project_dir = scaffold_project("greentest", "python", [], tmp_path)
+    pyproject = project_dir / "pyproject.toml"
+    assert pyproject.exists(), "python scaffold must declare its own dependencies"
 
-    # Minimal pyproject.toml with pytest in [dev] — the source of truth for test deps.
-    # Mirrors the atrade project structure: test deps declared in dev extra only.
-    # Uses setuptools.build_meta (stable since setuptools ~43) for broad compatibility.
-    (project_dir / "pyproject.toml").write_text(
+    probe = tmp_path / "devonlyprobe"
+    (probe / "devonlyprobe").mkdir(parents=True)
+    (probe / "devonlyprobe" / "__init__.py").write_text("MARKER = 'dev-extra'\n")
+    (probe / "pyproject.toml").write_text(
         textwrap.dedent("""\
             [project]
-            name = "greentest"
-            version = "0.1.0"
-            requires-python = ">=3.11"
-
-            [project.optional-dependencies]
-            dev = ["pytest"]
+            name = "devonlyprobe"
+            version = "0.0.1"
 
             [build-system]
-            requires = ["setuptools"]
+            requires = ["setuptools>=61"]
             build-backend = "setuptools.build_meta"
         """)
     )
+    generated = pyproject.read_text()
+    assert 'dev = ["pytest"]' in generated
+    pyproject.write_text(
+        generated.replace(
+            'dev = ["pytest"]',
+            f'dev = ["pytest", "devonlyprobe @ {probe.as_uri()}"]',
+        )
+    )
 
-    # A trivial test that imports a package installed ONLY via the [dev] extra.
-    # If CI installs from a hand-listed set it may accidentally pass.
-    # If CI installs from [dev], it passes structurally — the only correct way.
     (project_dir / "tests" / "test_import.py").write_text(
         textwrap.dedent("""\
-            def test_dev_extra_installed():
-                import pytest  # available only when [dev] extra is installed
+            import devonlyprobe
 
-                assert pytest is not None
+
+            def test_dev_extra_installed():
+                assert devonlyprobe.MARKER == "dev-extra"
         """)
     )
 
     ci_sh = project_dir / "scripts" / "ci.sh"
     assert ci_sh.exists(), "Python scaffold must generate scripts/ci.sh"
 
-    # Create a fresh isolated venv.  Pre-install ruff and setuptools so that
-    # ci.sh's `pip install "ruff==X"` step is a fast no-op (already satisfied)
-    # and `pip install -e '.[dev]'` has a working build backend.  Uses pip's
-    # download cache — no fresh network download needed when packages have
-    # already been installed on this machine.
     venv_dir = tmp_path / ".ci-venv"
-    subprocess.run(
-        [sys.executable, "-m", "venv", str(venv_dir)],
-        check=True,
-        capture_output=True,
-    )
-    venv_pip = str(venv_dir / "bin" / "pip")
-    subprocess.run(
-        [venv_pip, "install", "-q", f"ruff=={RUFF_VERSION}", "setuptools"],
-        check=True,
-        capture_output=True,
-    )
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True, capture_output=True)
 
-    env = os.environ.copy()
-    venv_bin = str(venv_dir / "bin")
-    env["PATH"] = venv_bin + ":" + env.get("PATH", "")
-    env["VIRTUAL_ENV"] = str(venv_dir)
-    env.pop("PYTHONPATH", None)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    env = {
+        "PATH": f"{venv_dir / 'bin'}:/usr/bin:/bin",
+        "VIRTUAL_ENV": str(venv_dir),
+        "HOME": str(fake_home),
+        "PYTHONNOUSERSITE": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }
+    # Guard the guard: pytest must not be reachable before ci.sh installs it.
+    pre = subprocess.run(
+        ["bash", "-c", "command -v pytest"], env=env, capture_output=True, text=True, check=False
+    )
+    assert pre.returncode != 0, f"pytest leaked into the isolated env: {pre.stdout}"
 
     result = subprocess.run(
         ["bash", str(ci_sh)],
@@ -330,3 +331,4 @@ def test_scaffold_goes_green(tmp_path):
         f"--- stdout ---\n{result.stdout}\n"
         f"--- stderr ---\n{result.stderr}"
     )
+    assert "1 passed" in result.stdout, f"the importing test did not run:\n{result.stdout}"

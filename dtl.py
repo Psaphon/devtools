@@ -116,15 +116,15 @@ STACKS: dict[str, dict] = {
                 python-version: "3.12"
             - name: Dependency audit (pip-audit)
               run: |
-                python -m venv .audit-venv
-                .audit-venv/bin/pip install -q pip-audit
+                python -m venv /tmp/auditenv
+                /tmp/auditenv/bin/pip install -q --upgrade pip
                 if [ -f pyproject.toml ]; then
-                  .audit-venv/bin/pip install -q -e .
-                  .audit-venv/bin/pip-audit --skip-editable
+                  /tmp/auditenv/bin/pip install -q -e .
                 elif [ -f requirements.txt ]; then
-                  .audit-venv/bin/pip install -q -r requirements.txt
-                  .audit-venv/bin/pip-audit --skip-editable
+                  /tmp/auditenv/bin/pip install -q -r requirements.txt
                 fi
+                /tmp/auditenv/bin/pip install -q pip-audit
+                /tmp/auditenv/bin/pip-audit --skip-editable
         """),
     },
     "node": {
@@ -726,6 +726,32 @@ def make_precommit_config() -> str:
     """)
 
 
+def make_pyproject(name: str) -> str:
+    """Generate a minimal pyproject.toml for the python scaffold.
+
+    scripts/ci.sh installs test tooling only from the project's own declaration.
+    Without this file a fresh scaffold declares nothing, so CI has no pytest and
+    the first push fails; the dev extra is where test dependencies belong.
+    """
+    return textwrap.dedent(f"""\
+        [project]
+        name = "{name}"
+        version = "0.1.0"
+        requires-python = ">=3.11"
+        dependencies = []
+
+        [project.optional-dependencies]
+        dev = ["pytest"]
+
+        [build-system]
+        requires = ["setuptools>=61"]
+        build-backend = "setuptools.build_meta"
+
+        [tool.setuptools.packages.find]
+        where = ["src"]
+    """)
+
+
 def make_ci_sh(stack_name: str) -> str:
     """Generate scripts/ci.sh — the single CI/local parity entrypoint for Python projects.
 
@@ -802,12 +828,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install gitleaks
+      # gitleaks CLI against the working tree, unpacked to /tmp: the runner user
+      # cannot write /usr/local/bin. Same form as atrade's green CI.
+      - name: Secret scan (gitleaks)
         run: |
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz" \\
-            | tar -xz -C /usr/local/bin gitleaks
-      - name: Scan for secrets
-        run: gitleaks detect --source . --no-git
+          GL=8.24.3
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${{GL}}/gitleaks_${{GL}}_linux_x64.tar.gz" \\
+            | tar -xz -C /tmp gitleaks
+          /tmp/gitleaks dir . --redact -v
 {audit_block}
   ci-ok:
     runs-on: ubuntu-latest
@@ -1844,6 +1872,8 @@ def scaffold_project(
     if ci_sh_content:
         ci_sh_path = project_dir / "scripts" / "ci.sh"
         files[ci_sh_path] = ci_sh_content
+    if stack_name == "python":
+        files[project_dir / "pyproject.toml"] = make_pyproject(name)
 
     if services:
         files[project_dir / "docker-compose.yml"] = make_docker_compose(services)
