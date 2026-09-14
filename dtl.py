@@ -1361,8 +1361,15 @@ def make_ai_claude_dockerfile() -> str:
 def make_ai_claude_settings(
     ai_providers: list[str],
     mcp_servers: list[str] | None = None,
+    model: str | None = None,
 ) -> str:
-    """Generate Claude Code settings for the sandbox."""
+    """Generate Claude Code settings for the sandbox.
+
+    ``model`` is pinned in settings.json, which the container bind-mounts and the
+    CLI reads. Without a pin the sandbox runs on whatever the CLI defaults to,
+    which can change with an image rebuild. The default is the provider's
+    ``default_model`` alias (``sonnet``), so code writing stays on Sonnet.
+    """
     mcp_config: dict = {}
     for srv in mcp_servers or []:
         binary_name = MCP_KNOWN_PACKAGES.get(srv, srv).rsplit("/", 1)[-1]
@@ -1372,6 +1379,7 @@ def make_ai_claude_settings(
         }
 
     settings: dict = {
+        "model": model or AI_PROVIDERS_CONFIG["claude"]["default_model"],
         "permissions": {
             "allow": [
                 "Bash(*)",
@@ -1411,11 +1419,12 @@ def make_ai_docker_compose(
     lines = ["services:"]
 
     if provider == "claude":
-        model_env = ""
-        if model:
-            pconfig = AI_PROVIDERS_CONFIG["claude"]
-            model_id = pconfig["models"].get(model, model)
-            model_env = f"      - CLAUDE_MODEL={model_id}"
+        # Claude Code reads ANTHROPIC_MODEL; CLAUDE_MODEL is ignored, so the old
+        # variable left every sandbox on the CLI default. Pass the alias through
+        # ("sonnet", not a dated id) so the CLI resolves its current Sonnet.
+        model_env = (
+            f"      - ANTHROPIC_MODEL={model or AI_PROVIDERS_CONFIG['claude']['default_model']}"
+        )
 
         lines.extend(
             [
@@ -1445,8 +1454,7 @@ def make_ai_docker_compose(
                 "      - GIT_COMMITTER_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
             ]
         )
-        if model_env:
-            lines.append(model_env)
+        lines.append(model_env)
         lines.append("")
 
     elif provider == "openclaw":
@@ -1947,7 +1955,9 @@ def _ai_attach_docker(
 
     if provider == "claude":
         files[ai_dir / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
-        files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings([provider])
+        files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings(
+            [provider], model=model
+        )
 
     for path, content in files.items():
         path.write_text(content)
@@ -1995,7 +2005,7 @@ def _ai_attach_vm(
     if provider == "claude":
         files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
         files[ai_dir / "containers" / "claude-code" / "settings.json"] = make_ai_claude_settings(
-            ai_providers_list
+            ai_providers_list, model=model
         )
 
     for path, content in files.items():
