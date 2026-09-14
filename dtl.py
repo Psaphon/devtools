@@ -54,6 +54,14 @@ import urllib.request
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# Fleet-wide constants
+# ---------------------------------------------------------------------------
+
+# Pinned ruff version — used in generated scripts/ci.sh so that an upstream
+# ruff release cannot turn CI red with no change on our side.
+RUFF_VERSION = "0.16.4"
+
+# ---------------------------------------------------------------------------
 # Stack definitions
 # ---------------------------------------------------------------------------
 
@@ -98,18 +106,25 @@ STACKS: dict[str, dict] = {
               - uses: actions/setup-python@v5
                 with:
                   python-version: "3.12"
-              - run: pip install ruff pytest
-              - run: ruff check .
-              - run: ruff format --check .
-              - run: pytest --tb=short || true
+              - name: Run CI
+                run: bash scripts/ci.sh
         """),
         "claude_linter": "ruff check . && ruff format --check .",
         "security_audit_step": textwrap.dedent("""\
+            - uses: actions/setup-python@v5
+              with:
+                python-version: "3.12"
             - name: Dependency audit (pip-audit)
               run: |
-                pip install pip-audit
-                if [ -f requirements.txt ]; then pip-audit -r requirements.txt; fi
-                if [ -f pyproject.toml ]; then pip-audit; fi
+                python -m venv .audit-venv
+                .audit-venv/bin/pip install -q pip-audit
+                if [ -f pyproject.toml ]; then
+                  .audit-venv/bin/pip install -q -e .
+                  .audit-venv/bin/pip-audit --skip-editable
+                elif [ -f requirements.txt ]; then
+                  .audit-venv/bin/pip install -q -r requirements.txt
+                  .audit-venv/bin/pip-audit --skip-editable
+                fi
         """),
     },
     "node": {
@@ -711,6 +726,44 @@ def make_precommit_config() -> str:
     """)
 
 
+def make_ci_sh(stack_name: str) -> str:
+    """Generate scripts/ci.sh — the single CI/local parity entrypoint for Python projects.
+
+    Both ci.yml and _run_lint_and_tests invoke this script so the two callers
+    cannot drift: there is only one definition of the lint/format/test sequence.
+    """
+    if stack_name != "python":
+        return ""  # only Python uses scripts/ci.sh today
+    return textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        # CI lint/format/test script — ONE definition, two callers.
+        # .github/workflows/ci.yml and dtl's local preflight (_run_lint_and_tests)
+        # both invoke this script.  Change steps here; CI and local cannot drift
+        # because there is only one of them.
+        set -euo pipefail
+
+        # Ruff at the pinned fleet version — installed separately from project deps
+        # so the pin is always honoured even when the project omits ruff from [dev].
+        pip install -q "ruff=={RUFF_VERSION}"
+
+        # Install from the project's declared dependencies — never a hand-written list.
+        # Detecting the [project.optional-dependencies] section selects the right form.
+        # A broken extra must fail CI loudly; there is NO || fallback.
+        if [ -f pyproject.toml ] && grep -qE '^\\[project\\.optional-dependencies\\]' pyproject.toml; then
+            pip install -q -e '.[dev]'
+        elif [ -f requirements.txt ]; then
+            pip install -q -r requirements.txt
+        elif [ -f pyproject.toml ]; then
+            pip install -q -e .
+        fi
+
+        ruff check .
+        ruff format --check .
+        # Tolerate exit-5 (no tests collected on an empty scaffold); fail on all others.
+        pytest --tb=short || {{ rc=$?; [ "$rc" -eq 5 ] && exit 0 || exit "$rc"; }}
+    """)
+
+
 def make_ci_workflow(name: str, stack: dict) -> str:
     """Generate .github/workflows/ci.yml."""
     ci_setup = textwrap.indent(stack["ci_setup"].rstrip(), "      ")
@@ -749,9 +802,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
+      - name: Install gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz" \\
+            | tar -xz -C /usr/local/bin gitleaks
+      - name: Scan for secrets
+        run: gitleaks detect --source . --no-git
 {audit_block}
   ci-ok:
     runs-on: ubuntu-latest
@@ -802,17 +858,23 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
 
           - name: Lint (ruff)
             if: steps.pycheck.outputs.found == 'true'
-            run: pip install ruff && ruff check .
+            run: pip install "ruff==0.16.4" && ruff check .
 
           - name: Format check (ruff)
             if: steps.pycheck.outputs.found == 'true'
             run: ruff format --check .
 
-          - name: Test (pytest)
+          - name: Install deps and test (pytest)
             if: steps.pycheck.outputs.found == 'true'
             run: |
-              pip install pytest
-              pytest --tb=short -q; RET=$?; [ $RET -eq 5 ] && exit 0 || exit $RET
+              if [ -f pyproject.toml ] && grep -qE '^\\[project\\.optional-dependencies\\]' pyproject.toml; then
+                pip install -q -e '.[dev]'
+              elif [ -f requirements.txt ]; then
+                pip install -q -r requirements.txt
+              elif [ -f pyproject.toml ]; then
+                pip install -q -e .
+              fi
+              pytest --tb=short -q || { rc=$?; [ "$rc" -eq 5 ] && exit 0 || exit "$rc"; }
 
           - name: Shellcheck
             run: |
@@ -1487,11 +1549,13 @@ def make_notify_script() -> str:
 
         def send_telegram(token: str, chat_id: str, message: str) -> bool:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            data = urllib.parse.urlencode({
-                "chat_id": chat_id,
-                "text": message[:4096],
-                "parse_mode": "Markdown",
-            }).encode()
+            data = urllib.parse.urlencode(
+                {
+                    "chat_id": chat_id,
+                    "text": message[:4096],
+                    "parse_mode": "Markdown",
+                }
+            ).encode()
             req = urllib.request.Request(url, data=data)
             try:
                 urllib.request.urlopen(req, timeout=10)
@@ -1517,7 +1581,10 @@ def make_notify_script() -> str:
             chat_id = os.environ.get("TELEGRAM_CHAT_ID", notify.get("telegram_chat_id") or "")
 
             if not token or not chat_id:
-                print("[notify] Telegram not configured. Set token and chat_id in .ai/config.json", file=sys.stderr)
+                print(
+                    "[notify] Telegram not configured. Set token and chat_id in .ai/config.json",
+                    file=sys.stderr,
+                )
                 print("[notify] or via TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars.", file=sys.stderr)
                 sys.exit(1)
 
@@ -1746,6 +1813,7 @@ def scaffold_project(
         project_dir / "tests",
         project_dir / ".devcontainer",
         project_dir / ".github" / "workflows",
+        project_dir / "scripts",
     ]
 
     for d in dirs:
@@ -1769,11 +1837,23 @@ def scaffold_project(
         project_dir / ".env.example": make_env_example(services),
     }
 
+    # Generate scripts/ci.sh for stacks that use it (Python).  The script is
+    # the single source of truth for lint/format/test: ci.yml calls it, and
+    # _run_lint_and_tests calls it too, so CI and local cannot drift.
+    ci_sh_content = make_ci_sh(stack_name)
+    if ci_sh_content:
+        ci_sh_path = project_dir / "scripts" / "ci.sh"
+        files[ci_sh_path] = ci_sh_content
+
     if services:
         files[project_dir / "docker-compose.yml"] = make_docker_compose(services)
 
     for path, content in files.items():
         path.write_text(content)
+
+    # Make scripts/ci.sh executable
+    if ci_sh_content:
+        (project_dir / "scripts" / "ci.sh").chmod(0o755)
 
     # -- AI setup (if requested during project creation) --
     if ai_providers:
@@ -3747,6 +3827,27 @@ def _make_watchdog_timer(interval_minutes: int) -> str:
 
 def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
     """Run lint and tests in the project. Returns (passed, output)."""
+    # When a generated scripts/ci.sh exists it is the single source of truth for
+    # lint/format/test — the same script that ci.yml invokes.  Run it directly so
+    # the two callers cannot drift.  PIP_BREAK_SYSTEM_PACKAGES bypasses the PEP 668
+    # externally-managed-environment rejection on Debian/Ubuntu system Python; it is
+    # a no-op on venvs and CI runners that do not enforce PEP 668.
+    ci_sh = project_dir / "scripts" / "ci.sh"
+    if ci_sh.exists():
+        env = os.environ.copy()
+        env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+        result = subprocess.run(
+            ["bash", str(ci_sh)],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        return result.returncode == 0, result.stdout + result.stderr
+
+    # Fall back to the legacy per-stack behaviour for projects without scripts/ci.sh
+    # (existing scaffolded repos that predate this feature keep working unchanged).
     # Detect stack from files present
     lint_cmd = None
     test_cmd = None

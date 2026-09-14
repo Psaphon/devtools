@@ -1231,7 +1231,7 @@ Complements `pm/weekly-review.sh` (scans existing repos); this bakes scanning in
 
 **Branch:** `fix/scaffold-ci-template`
 **Depends on:** scaffold-security-scan, ci-aggregation-gate
-**Status:** Not Started
+**Status:** In Progress
 **Requires:** ai
 
 ### Goal
