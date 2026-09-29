@@ -16,11 +16,17 @@ import pytest
 import dtl
 
 
+# The real cached function, captured at import. Tests monkeypatch
+# dtl._docker_is_rootless, and monkeypatch may still be applied when this
+# fixture tears down (conftest's autouse fixtures set it up first).
+_DETECT = dtl._docker_is_rootless
+
+
 @pytest.fixture(autouse=True)
 def _fresh_detection() -> Iterator[None]:
-    dtl._docker_is_rootless.cache_clear()
+    _DETECT.cache_clear()
     yield
-    dtl._docker_is_rootless.cache_clear()
+    _DETECT.cache_clear()
 
 
 def _fake_info(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
