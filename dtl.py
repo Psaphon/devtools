@@ -2529,6 +2529,17 @@ def ai_run(
 
 def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
     """Send a notification via the configured provider."""
+    # A failed AI run also goes through notify.toml (ntfy on hub), which the
+    # Telegram-only notify.py below cannot reach.
+    if exit_code != 0:
+        notify_cfg = _load_notify_config()
+        if notify_cfg:
+            _emit_notify_event(
+                notify_cfg,
+                "ai-failure",
+                {"project": ai_dir.parent.name, "feature": "dtl ai run", "exit_code": exit_code},
+                logging.getLogger("dtl.notify"),
+            )
     config_path = ai_dir / "config.json"
     if not config_path.exists():
         return
@@ -3868,8 +3879,25 @@ def _watchdog_notify_project(
     anomalies: list[str],
     log: logging.Logger,
 ) -> None:
-    """Invoke a project's .ai/notify.py once with all anomaly details."""
+    """Report anomalies: via notify.toml when configured, else .ai/notify.py."""
     if not anomalies:
+        return
+    # notify.py only speaks Telegram, which is not wired on hub; without this the
+    # watchdog found problems and told no one.
+    notify_cfg = _load_notify_config()
+    if notify_cfg:
+        _emit_notify_event(
+            notify_cfg,
+            "needs-attention",
+            {
+                "project": project_dir.name,
+                "feature": "watchdog",
+                "criterion": "; ".join(anomalies),
+            },
+            log,
+        )
+        # notify.toml is the configured channel; running the Telegram-only
+        # notify.py too would log a false "NOT delivered" on hub.
         return
     notify_script = project_dir / ".ai" / "notify.py"
     if not notify_script.exists():
