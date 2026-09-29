@@ -245,7 +245,7 @@ def test_ci_scaffold_yml_no_hand_listed_test_deps():
 # ---------------------------------------------------------------------------
 
 
-def test_scaffold_goes_green(tmp_path):
+def test_scaffold_goes_green(tmp_path, exec_dir):
     """An untouched python scaffold plus one importing test must pass its own CI.
 
     Runs the generated scripts/ci.sh in a fresh venv and asserts exit 0. Three
@@ -299,7 +299,7 @@ def test_scaffold_goes_green(tmp_path):
     ci_sh = project_dir / "scripts" / "ci.sh"
     assert ci_sh.exists(), "Python scaffold must generate scripts/ci.sh"
 
-    venv_dir = tmp_path / ".ci-venv"
+    venv_dir = exec_dir / ".ci-venv"
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True, capture_output=True)
 
     fake_home = tmp_path / "home"

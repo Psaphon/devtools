@@ -212,55 +212,65 @@ def test_resolve_chain_three_providers(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _write_fake_docker(bin_dir: Path, exit_code: int) -> None:
-    """Put a `docker` on PATH that prints to stdout and exits `exit_code`."""
+def _write_fake_docker(bin_dir: Path, exit_code: int, calls: Path) -> None:
+    """Put a `docker` on PATH that prints to stdout and exits `exit_code`.
+
+    It appends a line to `calls` so tests can prove the fake (not the real
+    docker) ran.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
     fake = bin_dir / "docker"
     fake.write_text(
-        f'#!/usr/bin/env bash\necho "fake docker output"\nexit {exit_code}\n'
+        f'#!/usr/bin/env bash\necho "called" >> "{calls}"\n'
+        f'echo "fake docker output"\nexit {exit_code}\n'
     )
     fake.chmod(0o755)
 
 
-def _run_generated_script(tmp_path: Path, docker_exit: int):
+def _run_generated_script(tmp_path: Path, docker_exit: int, exec_dir: Path):
     """Generate the claude run.sh, stub docker, execute it, return the result."""
-    script = tmp_path / "run.sh"
+    # The generated script runs directly, so it must live where scripts can
+    # execute: tmp_path may be on a noexec /tmp (hub).
+    script = exec_dir / "run.sh"
     script.write_text(make_run_script("claude"))
     script.chmod(0o755)
-    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    (exec_dir / "docker-compose.yml").write_text("services: {}\n")
 
-    bin_dir = tmp_path / "bin"
-    _write_fake_docker(bin_dir, docker_exit)
+    bin_dir = exec_dir / "bin"
+    calls = exec_dir / "calls"
+    _write_fake_docker(bin_dir, docker_exit, calls)
 
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
-    return subprocess.run(
+    result = subprocess.run(
         [str(script), "do the thing"],
         capture_output=True,
         text=True,
         env=env,
         timeout=30,
     )
+    assert calls.exists(), "fake docker never ran; the real docker may have run instead"
+    return result
 
 
-def test_generated_run_script_propagates_failure_exit_code(tmp_path):
+def test_generated_run_script_propagates_failure_exit_code(tmp_path, exec_dir):
     """A failing container run must surface as a non-zero exit, not success."""
-    result = _run_generated_script(tmp_path, docker_exit=42)
+    result = _run_generated_script(tmp_path, exec_dir=exec_dir, docker_exit=42)
     assert result.returncode == 42, (
         f"run.sh swallowed the failure and exited {result.returncode}; "
         "the container's real status must reach the caller"
     )
 
 
-def test_generated_run_script_success_exits_zero(tmp_path):
+def test_generated_run_script_success_exits_zero(tmp_path, exec_dir):
     """The success path must still exit 0."""
-    result = _run_generated_script(tmp_path, docker_exit=0)
+    result = _run_generated_script(tmp_path, exec_dir=exec_dir, docker_exit=0)
     assert result.returncode == 0
 
 
-def test_generated_run_script_still_prints_output_on_failure(tmp_path):
+def test_generated_run_script_still_prints_output_on_failure(tmp_path, exec_dir):
     """Failure must not cost us the diagnostics — the output is how we debug."""
-    result = _run_generated_script(tmp_path, docker_exit=42)
+    result = _run_generated_script(tmp_path, exec_dir=exec_dir, docker_exit=42)
     assert "fake docker output" in result.stdout
 
 
