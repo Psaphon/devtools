@@ -1285,7 +1285,7 @@ The reference fix is the atrade `ci.yml` after PRs #1 and #2 (`Psaphon/atrade`),
 
 **Branch:** `fix/ai-sandbox-git-identity`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged (#73)
 **Requires:** ai
 
 ### Goal
@@ -1294,18 +1294,18 @@ Commits made inside the AI sandbox must carry the host repo's git identity. On h
 
 ### Acceptance Criteria
 
-- [ ] `_compose_env()` sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` (and the committer pair) from `git -C <project> config user.name/user.email` when they are not already set in the environment
-- [ ] When the project has no git identity configured, dtl prints a clear warning and leaves the variables unset (never invents one)
-- [ ] An explicitly exported `GIT_AUTHOR_NAME`/`EMAIL` in the environment wins over the repo config
-- [ ] Tests cover: identity from repo config, env override, missing identity warns
-- [ ] All tests pass
-- [ ] Lint clean
+- [x] `_compose_env()` sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` (and the committer pair) from `git -C <project> config user.name/user.email` when they are not already set in the environment
+- [x] When the project has no git identity configured, dtl prints a clear warning and leaves the variables unset (never invents one)
+- [x] An explicitly exported `GIT_AUTHOR_NAME`/`EMAIL` in the environment wins over the repo config
+- [x] Tests cover: identity from repo config, env override, missing identity warns
+- [x] All tests pass
+- [x] Lint clean
 
 ## Feature: ai-sandbox-project-test-tools
 
 **Branch:** `fix/ai-sandbox-test-tools`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged (#75)
 **Requires:** ai
 
 ### Goal
@@ -1314,18 +1314,18 @@ The AI must be able to run the project's own lint and tests inside the sandbox b
 
 ### Acceptance Criteria
 
-- [ ] The generated sandbox prompt preamble (or `run.sh`) creates a venv in the container (not in the bind-mounted repo) and installs the project from its own declaration: `-e '.[dev]'` when a `dev` extra exists, else `-r requirements.txt`, else nothing
-- [ ] When the project has `scripts/ci.sh`, the AI is told to run that before committing
-- [ ] The install never writes into the repo working tree (no venv or egg-info left behind to dirty `git status`)
-- [ ] A test proves a project with a `dev` extra gets its test tools, and one with neither declaration still runs
-- [ ] All tests pass
-- [ ] Lint clean
+- [x] The generated sandbox prompt preamble (or `run.sh`) creates a venv in the container (not in the bind-mounted repo) and installs the project from its own declaration: `-e '.[dev]'` when a `dev` extra exists, else `-r requirements.txt`, else nothing
+- [x] When the project has `scripts/ci.sh`, the AI is told to run that before committing
+- [x] The install never writes into the repo working tree (no venv or egg-info left behind to dirty `git status`)
+- [x] A test proves a project with a `dev` extra gets its test tools, and one with neither declaration still runs
+- [x] All tests pass
+- [x] Lint clean
 
 ## Feature: test-hygiene-hub
 
 **Branch:** `fix/test-hygiene-hub`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged (#74)
 **Requires:** ai
 
 ### Goal
@@ -1336,17 +1336,17 @@ devtools' own test suite must not touch the real machine. Found on hub 2026-09-2
 
 ### Acceptance Criteria
 
-- [ ] An autouse fixture points dtl's state directory (and any other per-user path dtl writes) at `tmp_path` for every test; a test asserts nothing is written under the real `~/.local/state/dtl` during the suite
-- [ ] Fake CLIs fail closed: fakes are provided so that a non-executable fake can never fall through to a real binary (e.g. `BASH_FUNC_<name>%%` functions, or a PATH containing only a symlink dir of the needed tools)
-- [ ] The suite passes with `TMPDIR` on a `noexec` mount (simulate with a check that the fake actually ran, not the real tool)
-- [ ] All tests pass
-- [ ] Lint clean
+- [x] An autouse fixture points dtl's state directory (and any other per-user path dtl writes) at `tmp_path` for every test; a test asserts nothing is written under the real `~/.local/state/dtl` during the suite
+- [x] Fake CLIs fail closed: fakes are provided so that a non-executable fake can never fall through to a real binary (e.g. `BASH_FUNC_<name>%%` functions, or a PATH containing only a symlink dir of the needed tools)
+- [x] The suite passes with `TMPDIR` on a `noexec` mount (simulate with a check that the fake actually ran, not the real tool)
+- [x] All tests pass
+- [x] Lint clean
 
 ## Feature: notify-ntfy-native
 
 **Branch:** `feature/notify-ntfy-native`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged (#76, #77)
 **Requires:** ai
 
 ### Goal
@@ -1355,10 +1355,10 @@ devtools' own test suite must not touch the real machine. Found on hub 2026-09-2
 
 ### Acceptance Criteria
 
-- [ ] A `format = "ntfy"` option in `~/.config/dtl/notify.toml` sends ntfy-native messages: a human-readable one-line body, and `Title`, `Priority` and `Tags` headers per event type (`ai-failure` and `needs-attention` high, `feature-merged` default, `idle` low)
-- [ ] The default (`format = "json"`) keeps today's JSON POST exactly, so existing receivers keep working
-- [ ] `dtl notify test` sends through the configured format
-- [ ] docs/notify.md documents the hub config (`url = "http://127.0.0.1:2586/hub-alerts"`, `format = "ntfy"`)
-- [ ] Tests assert the exact headers and body for each event type, against a local HTTP server (real request, not a mocked urlopen)
-- [ ] All tests pass
-- [ ] Lint clean
+- [x] A `format = "ntfy"` option in `~/.config/dtl/notify.toml` sends ntfy-native messages: a human-readable one-line body, and `Title`, `Priority` and `Tags` headers per event type (`ai-failure` and `needs-attention` high, `feature-merged` default, `idle` low)
+- [x] The default (`format = "json"`) keeps today's JSON POST exactly, so existing receivers keep working
+- [x] `dtl notify test` sends through the configured format
+- [x] docs/notify.md documents the hub config (`url = "http://127.0.0.1:2586/hub-alerts"`, `format = "ntfy"`)
+- [x] Tests assert the exact headers and body for each event type, against a local HTTP server (real request, not a mocked urlopen)
+- [x] All tests pass
+- [x] Lint clean
