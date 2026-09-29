@@ -568,6 +568,8 @@ class TestCmdWorkflowRunLogPath:
 
         project_dir = self._make_project(tmp_path / "proj")
         monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+        # Fall back under a fake HOME so the real ~/.local/state is never written.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
         args = MagicMock()
         args.projects = str(project_dir)
