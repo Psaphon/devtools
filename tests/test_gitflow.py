@@ -107,13 +107,13 @@ class TestRunLintAndTests:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             passed, output = _run_lint_and_tests(tmp_path)
         assert passed
-        assert mock_run.call_count == 3  # pip install + lint + test
+        assert mock_run.call_count == 5  # venv + pip install + pytest probe + lint + test
 
     def test_lint_failure_stops_early(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
 
         def fake_run(cmd, **kwargs):
-            if "pip" in " ".join(str(c) for c in cmd):
+            if "pip" in " ".join(str(c) for c in cmd) or "-c" in cmd or "venv" in cmd:
                 return MagicMock(returncode=0, stdout="", stderr="")
             return MagicMock(returncode=1, stdout="", stderr="lint error")
 
@@ -221,9 +221,7 @@ class TestCmdWorkflowFinish:
             patch("dtl._run_lint_and_tests", return_value=(True, "all passed")),
             patch("dtl._git_is_dirty", return_value=False),
             patch("dtl._git_push_branch", return_value=True),
-            patch(
-                "dtl._gh_create_pr", return_value="https://github.com/test/pr/1"
-            ) as mock_pr,
+            patch("dtl._gh_create_pr", return_value="https://github.com/test/pr/1") as mock_pr,
             patch("dtl.subprocess.run"),  # for git add/commit/push of status
         ):
             cmd_workflow_finish(args)

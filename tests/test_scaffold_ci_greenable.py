@@ -157,7 +157,10 @@ def test_ci_parity_enforced_by_structure(tmp_path):
     assert "bash scripts/ci.sh" in ci_yml, "ci.yml must call scripts/ci.sh"
 
     # _run_lint_and_tests also calls the same script
-    with patch("dtl.subprocess.run") as mock_run:
+    with (
+        patch("dtl._project_venv", return_value=tmp_path / "venv"),
+        patch("dtl.subprocess.run") as mock_run,
+    ):
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
         _run_lint_and_tests(project_dir)
 

@@ -1,6 +1,6 @@
 """Shared fixtures: keep the suite off the real machine.
 
-- Every test gets its own XDG_STATE_HOME / XDG_CONFIG_HOME under tmp_path.
+- Every test gets its own XDG_STATE_HOME / XDG_CONFIG_HOME / XDG_CACHE_HOME under tmp_path.
 - A session guard fails the run if the real dtl state dir was touched.
 - ``exec_dir`` hands out a scratch dir that is executable even when /tmp is
   mounted noexec, so fake CLIs really run instead of falling through to the
@@ -77,10 +77,13 @@ def _isolated_xdg(
     root = tmp_path_factory.mktemp("xdg")
     state = root / "state"
     config = root / "config"
+    cache = root / "cache"
     state.mkdir()
     config.mkdir()
+    cache.mkdir()
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
 
 
 @pytest.fixture
