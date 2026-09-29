@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
+    RUFF_VERSION,
     RunOutcome,
     _build_ai_prompt,
     _check_install_freshness,
@@ -929,9 +930,8 @@ class TestRunLintAndTestsPipInstall:
 
         assert pip_calls, "Expected at least one pip install call"
         assert any("pip" in " ".join(c) for c in pip_calls)
-        assert any("--break-system-packages" in c for c in pip_calls), (
-            "pip command must include --break-system-packages (PEP 668 / ephemeral workstation)"
-        )
+        assert all("--break-system-packages" not in c for c in pip_calls)
+        assert any(f"ruff=={RUFF_VERSION}" in c for c in pip_calls)
 
     def test_no_pyproject_skips_pip_install(self, tmp_path):
         """When no pyproject.toml, pip install is never called."""
@@ -964,26 +964,24 @@ class TestRunLintAndTestsPipInstall:
         assert not passed
         assert "pip error" in output
 
-    def test_dev_extra_failure_falls_back_to_plain_install(self, tmp_path):
-        """If .[dev] install fails, falls back to plain editable install."""
-        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
-
-        call_count = {"n": 0}
+    def test_dev_extra_is_installed_when_declared(self, tmp_path):
+        """A project declaring a dev extra is installed with .[dev]."""
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\nname = 'test'\n[project.optional-dependencies]\ndev = ['pytest']\n"
+        )
+        pip_calls = []
 
         def fake_run(cmd, **kwargs):
             if "pip" in " ".join(str(c) for c in cmd):
-                call_count["n"] += 1
-                # First pip call (.[dev]) fails, second (plain) succeeds
-                if call_count["n"] == 1:
-                    return MagicMock(returncode=1, stdout="", stderr="no extra 'dev'")
-                return MagicMock(returncode=0, stdout="", stderr="")
+                pip_calls.append(list(cmd))
             return MagicMock(returncode=0, stdout="", stderr="")
 
         with patch("dtl.subprocess.run", side_effect=fake_run):
-            passed, output = _run_lint_and_tests(tmp_path)
+            passed, _ = _run_lint_and_tests(tmp_path)
 
-        assert call_count["n"] == 2, "Expected fallback to second pip install"
         assert passed
+        assert len(pip_calls) == 1
+        assert ".[dev]" in pip_calls[0]
 
 
 # ---------------------------------------------------------------------------

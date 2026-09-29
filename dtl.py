@@ -50,6 +50,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -2421,6 +2422,7 @@ def ai_run(
             else:
                 print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
+            prompt = _sandbox_tooling_note(project_dir) + prompt
             if max_wall_clock:
                 print(f"[dtl ai run] Wall-clock limit: {max_wall_clock}s")
             if max_ai_retries:
@@ -3955,96 +3957,178 @@ def _make_watchdog_timer(interval_minutes: int) -> str:
     )
 
 
+def _is_python_project(project_dir: Path) -> bool:
+    return any(
+        (project_dir / f).exists() for f in ("pyproject.toml", "setup.py", "requirements.txt")
+    )
+
+
+def _has_dev_extra(project_dir: Path) -> bool:
+    """True when pyproject.toml declares a ``dev`` optional-dependencies extra."""
+    pyproject = project_dir / "pyproject.toml"
+    if not pyproject.exists():
+        return False
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return "dev" in data.get("project", {}).get("optional-dependencies", {})
+
+
+def _project_venv(project_dir: Path) -> Path:
+    """Return the per-project venv path, creating the venv if missing.
+
+    Lives under $XDG_CACHE_HOME/dtl/venvs (never inside the project directory),
+    keyed by project name plus a short hash of the absolute path.
+    """
+    resolved = project_dir.resolve()
+    xdg = os.environ.get("XDG_CACHE_HOME", "")
+    cache = Path(xdg) if xdg else Path.home() / ".cache"
+    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+    venv = cache / "dtl" / "venvs" / f"{resolved.name}-{digest}"
+    if not (venv / "bin" / "python").exists():
+        venv.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    return venv
+
+
+def _venv_env(venv: Path) -> dict[str, str]:
+    """Environment that activates ``venv`` (no PEP 668 override)."""
+    env = os.environ.copy()
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PATH"] = f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    env.pop("PIP_BREAK_SYSTEM_PACKAGES", None)
+    return env
+
+
+def _sandbox_tooling_note(project_dir: Path) -> str:
+    """Prompt preamble telling the sandboxed AI how to get lint/test tools."""
+    if not _is_python_project(project_dir):
+        return ""
+    name = project_dir.name
+    note = (
+        f"Sandbox tooling: the container has no project test tools preinstalled. "
+        f"Create a venv OUTSIDE /workspace with `python3 -m venv /home/claude/.venvs/{name}` "
+        f"(so `git status` stays clean), then install the project from its own declaration "
+        f"with that venv's pip: `-e '.[dev]'` when a `dev` extra exists, else "
+        f"`-r requirements.txt`, else `-e .`, plus `ruff=={RUFF_VERSION}`. "
+        f"Do not hand-install other test tools."
+    )
+    if (project_dir / "scripts" / "ci.sh").exists():
+        note += (
+            " Before committing, run `bash scripts/ci.sh` with that venv active "
+            f"(`. /home/claude/.venvs/{name}/bin/activate`)."
+        )
+    return note + "\n\n"
+
+
 def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
     """Run lint and tests in the project. Returns (passed, output)."""
+    python_project = _is_python_project(project_dir)
+    venv_env: dict[str, str] | None = None
+    if python_project:
+        try:
+            venv = _project_venv(project_dir)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            return False, f"=== venv ===\nCould not create project venv: {detail}"
+        venv_env = _venv_env(venv)
+
     # When a generated scripts/ci.sh exists it is the single source of truth for
     # lint/format/test — the same script that ci.yml invokes.  Run it directly so
-    # the two callers cannot drift.  PIP_BREAK_SYSTEM_PACKAGES bypasses the PEP 668
-    # externally-managed-environment rejection on Debian/Ubuntu system Python; it is
-    # a no-op on venvs and CI runners that do not enforce PEP 668.
+    # the two callers cannot drift; it installs from the project's own declaration.
     ci_sh = project_dir / "scripts" / "ci.sh"
     if ci_sh.exists():
-        env = os.environ.copy()
-        env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
         result = subprocess.run(
             ["bash", str(ci_sh)],
             cwd=project_dir,
             capture_output=True,
             text=True,
             check=False,
-            env=env,
+            env=venv_env,
         )
         return result.returncode == 0, result.stdout + result.stderr
 
     # Fall back to the legacy per-stack behaviour for projects without scripts/ci.sh
     # (existing scaffolded repos that predate this feature keep working unchanged).
-    # Detect stack from files present
-    lint_cmd = None
-    test_cmd = None
-    if (project_dir / "pyproject.toml").exists() or (project_dir / "setup.py").exists():
-        lint_cmd = ["ruff", "check", "."]
-        test_cmd = ["pytest", "--tb=short"]
-    elif (project_dir / "package.json").exists():
-        lint_cmd = ["npm", "run", "lint"]
-        test_cmd = ["npm", "test"]
-    elif (project_dir / "go.mod").exists():
-        lint_cmd = ["golangci-lint", "run"]
-        test_cmd = ["go", "test", "./..."]
-    elif (project_dir / "Cargo.toml").exists():
-        lint_cmd = ["cargo", "clippy"]
-        test_cmd = ["cargo", "test"]
+    output_parts: list[str] = []
 
-    output_parts = []
-
-    if (project_dir / "pyproject.toml").exists():
-        # --break-system-packages bypasses PEP 668 rejection on Debian/Ubuntu system
-        # Python. Safe here: the ephemeral USB workstation's system Python is rebuilt
-        # weekly, so installing into site-packages has no durable downside. The flag
-        # is a no-op on venvs and CI runners that don't enforce PEP 668.
+    if python_project and venv_env is not None:
+        venv_python = str(Path(venv_env["VIRTUAL_ENV"]) / "bin" / "python")
+        if _has_dev_extra(project_dir):
+            target = ["-e", ".[dev]"]
+        elif (project_dir / "requirements.txt").exists():
+            target = ["-r", "requirements.txt"]
+        else:
+            target = ["-e", "."]
         pip_cmd = [
-            sys.executable,
+            venv_python,
             "-m",
             "pip",
             "install",
-            "-e",
-            ".[dev]",
             "--quiet",
-            "--break-system-packages",
+            *target,
+            f"ruff=={RUFF_VERSION}",
         ]
         pip_result = subprocess.run(
-            pip_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+            pip_cmd,
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=venv_env,
         )
-        if pip_result.returncode != 0:
-            pip_cmd = [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-e",
-                ".",
-                "--quiet",
-                "--break-system-packages",
-            ]
-            pip_result = subprocess.run(
-                pip_cmd, cwd=project_dir, capture_output=True, text=True, check=False
-            )
         output_parts.append(f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}")
         if pip_result.returncode != 0:
             return False, "\n".join(output_parts)
 
-    if lint_cmd:
-        result = subprocess.run(
-            lint_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+        probe = subprocess.run(
+            [venv_python, "-c", "import pytest"],
+            cwd=project_dir,
+            capture_output=True,
+            check=False,
+            env=venv_env,
         )
-        output_parts.append(f"=== lint ({' '.join(lint_cmd)}) ===\n{result.stdout}{result.stderr}")
-        if result.returncode != 0:
+        if probe.returncode != 0:
+            output_parts.append(
+                "pytest is not installed after installing the project's own declaration "
+                f"({' '.join(target)}). Declare it in the project's dev extra "
+                "(pyproject.toml [project.optional-dependencies] dev) or requirements.txt."
+            )
             return False, "\n".join(output_parts)
 
-    if test_cmd:
+        steps = [
+            ("lint (ruff check .)", ["ruff", "check", "."]),
+            ("test (pytest --tb=short)", ["pytest", "--tb=short"]),
+        ]
+    elif (project_dir / "package.json").exists():
+        steps = [
+            ("lint (npm run lint)", ["npm", "run", "lint"]),
+            ("test (npm test)", ["npm", "test"]),
+        ]
+    elif (project_dir / "go.mod").exists():
+        steps = [
+            ("lint (golangci-lint run)", ["golangci-lint", "run"]),
+            ("test (go test ./...)", ["go", "test", "./..."]),
+        ]
+    elif (project_dir / "Cargo.toml").exists():
+        steps = [
+            ("lint (cargo clippy)", ["cargo", "clippy"]),
+            ("test (cargo test)", ["cargo", "test"]),
+        ]
+    else:
+        steps = []
+
+    for label, cmd in steps:
         result = subprocess.run(
-            test_cmd, cwd=project_dir, capture_output=True, text=True, check=False
+            cmd, cwd=project_dir, capture_output=True, text=True, check=False, env=venv_env
         )
-        output_parts.append(f"=== test ({' '.join(test_cmd)}) ===\n{result.stdout}{result.stderr}")
+        output_parts.append(f"=== {label} ===\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return False, "\n".join(output_parts)
 
