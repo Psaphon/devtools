@@ -2089,7 +2089,7 @@ def ai_start(project_dir: Path) -> None:
         if provider == "claude":
             # UID is a bash builtin that is never exported, so the hint sets it
             # through env(1); without it the sandbox runs as uid 1000.
-            env = _compose_env()
+            env = _compose_env(project_dir)
             print("[dtl ai] Interactive session:")
             print(
                 f"  env UID={env['UID']} GID={env['GID']} "
@@ -2445,7 +2445,7 @@ def ai_run(
             try:
                 exit_code, output_lines = _run_ai_with_limits(
                     cmd,
-                    _compose_env(),
+                    _compose_env(project_dir),
                     max_wall_clock,
                     max_ai_retries,
                 )
@@ -2571,7 +2571,7 @@ def _docker_is_rootless() -> bool:
     return "name=rootless" in out
 
 
-def _compose_env() -> dict[str, str]:
+def _compose_env(project_dir: Path | None = None) -> dict[str, str]:
     """Environment for `docker compose`, with UID/GID set for the sandbox user.
 
     The compose file runs the sandbox as ${UID}:${GID}, but bash never exports
@@ -2579,13 +2579,54 @@ def _compose_env() -> dict[str, str]:
     is the host user and uid 1000 is an unrelated subordinate id that cannot
     write the bind-mounted repo (hub, 2026-09-29), so the sandbox runs as 0:0
     there. It is not host root: the daemon itself runs as the user.
+
+    With a project_dir, the repo's git user.name/user.email become the sandbox's
+    GIT_AUTHOR_*/GIT_COMMITTER_* unless already exported; without an identity
+    the variables stay unset and the compose template default applies.
     """
     env = {**os.environ}
     if _docker_is_rootless():
         env["UID"] = env["GID"] = "0"
     else:
         env["UID"], env["GID"] = str(os.getuid()), str(os.getgid())
+    if project_dir is not None:
+        _apply_git_identity(env, project_dir)
     return env
+
+
+def _apply_git_identity(env: dict[str, str], project_dir: Path) -> None:
+    """Fill unset GIT_AUTHOR_*/GIT_COMMITTER_* in env from the repo's git config."""
+    pairs = {"name": "NAME", "email": "EMAIL"}
+    if all(
+        f"GIT_{role}_{sfx}" in env for sfx in pairs.values() for role in ("AUTHOR", "COMMITTER")
+    ):
+        return
+
+    values: dict[str, str] = {}
+    for field in pairs:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(project_dir), "config", f"user.{field}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            break
+        value = result.stdout.strip() if result.returncode == 0 else ""
+        if value:
+            values[field] = value
+
+    if len(values) < len(pairs):
+        print(
+            f"[dtl ai] warning: no git user.name/user.email in {project_dir}; "
+            "sandbox commits will use the template default",
+            file=sys.stderr,
+        )
+        return
+    for field, suffix in pairs.items():
+        for role in ("AUTHOR", "COMMITTER"):
+            env.setdefault(f"GIT_{role}_{suffix}", values[field])
 
 
 def _run_cmd(cmd: list[str]) -> int:

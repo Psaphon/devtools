@@ -9,6 +9,7 @@ file runs as ${UID}:${GID}, which bash never exports, so it always ran as 1000
 import os
 import subprocess
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -85,3 +86,51 @@ def test_templates_own_home_by_the_run_uid() -> None:
         '        HOME_UID: "${UID:-1000}"',
         '        HOME_GID: "${GID:-1000}"',
     ]
+
+
+_GIT_VARS = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
+
+
+def _git_repo(path: Path, identity: bool) -> Path:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    if identity:
+        subprocess.run(["git", "-C", str(path), "config", "user.name", "Ada Lovelace"], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "config", "user.email", "ada@example.org"], check=True
+        )
+    return path
+
+
+@pytest.fixture
+def _clean_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in _GIT_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(dtl, "_docker_is_rootless", lambda: False)
+
+
+@pytest.mark.usefixtures("_clean_git_env")
+def test_sandbox_commits_as_the_repo_identity(tmp_path: Path) -> None:
+    env = dtl._compose_env(_git_repo(tmp_path, identity=True))
+    assert env["GIT_AUTHOR_NAME"] == env["GIT_COMMITTER_NAME"] == "Ada Lovelace"
+    assert env["GIT_AUTHOR_EMAIL"] == env["GIT_COMMITTER_EMAIL"] == "ada@example.org"
+
+
+@pytest.mark.usefixtures("_clean_git_env")
+def test_exported_git_identity_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Exported")
+    env = dtl._compose_env(_git_repo(tmp_path, identity=True))
+    assert env["GIT_AUTHOR_NAME"] == "Exported"
+    assert env["GIT_COMMITTER_NAME"] == "Ada Lovelace"
+
+
+@pytest.mark.usefixtures("_clean_git_env")
+def test_no_repo_identity_stays_unset_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Isolate from the developer's global/system git config.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    env = dtl._compose_env(_git_repo(tmp_path, identity=False))
+    assert not any(var in env for var in _GIT_VARS)
+    err = capsys.readouterr().err
+    assert err.count("[dtl ai] warning: no git user.name/user.email") == 1
