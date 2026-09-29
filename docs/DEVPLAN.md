@@ -1280,3 +1280,85 @@ Defects 1–4 were found on the empty scaffold; 5–6 surfaced only once the fir
 ### Notes
 
 The reference fix is the atrade `ci.yml` after PRs #1 and #2 (`Psaphon/atrade`), which is green across all jobs with a real importing test suite (defects 1–4 fixed in #1, 5–6 in #2). The deeper lesson: `scaffold-security-scan`'s tests asserted the job was *generated*, never that a scaffold *passes* — so add a test that runs the generated CI logic, not just diffs the YAML. Tracked in PM memory `project_dtl_scaffold_ci_pytest_gate`.
+
+## Feature: ai-sandbox-git-identity
+
+**Branch:** `fix/ai-sandbox-git-identity`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+Commits made inside the AI sandbox must carry the host repo's git identity. On hub (2026-09-29, first supervised `dtl ai run`) the commit came out as `Developer <dev@localhost>`: the compose template falls back to those defaults when `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` are unset, and nothing sets them.
+
+### Acceptance Criteria
+
+- [ ] `_compose_env()` sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` (and the committer pair) from `git -C <project> config user.name/user.email` when they are not already set in the environment
+- [ ] When the project has no git identity configured, dtl prints a clear warning and leaves the variables unset (never invents one)
+- [ ] An explicitly exported `GIT_AUTHOR_NAME`/`EMAIL` in the environment wins over the repo config
+- [ ] Tests cover: identity from repo config, env override, missing identity warns
+- [ ] All tests pass
+- [ ] Lint clean
+
+## Feature: ai-sandbox-project-test-tools
+
+**Branch:** `fix/ai-sandbox-test-tools`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+The AI must be able to run the project's own lint and tests inside the sandbox before committing. On hub the sandbox had no `ruff`, `pytest` or `pyyaml`, so the AI improvised a throwaway venv in `/tmp`. Follow the fleet CI rule: install from the project's own declaration, never a hand-list.
+
+### Acceptance Criteria
+
+- [ ] The generated sandbox prompt preamble (or `run.sh`) creates a venv in the container (not in the bind-mounted repo) and installs the project from its own declaration: `-e '.[dev]'` when a `dev` extra exists, else `-r requirements.txt`, else nothing
+- [ ] When the project has `scripts/ci.sh`, the AI is told to run that before committing
+- [ ] The install never writes into the repo working tree (no venv or egg-info left behind to dirty `git status`)
+- [ ] A test proves a project with a `dev` extra gets its test tools, and one with neither declaration still runs
+- [ ] All tests pass
+- [ ] Lint clean
+
+## Feature: test-hygiene-hub
+
+**Branch:** `fix/test-hygiene-hub`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+devtools' own test suite must not touch the real machine. Found on hub 2026-09-29:
+1. Workflow tests wrote into the **real** `~/.local/state/dtl` (`workflow.log`, `*-workflow-state.json` named after tests). On hub that could overwrite a real overnight run's state.
+2. Tests that fake `docker`/`git`/`claude` by writing scripts into `tmp_path` fall through to the **real** binary when `/tmp` is mounted `noexec` (bash skips a file it cannot execute). hub mounts `/tmp` noexec; GitHub CI does not, so this only bites on hub.
+
+### Acceptance Criteria
+
+- [ ] An autouse fixture points dtl's state directory (and any other per-user path dtl writes) at `tmp_path` for every test; a test asserts nothing is written under the real `~/.local/state/dtl` during the suite
+- [ ] Fake CLIs fail closed: fakes are provided so that a non-executable fake can never fall through to a real binary (e.g. `BASH_FUNC_<name>%%` functions, or a PATH containing only a symlink dir of the needed tools)
+- [ ] The suite passes with `TMPDIR` on a `noexec` mount (simulate with a check that the fake actually ran, not the real tool)
+- [ ] All tests pass
+- [ ] Lint clean
+
+## Feature: notify-ntfy-native
+
+**Branch:** `feature/notify-ntfy-native`
+**Depends on:** none
+**Status:** Not Started
+**Requires:** ai
+
+### Goal
+
+`dtl workflow` notifications must be readable on the phone. Today dtl POSTs a raw JSON body with `Content-Type: application/json` to the configured URL; ntfy shows that JSON verbatim as the message. hub has ntfy on `http://127.0.0.1:2586` (hub cannot resolve `*.ts.net`), topic `hub-alerts`.
+
+### Acceptance Criteria
+
+- [ ] A `format = "ntfy"` option in `~/.config/dtl/notify.toml` sends ntfy-native messages: a human-readable one-line body, and `Title`, `Priority` and `Tags` headers per event type (`ai-failure` and `needs-attention` high, `feature-merged` default, `idle` low)
+- [ ] The default (`format = "json"`) keeps today's JSON POST exactly, so existing receivers keep working
+- [ ] `dtl notify test` sends through the configured format
+- [ ] docs/notify.md documents the hub config (`url = "http://127.0.0.1:2586/hub-alerts"`, `format = "ntfy"`)
+- [ ] Tests assert the exact headers and body for each event type, against a local HTTP server (real request, not a mocked urlopen)
+- [ ] All tests pass
+- [ ] Lint clean
