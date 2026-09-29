@@ -229,10 +229,12 @@ def _write_fake_docker(bin_dir: Path, exit_code: int, calls: Path) -> None:
 
 def _run_generated_script(tmp_path: Path, docker_exit: int, exec_dir: Path):
     """Generate the claude run.sh, stub docker, execute it, return the result."""
-    script = tmp_path / "run.sh"
+    # The generated script runs directly, so it must live where scripts can
+    # execute: tmp_path may be on a noexec /tmp (hub).
+    script = exec_dir / "run.sh"
     script.write_text(make_run_script("claude"))
     script.chmod(0o755)
-    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    (exec_dir / "docker-compose.yml").write_text("services: {}\n")
 
     bin_dir = exec_dir / "bin"
     calls = exec_dir / "calls"
