@@ -11,7 +11,6 @@ import subprocess
 from collections.abc import Iterator
 
 import pytest
-import yaml
 
 import dtl
 
@@ -76,7 +75,13 @@ def test_templates_own_home_by_the_run_uid() -> None:
     assert "chown -R ${HOME_UID}:${HOME_GID} /home/claude" in dockerfile
     assert "1000:1000" not in dockerfile
 
-    compose = yaml.safe_load(dtl.make_ai_docker_compose("claude"))
-    service = compose["services"]["claude-code"]
-    assert service["user"] == "${UID:-1000}:${GID:-1000}"
-    assert service["build"]["args"] == {"HOME_UID": "${UID:-1000}", "HOME_GID": "${GID:-1000}"}
+    # devtools has no YAML dependency; check the generated text line by line.
+    compose = dtl.make_ai_docker_compose("claude").splitlines()
+    assert '    user: "${UID:-1000}:${GID:-1000}"' in compose
+    build = compose.index("    build:")
+    assert compose[build + 1 : build + 5] == [
+        "      context: ./claude-code",
+        "      args:",
+        '        HOME_UID: "${UID:-1000}"',
+        '        HOME_GID: "${GID:-1000}"',
+    ]
