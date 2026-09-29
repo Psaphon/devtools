@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import logging
@@ -1344,12 +1345,16 @@ def make_ai_claude_dockerfile() -> str:
         # Install Claude Code
         RUN npm install -g @anthropic-ai/claude-code
 
-        # Set up home directory for host-mapped user (UID 1000)
-        RUN mkdir -p /home/claude/.claude && chown -R 1000:1000 /home/claude
+        # Home directory owned by the uid the container runs as. dtl passes it
+        # (compose build args HOME_UID/HOME_GID): the host uid, or 0 under
+        # rootless Docker, where container uid 0 is the host user.
+        ARG HOME_UID=1000
+        ARG HOME_GID=1000
+        RUN mkdir -p /home/claude/.claude && chown -R ${HOME_UID}:${HOME_GID} /home/claude
 
         # Copy settings into Claude Code's config directory
         COPY settings.json /home/claude/.claude/settings.json
-        RUN chown 1000:1000 /home/claude/.claude/settings.json
+        RUN chown ${HOME_UID}:${HOME_GID} /home/claude/.claude/settings.json
 
         ENV HOME=/home/claude
         WORKDIR /workspace
@@ -1429,7 +1434,11 @@ def make_ai_docker_compose(
         lines.extend(
             [
                 "  claude-code:",
-                "    build: ./claude-code",
+                "    build:",
+                "      context: ./claude-code",
+                "      args:",
+                '        HOME_UID: "${UID:-1000}"',
+                '        HOME_GID: "${GID:-1000}"',
                 '    user: "${UID:-1000}:${GID:-1000}"',
                 "    volumes:",
                 "      - ../:/workspace",
@@ -2078,8 +2087,14 @@ def ai_start(project_dir: Path) -> None:
 
         provider = config["provider"]
         if provider == "claude":
+            # UID is a bash builtin that is never exported, so the hint sets it
+            # through env(1); without it the sandbox runs as uid 1000.
+            env = _compose_env()
             print("[dtl ai] Interactive session:")
-            print(f"  docker compose -f {compose_file} run --rm claude-code")
+            print(
+                f"  env UID={env['UID']} GID={env['GID']} "
+                f"docker compose -f {compose_file} run --rm claude-code"
+            )
         elif provider == "openclaw":
             print("[dtl ai] OpenClaw gateway running on port 18789")
             print("[dtl ai] Connect via Telegram or configured chat apps")
@@ -2430,7 +2445,7 @@ def ai_run(
             try:
                 exit_code, output_lines = _run_ai_with_limits(
                     cmd,
-                    {**os.environ},
+                    _compose_env(),
                     max_wall_clock,
                     max_ai_retries,
                 )
@@ -2540,10 +2555,44 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
         print(f"[dtl ai] Notification failed: {e}", file=sys.stderr)
 
 
+@functools.lru_cache(maxsize=1)
+def _docker_is_rootless() -> bool:
+    """True when the docker CLI talks to a rootless daemon."""
+    try:
+        out = subprocess.run(
+            ["docker", "info", "--format", "{{json .SecurityOptions}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return "name=rootless" in out
+
+
+def _compose_env() -> dict[str, str]:
+    """Environment for `docker compose`, with UID/GID set for the sandbox user.
+
+    The compose file runs the sandbox as ${UID}:${GID}, but bash never exports
+    UID, so it always fell back to 1000. Under rootless Docker, container uid 0
+    is the host user and uid 1000 is an unrelated subordinate id that cannot
+    write the bind-mounted repo (hub, 2026-09-29), so the sandbox runs as 0:0
+    there. It is not host root: the daemon itself runs as the user.
+    """
+    env = {**os.environ}
+    if _docker_is_rootless():
+        env["UID"] = env["GID"] = "0"
+    else:
+        env["UID"], env["GID"] = str(os.getuid()), str(os.getgid())
+    return env
+
+
 def _run_cmd(cmd: list[str]) -> int:
     """Run a command, printing output in real time. Returns exit code."""
+    env = _compose_env() if cmd[:2] == ["docker", "compose"] else {**os.environ}
     try:
-        result = subprocess.run(cmd, env={**os.environ}, check=False)
+        result = subprocess.run(cmd, env=env, check=False)
         return result.returncode
     except FileNotFoundError:
         print(f"Error: command not found: {cmd[0]}", file=sys.stderr)
