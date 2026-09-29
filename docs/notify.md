@@ -14,6 +14,10 @@ notifications, log-only):
 # Required: the endpoint that receives JSON POSTs.
 url = "https://ntfy.<tailnet>.ts.net/dtl"
 
+# Body format: "json" (default, structured JSON POST) or "ntfy" (ntfy-native:
+# one readable text line plus Title, Priority and Tags headers).
+# format = "ntfy"
+
 # Which event types to deliver. Omit or set to [] to deliver all.
 events = ["ai-failure", "feature-merged", "needs-attention", "idle"]
 
@@ -26,11 +30,33 @@ events = ["ai-failure", "feature-merged", "needs-attention", "idle"]
 retry_seconds = [1, 5, 30]
 ```
 
+The file lives at `$XDG_CONFIG_HOME/dtl/notify.toml`, or
+`~/.config/dtl/notify.toml` when `XDG_CONFIG_HOME` is unset.
+
+### `format`
+
+- `"json"` (default): POST the JSON body described under [Events](#events).
+- `"ntfy"`: POST a `text/plain; charset=utf-8` one-line message, e.g.
+  `loom: feature X merged (#42)`, with headers `Title` (`dtl: <project>`, ASCII only: headers are sent as Latin-1),
+  `Priority` (`ai-failure`, `needs-attention` → `high`; `idle` → `low`;
+  otherwise `default`), `Tags` (`x`, `warning`, `white_check_mark`, `zzz`) and
+  `X-Dtl-Event-Id` (for deduplication). Retry, auth and `events` filtering are
+  unchanged.
+
+### Example: hub
+
+hub runs ntfy locally and cannot resolve `*.ts.net`, so use the local port:
+
+```toml
+url = "http://127.0.0.1:2586/hub-alerts"
+format = "ntfy"
+```
+
 Config is read once at the start of each `dtl workflow run` invocation.
 
 ## Events
 
-All POSTs are JSON with `Content-Type: application/json`. Every event body
+With the default `json` format, all POSTs are JSON with `Content-Type: application/json`. Every event body
 includes these top-level fields:
 
 | Field | Type | Description |
@@ -138,7 +164,7 @@ dtl notify test --event feature-merged
 dtl notify test --event needs-attention
 ```
 
-Exit code is 1 if `~/.config/dtl/notify.toml` is absent.
+`dtl notify test` uses the configured `format`. Exit code is 1 if the config file is absent.
 
 ## Authentication
 

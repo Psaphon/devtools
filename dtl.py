@@ -4389,13 +4389,46 @@ def _find_feature_for_branch(features: list[dict], branch: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def _notify_config_path() -> Path:
+    """$XDG_CONFIG_HOME/dtl/notify.toml, falling back to ~/.config/dtl/notify.toml."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "dtl" / "notify.toml"
+
+
+_NTFY_PRIORITY = {"ai-failure": "high", "needs-attention": "high", "idle": "low"}
+_NTFY_TAGS = {
+    "ai-failure": "x",
+    "feature-merged": "white_check_mark",
+    "needs-attention": "warning",
+    "idle": "zzz",
+}
+
+
+def _ntfy_message(event_type: str, payload: dict) -> str:
+    """One human-readable line for an event, for ntfy's plain-text body."""
+    project = payload.get("project")
+    feature = payload.get("feature")
+    prefix = f"{project}: " if project else ""
+    if event_type == "feature-merged":
+        pr = payload.get("pr_number")
+        return f"{prefix}feature {feature} merged" + (f" (#{pr})" if pr is not None else "")
+    if event_type == "ai-failure":
+        return f"{prefix}AI run failed on {feature} (exit {payload.get('exit_code')})"
+    if event_type == "needs-attention":
+        return f"{prefix}{feature} needs attention: {payload.get('criterion', '')}"
+    if event_type == "idle":
+        return "dtl workflow idle"
+    return f"{prefix}{event_type}"
+
+
 def _load_notify_config() -> dict | None:
-    """Load ~/.config/dtl/notify.toml.
+    """Load $XDG_CONFIG_HOME/dtl/notify.toml (default ~/.config/dtl/notify.toml).
 
     Returns the parsed config dict, or None if the file is absent or unparseable.
     Config is optional — absent means no notifications, log-only.
     """
-    config_path = Path.home() / ".config" / "dtl" / "notify.toml"
+    config_path = _notify_config_path()
     if not config_path.exists():
         return None
     try:
@@ -4464,7 +4497,26 @@ def _emit_notify_event(
     }
     body.update(payload)
 
-    headers = {"Content-Type": "application/json"}
+    fmt = config.get("format", "json")
+    if fmt == "ntfy":
+        project = payload.get("project")
+        # http.client sends header values as Latin-1 and ntfy decodes them as
+        # UTF-8, so the literal part of the title stays ASCII ("·" reached the
+        # phone as U+FFFD, hub 2026-09-29).
+        title = f"dtl: {project}" if project else "dtl"
+        headers = {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Title": title.encode("latin-1", "replace").decode("latin-1"),
+            "Priority": _NTFY_PRIORITY.get(event_type, "default"),
+            "Tags": _NTFY_TAGS.get(event_type, "bell"),
+            "X-Dtl-Event-Id": event_id,
+        }
+        data = _ntfy_message(event_type, payload).encode("utf-8")
+    else:
+        if fmt != "json":
+            log.warning("Notify: unknown format %r — falling back to json.", fmt)
+        headers = {"Content-Type": "application/json"}
+        data = json.dumps(body).encode()
     auth_file = config.get("auth_header_file", "")
     if auth_file:
         try:
@@ -4483,7 +4535,6 @@ def _emit_notify_event(
             )
 
     retry_seconds: list = config.get("retry_seconds", [1, 5, 30])
-    data = json.dumps(body).encode()
 
     for attempt, delay in enumerate(retry_seconds):
         try:
@@ -4775,7 +4826,7 @@ def cmd_notify_test(args: argparse.Namespace) -> None:
     cfg = _load_notify_config()
     if not cfg:
         print(
-            "No notify config found at ~/.config/dtl/notify.toml\n"
+            f"No notify config found at {_notify_config_path()}\n"
             "Create the file first. See docs/notify.md for the config schema.",
             file=sys.stderr,
         )
