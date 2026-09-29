@@ -4500,8 +4500,10 @@ def _emit_notify_event(
     fmt = config.get("format", "json")
     if fmt == "ntfy":
         project = payload.get("project")
-        # http.client encodes header values as latin-1; never let a project name break delivery
-        title = f"dtl · {project}" if project else "dtl"
+        # http.client sends header values as Latin-1 and ntfy decodes them as
+        # UTF-8, so the literal part of the title stays ASCII ("·" reached the
+        # phone as U+FFFD, hub 2026-09-29).
+        title = f"dtl: {project}" if project else "dtl"
         headers = {
             "Content-Type": "text/plain; charset=utf-8",
             "Title": title.encode("latin-1", "replace").decode("latin-1"),

@@ -37,7 +37,7 @@ The file lives at `$XDG_CONFIG_HOME/dtl/notify.toml`, or
 
 - `"json"` (default): POST the JSON body described under [Events](#events).
 - `"ntfy"`: POST a `text/plain; charset=utf-8` one-line message, e.g.
-  `loom: feature X merged (#42)`, with headers `Title` (`dtl · <project>`),
+  `loom: feature X merged (#42)`, with headers `Title` (`dtl: <project>`, ASCII only: headers are sent as Latin-1),
   `Priority` (`ai-failure`, `needs-attention` → `high`; `idle` → `low`;
   otherwise `default`), `Tags` (`x`, `warning`, `white_check_mark`, `zzz`) and
   `X-Dtl-Event-Id` (for deduplication). Retry, auth and `events` filtering are

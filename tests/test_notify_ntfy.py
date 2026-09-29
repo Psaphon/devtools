@@ -80,7 +80,7 @@ def test_ntfy_format(server, event, payload, body, priority, tags):
     assert req["headers"]["content-type"] == "text/plain; charset=utf-8"
     assert req["headers"]["priority"] == priority
     assert req["headers"]["tags"] == tags
-    assert req["headers"]["title"] == ("dtl · loom" if "project" in payload else "dtl")
+    assert req["headers"]["title"] == ("dtl: loom" if "project" in payload else "dtl")
     assert len(req["headers"]["x-dtl-event-id"]) == 16
 
 
@@ -139,3 +139,16 @@ def test_config_falls_back_to_home(tmp_path, monkeypatch):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     assert dtl._load_notify_config() == {"url": "http://127.0.0.1:1/h"}
+
+
+def test_ntfy_headers_are_ascii() -> None:
+    """Non-ASCII header text reaches ntfy as U+FFFD (Latin-1 on the wire)."""
+    import dtl as _dtl
+
+    source = open(_dtl.__file__, encoding="utf-8").read()
+    start = source.index("def _emit_notify_event")
+    end = source.index("\ndef ", start + 1)
+    body = source[start:end]
+    for line in body.splitlines():
+        if "title" in line.lower() and 'f"' in line:
+            assert line.isascii(), f"non-ASCII in a header line: {line.strip()}"
