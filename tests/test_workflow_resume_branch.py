@@ -106,3 +106,32 @@ def test_giving_up_never_writes_failed_into_the_devplan() -> None:
     source = Path(dtl.__file__).read_text()
     assert '_update_feature_status(plan_path, f["name"], "Failed")' not in source
     assert "gave up after {max_failures} failed attempts" in source
+
+
+def test_failure_cleanup_leaves_a_clean_develop(tmp_path: Path) -> None:
+    """After a failed finish the next pass must not find a dirty tree."""
+    repo = _repo(tmp_path)
+    plan = repo / "docs" / "DEVPLAN.md"
+    plan.parent.mkdir()
+    plan.write_text("## Feature: x\n**Status:** Not Started\n")
+    _git(repo, "add", "docs/DEVPLAN.md")
+    _git(repo, "commit", "-q", "-m", "plan")
+    dtl._git_create_branch(repo, "fix/x", base="develop")
+    # The AI commits its work together with the workflow's "In Progress" edit...
+    plan.write_text("## Feature: x\n**Status:** In Progress\n")
+    _git(repo, "commit", "-qam", "ai work")
+    # ...then a later status write is left uncommitted when the checks fail.
+    plan.write_text("## Feature: x\n**Status:** Not Started\n")
+
+    dtl._discard_status_edit_and_return(repo, plan)
+
+    assert _git(repo, "branch", "--show-current") == "develop"
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_finish_failure_path_does_not_write_a_status() -> None:
+    source = Path(dtl.__file__).read_text()
+    start = source.index('"[%s] Lint/tests failed after AI. Output:\\n%s"')
+    block = source[start : source.index("continue", start)]
+    assert "_update_feature_status" not in block
+    assert "_discard_status_edit_and_return(project_dir, plan_path)" in block

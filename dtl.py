@@ -5003,10 +5003,18 @@ def _handle_interruption(
         log,
     )
 
-    # Discard the workflow's pre-run "In Progress" status edit if the AI
-    # didn't commit it. Targeted to DEVPLAN.md only — any unexpected dirty
-    # files trigger the dirty-tree skip on the next loop instead of being
-    # silently erased.
+    _discard_status_edit_and_return(project_dir, plan_path)
+
+
+def _discard_status_edit_and_return(project_dir: Path, plan_path: Path) -> None:
+    """Drop the workflow's own uncommitted DEVPLAN status edit, then go back to develop.
+
+    Targeted to DEVPLAN.md only: any other dirty file still triggers the
+    dirty-tree skip on the next loop instead of being silently erased. Used by
+    every failure path; writing a status instead left the edit uncommitted,
+    the checkout to develop failed, and the next pass skipped the project as
+    dirty (hub, 2026-09-30).
+    """
     rel_plan = plan_path.relative_to(project_dir)
     subprocess.run(
         ["git", "checkout", "--", str(rel_plan)],
@@ -5450,14 +5458,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
                 _fstate["last_failure_output"] = test_output[-4000:]
                 _write_feature_state(project_dir, next_feature["name"], _fstate)
-                _update_feature_status(plan_path, next_feature["name"], "Not Started")
-                # Return to develop
-                subprocess.run(
-                    ["git", "checkout", "develop"],
-                    cwd=project_dir,
-                    capture_output=True,
-                    check=False,
-                )
+                # The state file records the failure; don't write a status here.
+                _discard_status_edit_and_return(project_dir, plan_path)
                 continue
 
             # Emit needs-attention for any [HUMAN] acceptance criteria
