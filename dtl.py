@@ -3466,19 +3466,49 @@ def _git_create_branch(project_dir: Path, branch: str, base: str = "develop") ->
     )
     if exists.returncode == 0:
         subprocess.run(["git", "checkout", branch], cwd=project_dir, check=True)
+        # Bring the resumed branch up to date with base, or the checks run
+        # against a stale tree: on hub a branch from before scripts/ci.sh
+        # merged was resumed and tested without it (2026-09-30).
+        merged = subprocess.run(
+            ["git", "merge", "--no-edit", base],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if merged.returncode != 0:
+            subprocess.run(["git", "merge", "--abort"], cwd=project_dir, check=False)
+            subprocess.run(["git", "checkout", base], cwd=project_dir, check=False)
+            raise subprocess.CalledProcessError(
+                merged.returncode, merged.args, merged.stdout, merged.stderr
+            )
         return
     subprocess.run(["git", "checkout", base], cwd=project_dir, check=True)
     subprocess.run(["git", "checkout", "-b", branch], cwd=project_dir, check=True)
 
 
-def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
-    """Build the prompt string passed to the AI for a feature."""
+def _build_ai_prompt(constraints_block: str, feature: dict, previous_failure: str = "") -> str:
+    """Build the prompt string passed to the AI for a feature.
+
+    previous_failure: tail of the host lint/test output from the last attempt.
+    Without it a retry repeats the same mistake blind (hub, 2026-09-30).
+    """
     parts = []
     if constraints_block:
         parts.append(constraints_block)
         parts.append("")
     parts.append(feature["block"])
     parts.append("")
+    if previous_failure:
+        parts.append(
+            "A previous attempt at this feature is already committed on this branch, "
+            "but the host's lint/test step failed afterwards. Fix the cause; do not "
+            "start over. The tail of that failure output:"
+        )
+        parts.append("```")
+        parts.append(previous_failure)
+        parts.append("```")
+        parts.append("")
     parts.append(
         "Implement this feature exactly as specified above. "
         "Follow all constraints. "
@@ -3630,6 +3660,8 @@ _FEATURE_STATE_DEFAULT: dict = {
     "attempts_completed": 0,
     "attempts_interrupted": 0,
     "partial_work_branch": None,
+    # Tail of the last lint/test failure, handed to the next attempt's prompt.
+    "last_failure_output": "",
 }
 
 
@@ -5138,7 +5170,21 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                             f["name"],
                             max_failures,
                         )
-                        _update_feature_status(plan_path, f["name"], "Failed")
+                        # Do NOT write "Failed" into the DEVPLAN here: this runs on
+                        # develop, the edit stays uncommitted, and the dirty-tree
+                        # check then skips the project on every later run (hub,
+                        # 2026-09-30). The state file already records the give-up;
+                        # tell the operator instead.
+                        _emit_notify_event(
+                            _load_notify_config(),
+                            "needs-attention",
+                            {
+                                "project": project_dir.name,
+                                "feature": f["name"],
+                                "criterion": f"gave up after {max_failures} failed attempts",
+                            },
+                            log,
+                        )
                         continue
                     next_feature = f
                     break
@@ -5207,7 +5253,11 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
 
             # Build prompt and run AI
             constraints_block, _ = _parse_devplan(plan_path.read_text())
-            prompt = _build_ai_prompt(constraints_block, next_feature)
+            prompt = _build_ai_prompt(
+                constraints_block,
+                next_feature,
+                _read_feature_state(project_dir, next_feature["name"])["last_failure_output"],
+            )
 
             log.info("[%s] Launching AI for %s...", project_dir.name, next_feature["name"])
 
@@ -5398,6 +5448,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 _fstate["last_outcome"] = RunOutcome.FAILED_AI
                 _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                 _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _fstate["last_failure_output"] = test_output[-4000:]
                 _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
                 # Return to develop
