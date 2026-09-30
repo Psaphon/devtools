@@ -3452,7 +3452,21 @@ def _git_current_branch(project_dir: Path) -> str:
 
 
 def _git_create_branch(project_dir: Path, branch: str, base: str = "develop") -> None:
-    """Create and checkout a new branch off base."""
+    """Create and checkout a new branch off base, or resume it if it exists.
+
+    A retry after a failed finish (lint/tests) finds the branch from the first
+    attempt. `checkout -b` then failed, so the retry gave up and the AI's work
+    was stranded (hub, 2026-09-30). Resume the branch instead, keeping its commits.
+    """
+    exists = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=project_dir,
+        capture_output=True,
+        check=False,
+    )
+    if exists.returncode == 0:
+        subprocess.run(["git", "checkout", branch], cwd=project_dir, check=True)
+        return
     subprocess.run(["git", "checkout", base], cwd=project_dir, check=True)
     subprocess.run(["git", "checkout", "-b", branch], cwd=project_dir, check=True)
 
