@@ -146,7 +146,7 @@ class TestParseDevplan:
         assert "Some notes here." in beta["block"]
 
     def test_empty_plan_returns_no_features(self):
-        constraints, features = _parse_devplan("# Development Plan\n\nNothing here.\n")
+        _constraints, features = _parse_devplan("# Development Plan\n\nNothing here.\n")
         assert features == []
 
     def test_no_constraints_section(self):
@@ -333,9 +333,8 @@ class TestCmdWorkflowNext:
         args.plan = str(plan_file)
         args.project = str(tmp_path)
 
-        with patch("dtl._git_is_dirty", return_value=True):
-            with pytest.raises(SystemExit) as exc:
-                cmd_workflow_next(args)
+        with patch("dtl._git_is_dirty", return_value=True), pytest.raises(SystemExit) as exc:
+            cmd_workflow_next(args)
         assert exc.value.code == 1
 
     def test_prints_message_when_all_done(self, tmp_path, capsys):
@@ -1027,9 +1026,9 @@ class TestCmdWorkflowRunScheduleSubprocess:
             # passes only in CI (where the path is absent). Bypass it to test
             # subprocess delegation in isolation.
             patch("dtl._check_install_freshness"),
+            pytest.raises(SystemExit) as exc_info,
         ):
-            with pytest.raises(SystemExit) as exc_info:
-                cmd_workflow_run(args)
+            cmd_workflow_run(args)
 
         assert len(subprocess_calls) == 1, (
             f"Expected exactly one subprocess.run call; got {subprocess_calls}"
@@ -1082,11 +1081,11 @@ class TestPreflightAutoMerge:
 
         with (
             patch("dtl._preflight_auto_merge", return_value=False),
-            patch("dtl.time.sleep", side_effect=lambda s: sleep_calls.append(s)),
+            patch("dtl.time.sleep", side_effect=sleep_calls.append),
             patch("dtl._setup_workflow_logger", return_value=MagicMock()),
+            pytest.raises(SystemExit) as exc_info,
         ):
-            with pytest.raises(SystemExit) as exc_info:
-                cmd_workflow_run(args)
+            cmd_workflow_run(args)
 
         assert exc_info.value.code != 0, (
             "Expected non-zero exit when allow_auto_merge=False and --schedule is set"
@@ -1921,15 +1920,15 @@ Test feature.
             patch("dtl._git_create_branch"),
             patch(
                 "dtl._handle_interruption",
-                side_effect=lambda *a, **kw: self._fake_handle_interruption(*a, **kw),
+                side_effect=self._fake_handle_interruption,
             ),
             patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
             patch("dtl.time.sleep"),
             patch("dtl._setup_workflow_logger", return_value=MagicMock()),
             patch("dtl._preflight_auto_merge", return_value=None),
+            pytest.raises(SystemExit),
         ):
-            with pytest.raises(SystemExit):
-                cmd_workflow_run(args)
+            cmd_workflow_run(args)
 
         assert len(call_providers) == 2, f"Expected 2 AI calls; got {call_providers}"
         assert call_providers[0] == "claude"
@@ -1964,15 +1963,15 @@ Test feature.
             patch("dtl._git_create_branch"),
             patch(
                 "dtl._handle_interruption",
-                side_effect=lambda *a, **kw: self._fake_handle_interruption(*a, **kw),
+                side_effect=self._fake_handle_interruption,
             ),
             patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
-            patch("dtl.time.sleep", side_effect=lambda s: sleep_calls.append(s)),
+            patch("dtl.time.sleep", side_effect=sleep_calls.append),
             patch("dtl._setup_workflow_logger", return_value=MagicMock()),
             patch("dtl._preflight_auto_merge", return_value=None),
+            pytest.raises(SystemExit),
         ):
-            with pytest.raises(SystemExit):
-                cmd_workflow_run(args)
+            cmd_workflow_run(args)
 
         assert 999 in sleep_calls, (
             f"Expected quota_reset_sleep=999 in sleep calls; got {sleep_calls}"
@@ -2013,15 +2012,15 @@ Test feature.
             patch("dtl._git_create_branch"),
             patch(
                 "dtl._handle_interruption",
-                side_effect=lambda *a, **kw: self._fake_handle_interruption(*a, **kw),
+                side_effect=self._fake_handle_interruption,
             ),
             patch("dtl.subprocess.run", side_effect=fake_subprocess_run),
             patch("dtl.time.sleep"),
             patch("dtl._setup_workflow_logger", return_value=MagicMock()),
             patch("dtl._preflight_auto_merge", return_value=None),
+            pytest.raises(SystemExit),
         ):
-            with pytest.raises(SystemExit):
-                cmd_workflow_run(args)
+            cmd_workflow_run(args)
 
         # claude → ollama (chain exhausted, sleep) → claude again (chain reset)
         assert len(call_providers) == 3, f"Expected 3 AI calls; got {call_providers}"
@@ -2098,9 +2097,9 @@ class TestInstallFreshnessGuard:
         with (
             patch("sys.argv", [str(running)]),
             patch.object(dtl_module.Path, "home", staticmethod(fake_home)),
+            pytest.raises(SystemExit) as exc_info,
         ):
-            with pytest.raises(SystemExit) as exc_info:
-                _check_install_freshness(schedule_mode=True)
+            _check_install_freshness(schedule_mode=True)
         assert exc_info.value.code == 1
 
     def test_source_of_truth_missing_returns_silently(self, tmp_path):

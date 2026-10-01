@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -145,7 +146,7 @@ def test_ntfy_headers_are_ascii() -> None:
     """Non-ASCII header text reaches ntfy as U+FFFD (Latin-1 on the wire)."""
     import dtl as _dtl
 
-    source = open(_dtl.__file__, encoding="utf-8").read()
+    source = Path(_dtl.__file__).read_text(encoding="utf-8")
     start = source.index("def _emit_notify_event")
     end = source.index("\ndef ", start + 1)
     body = source[start:end]

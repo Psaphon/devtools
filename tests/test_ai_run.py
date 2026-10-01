@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import _resolve_provider_chain, _run_ai_with_limits, make_run_script
 
-
 # ---------------------------------------------------------------------------
 # _run_ai_with_limits — wall-clock timeout
 # ---------------------------------------------------------------------------
@@ -21,7 +20,7 @@ def test_run_ai_with_limits_wall_clock_timeout(tmp_path):
     """A subprocess that sleeps longer than the limit should be killed (code 124)."""
     cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
     start = time.monotonic()
-    code, lines = _run_ai_with_limits(
+    code, _lines = _run_ai_with_limits(
         cmd,
         {},
         max_wall_clock=2,
@@ -88,7 +87,7 @@ def test_run_ai_with_limits_retry_disabled_does_not_kill(tmp_path):
         "print('done')\n"
     )
     cmd = [sys.executable, "-c", script]
-    code, lines = _run_ai_with_limits(
+    code, _lines = _run_ai_with_limits(
         cmd,
         {},
         max_wall_clock=30,
@@ -248,6 +247,7 @@ def _run_generated_script(tmp_path: Path, docker_exit: int, exec_dir: Path):
         text=True,
         env=env,
         timeout=30,
+        check=False,
     )
     assert calls.exists(), "fake docker never ran; the real docker may have run instead"
     return result
@@ -282,9 +282,7 @@ def test_generated_run_script_has_no_pipestatus_antipattern(tmp_path):
     not trip the check. Only executable lines are inspected.
     """
     code = "\n".join(
-        line
-        for line in make_run_script("claude").splitlines()
-        if not line.lstrip().startswith("#")
+        line for line in make_run_script("claude").splitlines() if not line.lstrip().startswith("#")
     )
     assert "PIPESTATUS" not in code, (
         "PIPESTATUS is reset by `|| true`; use `|| EXIT_CODE=$?` instead"

@@ -59,3 +59,8 @@ ignore = ["E501"]
 #          explicit check=) and are tracked as follow-up work, but adopting
 #          them belongs in a change that fixes them, not one that declares
 #          the baseline.
+
+# Tests are linted too (CI checks the whole repo, not just dtl.py). Annotating
+# every pytest function and fixture argument adds noise, not safety.
+[lint.per-file-ignores]
+"tests/**" = ["ANN"]

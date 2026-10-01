@@ -6,8 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dtl import STACKS, _CI_YML_SCAFFOLD, make_ci_workflow
-
+from dtl import _CI_YML_SCAFFOLD, STACKS, make_ci_workflow
 
 # ---------------------------------------------------------------------------
 # make_ci_workflow — scaffolded per-stack CI template
@@ -80,9 +79,7 @@ def test_make_ci_workflow_node_stack_has_npm_audit():
 def test_make_ci_workflow_security_scan_present_for_all_stacks():
     for stack_name, stack in STACKS.items():
         content = make_ci_workflow(stack_name, stack)
-        assert "security-scan:" in content, (
-            f"security-scan job missing for stack {stack_name!r}"
-        )
+        assert "security-scan:" in content, f"security-scan job missing for stack {stack_name!r}"
         assert "gitleaks" in content, (
             f"gitleaks missing from security-scan for stack {stack_name!r}"
         )

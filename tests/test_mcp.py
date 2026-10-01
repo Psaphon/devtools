@@ -200,9 +200,7 @@ def test_settings_mcp_binary_name() -> None:
 
 
 def test_settings_multiple_mcp_servers() -> None:
-    raw = make_ai_claude_settings(
-        ["claude"], mcp_servers=["filesystem", "github", "memory"]
-    )
+    raw = make_ai_claude_settings(["claude"], mcp_servers=["filesystem", "github", "memory"])
     data = json.loads(raw)
     assert set(data["mcpServers"].keys()) == {"filesystem", "github", "memory"}
 

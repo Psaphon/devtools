@@ -15,7 +15,6 @@ import pytest
 
 import dtl
 
-
 # The real cached function, captured at import. Tests monkeypatch
 # dtl._docker_is_rootless, and monkeypatch may still be applied when this
 # fixture tears down (conftest's autouse fixtures set it up first).
