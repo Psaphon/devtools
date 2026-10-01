@@ -7,8 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import dtl  # noqa: E402
-
+import dtl
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,9 +83,7 @@ def test_pm_install_preserves_handoff(tmp_path):
     args = _make_args(str(tmp_path))
     dtl.cmd_pm_install(args)
 
-    assert handoff.read_text() == sentinel, (
-        "HANDOFF.md was overwritten — preservation failed"
-    )
+    assert handoff.read_text() == sentinel, "HANDOFF.md was overwritten — preservation failed"
 
 
 def test_pm_install_dry_run_no_files(tmp_path):

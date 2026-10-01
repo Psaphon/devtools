@@ -68,9 +68,7 @@ def make_project(tmp_path: Path, name: str = "myproject") -> Path:
 
 def write_devplan(project: Path, statuses: list[str]) -> None:
     """Write a DEVPLAN.md with features at the given statuses."""
-    features = "\n".join(
-        FEATURE_TEMPLATE.format(i=i, status=s) for i, s in enumerate(statuses)
-    )
+    features = "\n".join(FEATURE_TEMPLATE.format(i=i, status=s) for i, s in enumerate(statuses))
     plan_text = SAMPLE_DEVPLAN_TEMPLATE.format(name=project.name, features=features)
     (project / "docs" / "DEVPLAN.md").write_text(plan_text)
 
@@ -104,9 +102,7 @@ class TestWatchdogCheckMissingRunner:
     def test_not_started_with_matching_process_returns_none(self, tmp_path):
         project = make_project(tmp_path)
         write_devplan(project, ["Not Started"])
-        fake_ps = (
-            f"user 1234 0.0 0.1 python3 dtl.py workflow run --projects {project}\n"
-        )
+        fake_ps = f"user 1234 0.0 0.1 python3 dtl.py workflow run --projects {project}\n"
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
             result = dtl._watchdog_check_missing_runner(project)
@@ -120,9 +116,7 @@ class TestWatchdogCheckMissingRunner:
             result = dtl._watchdog_check_missing_runner(project)
         assert result is not None
 
-    def test_state_file_quota_interruption_suppresses_anomaly(
-        self, tmp_path, monkeypatch
-    ):
+    def test_state_file_quota_interruption_suppresses_anomaly(self, tmp_path, monkeypatch):
         """If the feature state shows INTERRUPTED_QUOTA, the watchdog suppresses
         anomaly A because the workflow halted intentionally for human attention."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
@@ -145,13 +139,9 @@ class TestWatchdogCheckMissingRunner:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="other stuff\n", returncode=0)
             result = dtl._watchdog_check_missing_runner(project)
-        assert result is None, (
-            "INTERRUPTED_QUOTA state should suppress missing-runner anomaly"
-        )
+        assert result is None, "INTERRUPTED_QUOTA state should suppress missing-runner anomaly"
 
-    def test_state_file_auth_interruption_suppresses_anomaly(
-        self, tmp_path, monkeypatch
-    ):
+    def test_state_file_auth_interruption_suppresses_anomaly(self, tmp_path, monkeypatch):
         """INTERRUPTED_AUTH also suppresses anomaly A."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
         project = make_project(tmp_path)
@@ -172,13 +162,9 @@ class TestWatchdogCheckMissingRunner:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="other stuff\n", returncode=0)
             result = dtl._watchdog_check_missing_runner(project)
-        assert result is None, (
-            "INTERRUPTED_AUTH state should suppress missing-runner anomaly"
-        )
+        assert result is None, "INTERRUPTED_AUTH state should suppress missing-runner anomaly"
 
-    def test_state_file_failed_ai_does_not_suppress_anomaly(
-        self, tmp_path, monkeypatch
-    ):
+    def test_state_file_failed_ai_does_not_suppress_anomaly(self, tmp_path, monkeypatch):
         """FAILED_AI state does not suppress anomaly A — the workflow should retry."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
         project = make_project(tmp_path)
@@ -199,9 +185,7 @@ class TestWatchdogCheckMissingRunner:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="other stuff\n", returncode=0)
             result = dtl._watchdog_check_missing_runner(project)
-        assert result is not None, (
-            "FAILED_AI state should NOT suppress missing-runner anomaly"
-        )
+        assert result is not None, "FAILED_AI state should NOT suppress missing-runner anomaly"
 
     # ------------------------------------------------------------------
     # Which running workflow actually covers this project.
@@ -253,8 +237,7 @@ class TestWatchdogCheckMissingRunner:
         atrade = make_project(tmp_path, name="atrade")
         write_devplan(loom, ["Not Started"])
         fake_ps = (
-            f"user 1234 0.0 0.1 python3 {devtools}/dtl.py workflow run "
-            f"--projects {atrade},{loom}\n"
+            f"user 1234 0.0 0.1 python3 {devtools}/dtl.py workflow run --projects {atrade},{loom}\n"
         )
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout=fake_ps, returncode=0)
@@ -328,9 +311,7 @@ class TestWatchdogCheckDirtyAge:
         old_time = time.time() - (25 * 3600)
         os.utime(new_file, (old_time, old_time))
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                stdout="R  old.py -> new.py\n", returncode=0
-            )
+            mock_run.return_value = MagicMock(stdout="R  old.py -> new.py\n", returncode=0)
             # Should not raise; may or may not detect anomaly depending on file existence.
             dtl._watchdog_check_dirty_age(project)
 
@@ -366,9 +347,7 @@ class TestWatchdogCheckPrActivity:
     def test_recent_pr_activity_returns_none(self, tmp_path):
         project = make_project(tmp_path)
         write_devplan(project, ["Not Started"])
-        recent = (
-            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
-        ).isoformat()
+        recent = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)).isoformat()
         prs = [{"number": 1, "updatedAt": recent}]
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout=json.dumps(prs), returncode=0)
@@ -392,9 +371,7 @@ class TestWatchdogCheckPrActivity:
         This case alone cannot detect that (it also expects None), which is why
         it is paired with the stale-timestamp test below; that one does.
         """
-        recent = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            hours=1
-        )
+        recent = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
         # Explicitly the GitHub wire format: trailing Z, no offset.
         z_stamp = recent.strftime("%Y-%m-%dT%H:%M:%SZ")
         assert z_stamp.endswith("Z")
@@ -419,9 +396,7 @@ class TestWatchdogCheckPrActivity:
         Verified by mutation: breaking the parse fails this test and only this
         test.
         """
-        stale = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            hours=60
-        )
+        stale = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=60)
         z_stamp = stale.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         project = make_project(tmp_path)
@@ -436,9 +411,7 @@ class TestWatchdogCheckPrActivity:
     def test_stale_pr_with_not_started_returns_anomaly(self, tmp_path):
         project = make_project(tmp_path)
         write_devplan(project, ["Not Started"])
-        stale = (
-            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=60)
-        ).isoformat()
+        stale = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=60)).isoformat()
         prs = [{"number": 1, "updatedAt": stale}]
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout=json.dumps(prs), returncode=0)
@@ -573,9 +546,7 @@ class TestWatchdogNotifyProject:
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            dtl._watchdog_notify_project(
-                project, ["issue alpha", "issue beta"], self._log()
-            )
+            dtl._watchdog_notify_project(project, ["issue alpha", "issue beta"], self._log())
 
         message = mock_run.call_args[0][0][-1]  # last positional arg is the message
         assert "issue alpha" in message
@@ -597,9 +568,7 @@ class TestWatchdogNotifyProject:
         ai_dir.mkdir()
         # Mirrors the real notify.py's no-credentials path.
         (ai_dir / "notify.py").write_text(
-            "import sys\n"
-            "print('[notify] Telegram not configured.', file=sys.stderr)\n"
-            "sys.exit(1)\n"
+            "import sys\nprint('[notify] Telegram not configured.', file=sys.stderr)\nsys.exit(1)\n"
         )
 
         with caplog.at_level(logging.INFO):
@@ -715,9 +684,7 @@ class TestCmdWatchdogInstall:
             )
             dtl.cmd_watchdog_install(args)
 
-        timer_text = (
-            tmp_path / ".config" / "systemd" / "user" / "dtl-watchdog.timer"
-        ).read_text()
+        timer_text = (tmp_path / ".config" / "systemd" / "user" / "dtl-watchdog.timer").read_text()
         assert "45min" in timer_text
 
     def test_output_includes_activation_commands(self, tmp_path, capsys):
@@ -740,9 +707,7 @@ class TestCmdWatchdogInstall:
 
 class TestCmdWatchdogStatus:
     def test_no_state_prints_guidance(self, tmp_path, capsys, monkeypatch):
-        monkeypatch.setattr(
-            dtl, "_watchdog_state_path", lambda: tmp_path / "nonexistent.json"
-        )
+        monkeypatch.setattr(dtl, "_watchdog_state_path", lambda: tmp_path / "nonexistent.json")
         dtl.cmd_watchdog_status(argparse.Namespace())
         out = capsys.readouterr().out
         assert "No watchdog state" in out

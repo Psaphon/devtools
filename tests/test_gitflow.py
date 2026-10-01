@@ -105,7 +105,7 @@ class TestRunLintAndTests:
         (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
         with patch("dtl.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-            passed, output = _run_lint_and_tests(tmp_path)
+            passed, _output = _run_lint_and_tests(tmp_path)
         assert passed
         assert mock_run.call_count == 5  # venv + pip install + pytest probe + lint + test
 
@@ -123,7 +123,7 @@ class TestRunLintAndTests:
         assert "lint error" in output
 
     def test_no_project_files(self, tmp_path):
-        passed, output = _run_lint_and_tests(tmp_path)
+        passed, _output = _run_lint_and_tests(tmp_path)
         assert passed  # nothing to check = pass
 
     def test_node_project_detected(self, tmp_path):
