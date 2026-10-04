@@ -49,7 +49,7 @@ dtl.py (single file, stdlib-only Python)
 | `templates/CLAUDE.md` | Reusable project context template |
 | `templates/PLAN.md` | Single-file plan (new project or features), dropped in Proton `hub/pm-inbox` |
 | `templates/PLANNING-GUIDE.md` | Instructions for the phone planner (claude.ai) producing a `PLAN.md` |
-| `templates/PROJECTS-CONTEXT.md` | The stable, hub, and conventions every plan inherits |
+| (private) `hub/docs/planning/PROJECTS-CONTEXT.md` | The stable and conventions every plan inherits; private, not in this repo |
 | `docs/DEVPLAN.md` | This project's own development plan |
 | `env.example` | Template for API keys and git identity |
 
