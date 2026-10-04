@@ -73,11 +73,15 @@ Each `## Feature:` is one branch, one PR, and one autonomous AI session. The AI 
 - **Small:** more than about 8 files means split it.
 - **Acceptance criteria must execute the real boundary.** This is the lesson the stable paid for repeatedly: features merged green and broke in production because tests checked text, not behaviour. Write criteria the AI can only meet by *running* something: invoke the CLI and check exit code and output, parse the real config, run the script against stub binaries that record their arguments, load the real systemd unit. "The file mentions X" is never a criterion. Anything that can only be verified on real hardware or live accounts becomes a `[HUMAN]` criterion.
 - **`[HUMAN]` prefix** for operator steps inside `Requires: both` features. These don't block the AI build; the PM tracks them.
-- **CI must gate:** the first feature of a new repo sets up CI that runs lint and tests on PRs, and the PM makes those jobs required checks. Pin linters (ruff `0.16.4`, explicit `select`). CI installs dependencies from the project's own declaration, never a hand-written list.
+- **CI must gate:** the first feature of a new repo sets up CI that runs lint and tests on PRs, and the PM makes those jobs required checks. Pin linters (version and `select` per PROJECTS-CONTEXT). CI installs dependencies from the project's own declaration, never a hand-written list.
 - **End every criteria list** with "All tests pass" and "Lint clean" (except pure `Requires: human` features).
 - **Finish a new-project plan with a docs/README feature.** READMEs come out better once the code exists.
 
 **Artifact features** (workflow JSONs, prompts, images, model weights): use "produces expected artifact" with a specific name, format or size instead of "All tests pass", and list the outputs under an `### Assets` table. Use `Requires: human` or `both` when someone must approve a creative output.
+
+## Repo hygiene (everything in a plan gets committed)
+
+Write every plan as if the repo goes public. No identity (the operator, never a name), no location or time zone, no work details or personal schedules, no hardware models or sizes (state the capability needed), and no versions, prices or budgets as facts; reference PROJECTS-CONTEXT instead. Fixtures are synthetic, never real personal data, and there are no credentials anywhere. The full rules are in PROJECTS-CONTEXT, "Repo Hygiene".
 
 ## What NOT to do
 

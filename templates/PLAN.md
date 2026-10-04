@@ -41,7 +41,7 @@ default. Write "none" if there are none.
 - **Pitch:** {15 words or less}
 - **Problem / motivation:** {2–4 sentences}
 - **Target user:** {"the operator only" / a persona}. Never a real name.
-- **Stack preferences:** {language, data, hosting, LLM; "PM decides" is fine}
+- **Stack preferences:** {language, data, hosting, LLM; "PM decides" is fine. No hardware models or sizes: say what capability is needed}
 - **Must-haves (v1):** {bullets; each maps to features below}
 - **Nice-to-haves (later):** {bullets; go to the repo's FEATURE-REQUESTS.md, not the DEVPLAN}
 - **Non-goals:** {bullets}
