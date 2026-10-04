@@ -1,124 +1,87 @@
-# User's ~/Projects Stable — Context for Planning
+# The Operator's ~/Projects Stable: Context for Planning
 
-This file summarizes the repos in User's `~/Projects` directory and the cross-cutting conventions they share. Use it when proposing stacks or features during planning sessions. Prefer existing patterns unless there's a clear reason to deviate.
+What exists, how development actually runs, and the conventions every plan inherits. Read it before planning; prefer the existing patterns unless there's a clear reason to deviate.
 
-**Last updated:** 2026-05-25
+**Last updated:** 2026-10-04
 
-## Active Projects
+## Where development happens
 
-| Project | Purpose | Stack |
-|---------|---------|-------|
-| **devtools** | CLI scaffolder and AI dev orchestrator (`dtl`) | Python 3.11, stdlib-only, single-file |
-| **morning-brief** | Automated daily news dashboard pipeline | Python 3.11, async httpx, SQLite, Ollama (Qwen 2.5 7B), Jinja2, Rich, Click, Cloudflare Pages |
-| **loom** | Overnight music-video pipeline (ComfyUI + ffmpeg) | Python 3.11, Click, httpx (async), librosa, ffmpeg subprocess, TOML, systemd timer |
-| **hub** | Headless, Tailnet-native, **persistent** workstation; the substrate the other private projects run on (supersedes `usb-autoinstall-public`) | Ubuntu Server 26.04 LTS, Ansible (konstruktoid.hardening), Tailscale, Docker + NVIDIA Container Toolkit, Ollama, ntfy, Glance/Beszel, distro `python3` + Bash, systemd |
-| **usb-autoinstall-public** | Ephemeral security workstation USB installer — **ARCHIVED on GitHub**, superseded by `hub` | Bash, shellcheck, Ubuntu 25.10 autoinstall, 4-partition USB |
-| **ollama** | Local LLM management (separate from morning-brief) | Ollama runtime |
-| **atrade** | Low-frequency autonomous paper-trading bot; consumes morning-brief signals | Python |
-| **Prompt-Fishing** | **Parked indefinitely** — do not propose features | Next.js, TypeScript |
-| **water-monitor-infra** | Water quality monitoring infrastructure | TBD |
-| **log-sentinel** | Security log analysis | TBD |
-| **impact-etl** | Data pipeline for impact metrics | TBD |
+Everything runs on **hub**: an always-on, headless Ubuntu Server 26.04 box on the Tailnet (LUKS + TPM auto-unlock, CIS-hardened, persistent). The old weekly-rebuilt USB workstation is retired.
 
-## In-Flight Plans (not yet scaffolded)
+- **PM:** a Project Manager Claude runs on hub in a durable `screen` session (`pm`). The operator reaches it from the phone over SSH (Shellfish) and supervises asynchronously, often from a watch.
+- **AI developers:** each feature is built by `dtl ai run` (in-session, PM-reviewed) or by the nightly loop: `dtl-workflow@<project>.timer` at about 02:00 UTC builds the first `Status: Not Started` feature, opens a PR and auto-merges on green CI.
+- **Planning handoff:** one `PLAN-<name>.md` file dropped at the top level of the Proton Drive folder `hub/pm-inbox`. Hub fetches it within 15 minutes and pings the phone, and the PM turns it into a DEVPLAN PR (features) or a scaffold-ready check (new project). See `PLANNING-GUIDE.md`.
+- **Notifications:** ntfy on hub pushes to the phone (`hub-alert`): finished runs, failures, "PM needs you". No other alert channel works.
 
-Live planning artifacts in `~/Projects/NEW-PROJECTS/`. Scan this directory before proposing a brief — if your idea overlaps with one of these, fold into it rather than spinning up a parallel repo.
+## Projects
 
-| Plan | Status | Will become |
+| Project | State | Visibility | Purpose | Stack |
+|---|---|---|---|---|
+| **hub** | active | private | The always-on box itself: install, hardening, services, backups, the PM's tooling | Ubuntu 26.04, Ansible (konstruktoid.hardening), Bash + distro python3, systemd, Docker (rootless for the operator), Tailscale, ntfy, Glance/Beszel, Ollama |
+| **devtools** | active | public | `dtl`: scaffolder and AI-dev orchestrator, plus these planning templates | Python 3.11, stdlib-only, single file |
+| **loom** | active | public | Overnight music-video pipeline | Python 3.11, Click, httpx, librosa, ffmpeg, ComfyUI, systemd timer |
+| **morning-brief** | active | public | Daily news dashboard; also writes the signals file atrade reads | Python 3.11, httpx, SQLite, Ollama, Jinja2, Click, Cloudflare Pages |
+| **atrade** | active | private | Low-frequency autonomous **paper**-trading bot (live trading hard-guarded out) | Python |
+| Prompt-Fishing, crystallize | parked | — | Don't propose features | — |
+| ollama | dormant | public | Planning only, no CI | — |
+| impact-etl, log-sentinel, water-monitor-infra | stub | — | Planning `CLAUDE.md` only; a plan may revive one as a new project | — |
+| usb-autoinstall-public | archived | public | Superseded by hub | — |
+
+If an idea overlaps an active repo, plan it as **features for that repo**. One repo per deployment surface: anything that configures hub belongs in hub.
+
+## Hardware (hub)
+
+| Component | Spec | Planning impact |
 |---|---|---|
-| _(none currently)_ | — | `hub` graduated to a live repo (see Active Projects) on 2026-05-12; ~10 features merged, host integrations (claude-agent-runner, dtl-workflow-scheduling, action/voice/watch handlers, break-glass, docs) still queued. `~/Projects/NEW-PROJECTS/` now holds only `ARCHIVE/`. |
+| GPU | NVIDIA RTX 2060, 6 GB VRAM | About 7–8B models at Q4 locally; bigger means CPU offload or the API |
+| CPU | AMD Ryzen 5 3600XT, 6 cores / 12 threads | |
+| RAM | 32 GB | Comfortable for compose stacks plus one model |
+| Storage | 500 GB NVMe (system + `/data`), 2 TB HDD (backups) | Large media lives in `/data`; the HDD is backup-only |
+| Local models (Ollama) | qwen2.5:7b, qwen2.5-coder:7b, qwen3:8b, phi4-mini | |
+| Network | Home LAN + Tailscale; no inbound from the internet | |
 
-## Cross-Cutting Conventions
+**GPU and schedule tenants (UTC):** dtl nightly loop about 02:00 · borg backup 03:00 · off-site upload 04:00 · morning-brief 08:15 · atrade weekdays 10:30 · loom overnight when enabled. A new GPU job must name its window.
 
-**Gitflow branching** — every project uses `main`, `develop`, `feature/*`, `fix/*`, `release/*`, `hotfix/*`. Feature branches merge to develop via PR. Never commit directly to main or develop. AI developers commit but do not push.
+## Conventions every plan inherits
 
-**Conventional commits** — `feat:`, `fix:`, `docs:`, `test:`, `chore:`, `refactor:`.
+- **Gitflow:** `main`, `develop`, `feature/*`, `fix/*`, `chore/*`, `docs/*`, `release/*`, `hotfix/*`. Features merge to `develop` by PR; the operator decides releases to `main`. AI developers commit but never push; the PM pushes.
+- **Conventional commits:** `feat:`, `fix:`, `docs:`, `test:`, `chore:`, `refactor:`.
+- **CI is the merge gate:** ruff (pinned `0.16.4`, explicit `select`) and pytest (plus shellcheck/yamllint where relevant) on every PR, as **required** checks. A job that runs but isn't required gates nothing. CI installs dependencies from the project's own declaration (`pyproject.toml`), never a hand-written list.
+- **Tests execute the real boundary.** Features in hub, morning-brief and loom merged green and broke in production because tests checked text instead of behaviour. Criteria must run the thing: CLI exit codes, real config parsing, scripts against stub binaries that record their arguments. Hardware or live-account checks become `[HUMAN]` criteria.
+- **Repo defaults for new projects:** private, full nightly workflow, auto-merge, unless the plan says otherwise. GitHub Pro: auto-merge works on private and public alike, so visibility is a confidentiality choice only.
+- **Secrets:** never in code or repos. They live on the SECRETS USB (mounted on hub at `/etc/hub/secrets`), as systemd credentials (`LoadCredential`), GitHub Actions secrets, or in Proton Pass. Everything else is config via env vars.
+- **Network:** the Tailnet is the perimeter; no inbound from the internet. Every bind address is explicit (`127.0.0.1` or `tailscale0`), never `0.0.0.0`. Projects that bind, hold credentials, talk to another device or run unattended declare a `## Network Segmentation and Trust Boundaries` block in their `CLAUDE.md`.
+- **Containers:** `cap_drop: ALL`, `no-new-privileges`, AppArmor profile. On hub, the operator's containers run under rootless Docker.
+- **Scheduling:** systemd timers (user units for the operator's jobs; linger is on). Overnight AI development is the `dtl-workflow@` timer, not ad-hoc `--schedule` runs.
+- **Security-sensitive features are supervised:** credentials, deletion, network or permission changes are built by the PM in session and reviewed against the real system, not left to the nightly loop. They're queued with a status the loop skips (`Ready (supervised)`).
+- **No real names:** never the operator's real name in code, docs, commits or PRs. Use "the operator".
+- **DEVPLAN vs FEATURE-REQUESTS:** `docs/DEVPLAN.md` is the committed work queue (one `## Feature:` per branch). `docs/FEATURE-REQUESTS.md` is the backlog of ideas, parked items and nice-to-haves. Entries graduate from the backlog into the DEVPLAN when they're specced.
 
-**Security posture** — no secrets in code, all config via env vars, Docker containers run with `cap_drop: ALL` and `no-new-privileges`, SSH keys live on the SECRETS USB partition (persist across weekly workstation rebuilds).
+## LLM and budget
 
-**Network segmentation & trust boundaries** — every project that binds to a non-loopback interface, holds credentials, accepts input from another device, or deploys to metal must declare its segmentation level explicitly in the `## Network Segmentation and Trust Boundaries` block of its `CLAUDE.md`. Bind addresses are never implicit: `127.0.0.1`, `tailscale0`, or `0.0.0.0` is a decision, not a default. The Tailnet is the perimeter for personal infrastructure; the public internet is never directly reachable inbound. New projects inherit this convention unless they explicitly opt out and justify the choice.
+- **Claude Pro is the developer:** the PM, `dtl ai run` and the nightly loop all use the Pro login. The weekly allowance resets Sunday 14:00 ET; aim for steady use of about 14% a day.
+- **The Claude API is an app component**, not a backup developer: in-product features only, in a workspace capped at $40/month.
+- **Local-first for bulk work:** Ollama on hub. Electricity is off-peak overnight; the total budget is $5–10/week.
 
-**Repo visibility & scheduling eligibility** — the user is on **GitHub Pro**. `gh pr merge --auto` is available on **both** public and private repos, so `dtl workflow run --schedule HH:MM` can chain features unattended overnight regardless of visibility. Visibility is therefore a *confidentiality* decision, not a scheduling constraint: keep infrastructure/security internals private (`hub`), keep portfolio-worthy tools public (`devtools`, `loom`, `morning-brief`). Each project's `PROJECT-BRIEF.md` declares its visibility. (Historical note: under the old GitHub Free plan, private repos could not auto-merge and were daytime/manual-only — that limitation no longer applies, so don't propose "make it public just to schedule it.")
+## Hosting and backups
 
-| Visibility | Auto-merge | Development model | Examples |
-|---|---|---|---|
-| Public | yes | overnight-scheduled, unattended | devtools, morning-brief, loom |
-| Private | yes (on Pro) | overnight-scheduled, unattended | hub, atrade |
+- **Static sites:** Cloudflare Pages; auth-gated APIs on Cloudflare Workers. The free tier is enough.
+- **Backups:** hub's state (`/data` and the operator's home) gets a nightly borg backup to the HDD and a nightly encrypted copy to Proton Drive. A project that keeps irreplaceable state must put it under one of those paths, or say how else it's backed up.
 
-**Ephemeral workstation** — User's current development machine is reinstalled from USB roughly weekly. All persistent state must live in: (a) git repos on GitHub, (b) the SECRETS USB partition, (c) Docker named volumes for OAuth tokens. Nothing on `/home` is permanent. **Exception in progress:** `hub` is being stood up as a *persistent*, non-ephemeral box (LUKS+TPM2 auto-unlock, no weekly rebuild) intended to become the daily driver and host the other projects. Once hub is live on real hardware, the weekly-rebuild assumption applies only to break-glass recovery, not a routine cadence — and this Hardware section should be updated to hub's specs.
+## Default stack (when the plan says "PM decides")
 
-**LLM strategy** — local-first. Use Ollama (Qwen 2.5 7B on RTX 2060) for bulk work. Use Claude API only for synthesis or high-reasoning tasks where quality matters more than cost. Budget: $5-10/week total.
+| Need | Default |
+|---|---|
+| Language | Python 3.11+ |
+| HTTP | httpx |
+| Database | SQLite |
+| CLI | Click (`argparse` when avoiding dependencies) |
+| Templating / terminal UI | Jinja2 / Rich |
+| Logging, paths | `logging` (never `print`), `pathlib.Path` |
+| Shell | Bash, `set -euo pipefail`, shellcheck-clean |
+| Containers | Docker Compose, multi-stage, slim runtime |
+| Lint | `ruff check . && ruff format --check .` |
 
-**Remote access** — Tailscale mesh VPN. Phone access via Terminus SSH over Tailscale. the user manages projects from their phone via claude.ai and SSH terminal.
+## When to deviate
 
-**Scheduling** — systemd user units (`.service` + `.timer`) for batch jobs. `dtl workflow run --schedule HH:MM` for overnight autonomous development, typically 02:00 for off-peak electricity. GPU tenants share the 00:00–05:30 window: loom (00:00–05:30), morning-brief (starts 05:30).
-
-**Hosting** — Cloudflare Pages for static sites, Cloudflare Workers for auth-gated APIs. Free tier is sufficient.
-
-**Planning artifacts — DEVPLAN vs FEATURE-REQUESTS** — every project's `docs/` holds two planning documents with distinct roles:
-
-- **`DEVPLAN.md`** — committed, concrete work queue. Each `## Feature:` has a branch name, acceptance criteria, file list, and a `Status:` field. `dtl workflow run` picks the next `Status: Not Started` feature and builds it.
-- **`FEATURE-REQUESTS.md`** — backlog: ideas, open problems, parked items. Entries start here. When concrete enough to spec (branch name + files + acceptance criteria), they get **promoted** to `DEVPLAN.md` and marked "Promoted to DEVPLAN {date}" in the backlog stub.
-
-Don't conflate them. A loose idea belongs in FEATURE-REQUESTS; a shippable branch belongs in DEVPLAN.
-
-**Workflow supervision** — `dtl watchdog install` scaffolds a systemd user timer that runs anomaly detection (dead process, dirty-tree stall, PR silence, log growth) every N hours and notifies via each project's `.ai/notify.py`. Use this instead of tailing logs manually.
-
-**Off-workstation access** — the user manages projects primarily from iOS via Terminus SSH over Tailscale. Overnight workflow runs should be launchable and observable from the phone (logs readable, PR activity visible via `gh` CLI).
-
-## Default Stack Choices
-
-When the user says "PM decides" or hasn't expressed a preference, the PM will default to:
-
-| Need | Default | Why |
-|------|---------|-----|
-| Language | Python 3.11+ | Most existing projects, the user is fluent |
-| HTTP client | httpx (async) | Used in morning-brief, handles async well |
-| Database | SQLite | Single-user, simple, no server to maintain |
-| Templating | Jinja2 | Python standard, used in morning-brief |
-| CLI framework | Click | Matches morning-brief; `argparse` if avoiding deps |
-| Terminal UI | Rich | Used in morning-brief |
-| Logging | Python `logging` module (never `print`) | Project standard |
-| Paths | `pathlib.Path` (never string paths) | Project standard |
-| Containers | Docker Compose, multi-stage, slim runtime | Established pattern |
-| Shell scripts | Bash with `set -euo pipefail`, `shellcheck`-clean | Project standard |
-| Linting (Python) | `ruff check . && ruff format --check .` | Project standard |
-| Linting (Shell) | `shellcheck` | Project standard |
-
-## Hardware
-
-The workstation's hardware determines what is feasible locally (inference speed, VRAM budget, storage headroom) and what must be offloaded to cloud or deferred. Always read this section before proposing ML, media-processing, or compute-heavy features.
-
-| Component | Spec | Notes |
-|-----------|------|-------|
-| GPU | {model, e.g., RTX 2060} | {e.g., CUDA 12.x, used for local inference} |
-| VRAM | {GB} | {max model size at full precision; quantized budget} |
-| RAM | {GB} | {available to host + containers} |
-| CPU | {model / core count} | {relevant for CPU-only inference or build times} |
-| Storage | {size, type} | {/ partition; ephemeral — rebuilds weekly} |
-| Network | {e.g., Tailscale mesh, home gigabit} | {bandwidth for model pulls, API calls} |
-| GPU tenants | {services sharing the GPU} | {e.g., Ollama, ComfyUI — VRAM contention} |
-| Remote access | {e.g., Terminus SSH over Tailscale} | {how the user reaches the machine from phone} |
-
-**Current workstation example** (update when hardware changes):
-
-| Component | Spec | Notes |
-|-----------|------|-------|
-| GPU | NVIDIA RTX 2060 | CUDA 12.x; primary inference device |
-| VRAM | 6 GB | Max ~7B param at Q4; 13B+ must be CPU-offloaded or cloud |
-| RAM | 32 GB DDR4 | Comfortable for Docker Compose stacks + Ollama |
-| CPU | {CPU model} | {fill in} |
-| Storage | {size} SSD | Ephemeral `/home`; persistent state on SECRETS USB or Docker volumes |
-| Network | Home gigabit + Tailscale mesh VPN | Low-latency to Cloudflare; Tailscale for phone/remote access |
-| GPU tenants | Ollama (Qwen 2.5 7B default) | ComfyUI shares VRAM when running — don't run both at full load |
-| Remote access | Terminus SSH over Tailscale | Primary mobile interface; user manages projects from iOS/Android |
-
-## When to Deviate
-
-Prefer existing patterns, but break the pattern when:
-
-- The new project has fundamentally different constraints (e.g., embedded device → Rust over Python)
-- An existing library is known to be painful for the specific use case (explain why)
-- the user explicitly asks for a new stack (honor it, but note any maintenance cost on an ephemeral workstation)
-
-When in doubt, ask the user. Capture the answer in the PROJECT-BRIEF's Stack Preferences section.
+When the constraints are fundamentally different (embedded device, browser-only app), when a default is known to be painful for the case, or when the operator asks. Say why in the plan's Key Decisions, and note the maintenance cost.
