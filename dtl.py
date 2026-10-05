@@ -756,6 +756,13 @@ def make_pyproject(name: str) -> str:
 
         [tool.setuptools.packages.find]
         where = ["src"]
+
+        [tool.ruff]
+        line-length = 100
+        target-version = "py311"
+
+        [tool.ruff.lint]
+        select = ["E", "F", "W", "I", "UP", "B"]
     """)
 
 
@@ -807,7 +814,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, "feature/**", "release/**", "hotfix/**"]
+    branches: [main, develop, "feature/**", "fix/**", "docs/**", "chore/**", "release/**", "hotfix/**"]
   pull_request:
     branches: [main, develop]
 
@@ -849,13 +856,16 @@ jobs:
     needs: [lint-and-test, shellcheck, security-scan]
     if: always()
     steps:
-      - name: Check job results
+      # Every needed job must SUCCEED: "skipped" fails too, so a mis-scoped job
+      # can't let a PR merge untested (devtools templates/ci/ci-ok-job.yml).
+      - name: All required jobs succeeded
+        env:
+          RESULTS: ${{{{ join(needs.*.result, ' ') }}}}
         run: |
-          if [[ "${{{{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}}}" == "true" ]]; then
-            echo "One or more required jobs did not succeed."
-            exit 1
-          fi
-          echo "All required jobs succeeded."
+          echo "job results: ${{RESULTS}}"
+          for r in ${{RESULTS}}; do
+            [[ "${{r}}" == "success" ]] || {{ echo "::error::a required job ended '${{r}}'"; exit 1; }}
+          done
 """
 
 
@@ -917,18 +927,20 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
               [ ${#scripts[@]} -eq 0 ] && exit 0
               shellcheck "${scripts[@]}"
 
-  ci-ok:
-    runs-on: ubuntu-latest
-    needs: [lint-and-test]
-    if: always()
-    steps:
-      - name: Check job results
-        run: |
-          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more required jobs did not succeed."
-            exit 1
-          fi
-          echo "All required jobs succeeded."
+      ci-ok:
+        runs-on: ubuntu-latest
+        needs: [lint-and-test]
+        if: always()
+        steps:
+          # Every needed job must SUCCEED; "skipped" fails too.
+          - name: All required jobs succeeded
+            env:
+              RESULTS: ${{ join(needs.*.result, ' ') }}
+            run: |
+              echo "job results: ${RESULTS}"
+              for r in ${RESULTS}; do
+                [[ "${r}" == "success" ]] || { echo "::error::a required job ended '${r}'"; exit 1; }
+              done
 """)
 
 
@@ -1593,8 +1605,8 @@ def make_notify_script() -> str:
         import json
         import os
         import sys
-        import urllib.request
         import urllib.parse
+        import urllib.request
         from pathlib import Path
 
 
@@ -1897,6 +1909,11 @@ def scaffold_project(
         files[ci_sh_path] = ci_sh_content
     if stack_name == "python":
         files[project_dir / "pyproject.toml"] = make_pyproject(name)
+        # git does not track empty directories, so an empty src/ vanishes on the
+        # first clone and `pip install -e .` fails ("egg_base 'src' does not exist").
+        pkg = name.replace("-", "_")
+        (project_dir / "src" / pkg).mkdir(parents=True, exist_ok=True)
+        files[project_dir / "src" / pkg / "__init__.py"] = f'"""{name}."""\n'
 
     if services:
         files[project_dir / "docker-compose.yml"] = make_docker_compose(services)
