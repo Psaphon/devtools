@@ -325,6 +325,9 @@ WORKFLOW_STALL_THRESHOLD = 3
 # Watchdog anomaly thresholds (v1 constants — not user-configurable).
 WATCHDOG_DIRTY_HOURS: int = 24  # dirty tree older than this triggers anomaly
 WATCHDOG_PR_IDLE_HOURS: int = 48  # no PR activity for this long triggers anomaly
+# Queued work waits for the next scheduled (nightly) run. Past this, no run has
+# picked it up, so the timer itself is suspect.
+WATCHDOG_QUEUE_WAIT_HOURS: int = 26
 WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers anomaly
 
 # Merge-wait bounds. The overnight loop used to poll `gh pr view` forever waiting
@@ -3751,6 +3754,22 @@ def _watchdog_write_state(state: dict) -> None:
         raise
 
 
+def _watchdog_queue_waiting_for_next_run(project_dir: Path, plan_path: Path) -> bool:
+    """True when the queue changed after the last run and hasn't waited too long."""
+    queued_at = datetime.datetime.fromtimestamp(plan_path.stat().st_mtime)
+    now = datetime.datetime.now()
+    if now - queued_at >= datetime.timedelta(hours=WATCHDOG_QUEUE_WAIT_HOURS):
+        return False
+    last_check = _read_workflow_state(project_dir).get("last_check")
+    if not last_check:
+        return True  # never run yet: the first scheduled run is still ahead
+    try:
+        last_run = datetime.datetime.fromisoformat(last_check)
+    except ValueError:
+        return False  # unreadable state: don't hide a possible anomaly
+    return last_run < queued_at
+
+
 def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
     """Anomaly A: 'dtl workflow run' absent when DEVPLAN has Not Started features."""
     plan_path = project_dir / "docs" / "DEVPLAN.md"
@@ -3770,6 +3789,14 @@ def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
         for f in not_started
     )
     if all_intentionally_halted:
+        return None
+
+    # Nightly scheduling: work queued since the last run is simply waiting for
+    # the next one, and is no anomaly until it has waited longer than a day.
+    # The DEVPLAN's mtime marks when the local queue last changed (edit or pull);
+    # the workflow state's last_check marks the last run that looked at it.
+    # Without this, every queued feature alerted every watchdog tick all day.
+    if _watchdog_queue_waiting_for_next_run(project_dir, plan_path):
         return None
 
     # Fallback: check whether a matching 'dtl workflow run' process exists.
