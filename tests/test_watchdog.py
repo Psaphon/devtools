@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import dtl
@@ -66,11 +68,75 @@ def make_project(tmp_path: Path, name: str = "myproject") -> Path:
     return project
 
 
-def write_devplan(project: Path, statuses: list[str]) -> None:
-    """Write a DEVPLAN.md with features at the given statuses."""
+def write_devplan(project: Path, statuses: list[str], queued_hours_ago: float = 30) -> None:
+    """Write a DEVPLAN.md with features at the given statuses.
+
+    The file's mtime is set ``queued_hours_ago`` in the past. The default is past
+    WATCHDOG_QUEUE_WAIT_HOURS, so the queue counts as overdue and anomaly A is
+    judged on the runner process alone, as before the nightly-wait rule.
+    """
     features = "\n".join(FEATURE_TEMPLATE.format(i=i, status=s) for i, s in enumerate(statuses))
     plan_text = SAMPLE_DEVPLAN_TEMPLATE.format(name=project.name, features=features)
-    (project / "docs" / "DEVPLAN.md").write_text(plan_text)
+    plan = project / "docs" / "DEVPLAN.md"
+    plan.write_text(plan_text)
+    stamp = time.time() - queued_hours_ago * 3600
+    os.utime(plan, (stamp, stamp))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_home(tmp_path, monkeypatch):
+    """Never read or write the real ~/.local/state/dtl workflow state."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
+def _record_run(project: Path, hours_ago: float) -> None:
+    """Write workflow state as if a scheduled run checked the project ``hours_ago``."""
+    when = datetime.datetime.now() - datetime.timedelta(hours=hours_ago)
+    path = dtl._workflow_state_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"last_check": when.isoformat(timespec="seconds")}))
+
+
+class TestWatchdogNightlyQueueWait:
+    """Queued work waits for the next nightly run; only an overdue queue alerts."""
+
+    def _no_runner(self):
+        return patch("subprocess.run", return_value=MagicMock(stdout="other\n", returncode=0))
+
+    def test_queued_today_never_run_waits(self, tmp_path):
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"], queued_hours_ago=2)
+        with self._no_runner():
+            assert dtl._watchdog_check_missing_runner(project) is None
+
+    def test_queued_after_last_run_waits(self, tmp_path):
+        project = make_project(tmp_path)
+        _record_run(project, hours_ago=10)
+        write_devplan(project, ["Not Started"], queued_hours_ago=2)
+        with self._no_runner():
+            assert dtl._watchdog_check_missing_runner(project) is None
+
+    def test_run_since_queued_but_work_left_alerts(self, tmp_path):
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"], queued_hours_ago=10)
+        _record_run(project, hours_ago=2)
+        with self._no_runner():
+            assert dtl._watchdog_check_missing_runner(project) is not None
+
+    def test_queue_overdue_with_no_run_alerts(self, tmp_path):
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"], queued_hours_ago=dtl.WATCHDOG_QUEUE_WAIT_HOURS + 1)
+        with self._no_runner():
+            assert dtl._watchdog_check_missing_runner(project) is not None
+
+    def test_unreadable_state_does_not_hide_anomaly(self, tmp_path):
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"], queued_hours_ago=2)
+        path = dtl._workflow_state_path(project)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"last_check": "not-a-date"}))
+        with self._no_runner():
+            assert dtl._watchdog_check_missing_runner(project) is not None
 
 
 # ---------------------------------------------------------------------------
