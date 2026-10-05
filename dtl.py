@@ -335,6 +335,11 @@ WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers
 MERGE_WAIT_POLL_S: int = 60  # seconds between PR state polls
 MERGE_WAIT_TIMEOUT_S: int = 3600  # abandon a PR that has neither merged nor failed
 
+# dtl never pushes these. The fleet rulesets reject direct pushes to them, and a
+# rejected push used to leave local develop one commit ahead of origin (observed
+# on batch-scout 2026-10-05). Status updates ride on the feature branch instead.
+PROTECTED_BRANCHES: tuple[str, ...] = ("main", "develop")
+
 # ---------------------------------------------------------------------------
 # CLAUDE.md template categories
 # ---------------------------------------------------------------------------
@@ -4210,7 +4215,12 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
 
 
 def _git_push_branch(project_dir: Path, branch: str) -> bool:
-    """Push the current branch to origin. Returns True on success."""
+    """Push the current branch to origin. Returns True on success.
+
+    This is dtl's only push. It refuses protected branches outright.
+    """
+    if branch in PROTECTED_BRANCHES:
+        return False
     result = subprocess.run(
         ["git", "push", "-u", "origin", branch],
         cwd=project_dir,
@@ -4219,6 +4229,32 @@ def _git_push_branch(project_dir: Path, branch: str) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+def _commit_merged_status(
+    project_dir: Path, plan_path: Path, feature_name: str, branch: str, pr_url: str
+) -> bool:
+    """Mark the feature Merged on its own branch and push, before auto-merge is on.
+
+    The squash merge then carries the status into develop, so nothing is ever
+    committed to develop directly. Returns False (and commits nothing) when the
+    checkout is not on ``branch`` or ``branch`` is protected.
+    """
+    if branch in PROTECTED_BRANCHES or _git_current_branch(project_dir) != branch:
+        return False
+    pr_match = re.search(r"/pull/(\d+)", pr_url)
+    status = f"Merged (#{pr_match.group(1)})" if pr_match else "Merged"
+    _update_feature_status(plan_path, feature_name, status)
+    subprocess.run(
+        ["git", "add", str(plan_path)], cwd=project_dir, capture_output=True, check=False
+    )
+    subprocess.run(
+        ["git", "commit", "-m", f"chore: mark {feature_name} {status}"],
+        cwd=project_dir,
+        capture_output=True,
+        check=False,
+    )
+    return _git_push_branch(project_dir, branch)
 
 
 def _gh_create_pr(
@@ -4706,38 +4742,21 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
 
     log.info("Creating PR...")
     pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
-    if pr_url:
-        log.info("PR created: %s", pr_url)
-        print(f"\nPR: {pr_url}")
-        if _gh_enable_auto_merge(project_dir, branch):
-            log.info("Auto-merge enabled.")
-            print("Auto-merge: enabled (will merge when CI passes)")
-        else:
-            log.info("Auto-merge not available — manual merge required.")
-    else:
+    if not pr_url:
         log.info("Failed to create PR — check gh auth status.")
         sys.exit(1)
+    log.info("PR created: %s", pr_url)
+    print(f"\nPR: {pr_url}")
 
-    # Step 5: update status
-    _update_feature_status(plan_path, feature["name"], "PR Open")
-    subprocess.run(
-        ["git", "add", str(plan_path)],
-        cwd=project_dir,
-        capture_output=True,
-        check=False,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", f"chore: update {feature['name']} status to PR Open"],
-        cwd=project_dir,
-        capture_output=True,
-        check=False,
-    )
-    subprocess.run(
-        ["git", "push"],
-        cwd=project_dir,
-        capture_output=True,
-        check=False,
-    )
+    # Step 5: record the status on the feature branch, then let it merge
+    if not _commit_merged_status(project_dir, plan_path, feature["name"], branch, pr_url):
+        log.info("Could not push the status commit to %s — enable auto-merge by hand.", branch)
+        sys.exit(1)
+    if _gh_enable_auto_merge(project_dir, branch):
+        log.info("Auto-merge enabled.")
+        print("Auto-merge: enabled (will merge when CI passes)")
+    else:
+        log.info("Auto-merge not available — manual merge required.")
 
     if not watch:
         return
@@ -4748,36 +4767,16 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
         time.sleep(60)
         state = _gh_pr_state(project_dir, branch)
         if state == "MERGED":
-            log.info("PR merged! Updating status.")
-            # Checkout develop and pull to get merge
+            log.info("PR merged; syncing develop (the status arrived with the merge).")
             subprocess.run(
                 ["git", "checkout", "develop"], cwd=project_dir, capture_output=True, check=False
             )
             subprocess.run(
-                ["git", "pull", "origin", "develop"],
+                ["git", "pull", "--ff-only", "origin", "develop"],
                 cwd=project_dir,
                 capture_output=True,
                 check=False,
             )
-            _update_feature_status(plan_path, feature["name"], "Merged")
-            subprocess.run(
-                ["git", "add", str(plan_path)],
-                cwd=project_dir,
-                capture_output=True,
-                check=False,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "commit",
-                    "-m",
-                    f"chore: update {feature['name']} status to Merged",
-                ],
-                cwd=project_dir,
-                capture_output=True,
-                check=False,
-            )
-            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True, check=False)
             break
         elif state == "CLOSED":
             log.info("PR was closed without merging. Stopping.")
@@ -5523,36 +5522,29 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
             if pr_url:
                 log.info("[%s] PR created: %s", project_dir.name, pr_url)
-                if _gh_enable_auto_merge(project_dir, branch):
-                    log.info("[%s] Auto-merge enabled.", project_dir.name)
-                else:
-                    log.info(
-                        "[%s] Auto-merge not available — manual merge required.",
-                        project_dir.name,
-                    )
             else:
                 log.info("[%s] Failed to create PR.", project_dir.name)
                 continue
 
-            _update_feature_status(plan_path, next_feature["name"], "PR Open")
-            subprocess.run(
-                ["git", "add", str(plan_path)],
-                cwd=project_dir,
-                capture_output=True,
-                check=False,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "commit",
-                    "-m",
-                    f"chore: update {next_feature['name']} status to PR Open",
-                ],
-                cwd=project_dir,
-                capture_output=True,
-                check=False,
-            )
-            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True, check=False)
+            # Status rides on the feature branch so the squash merge carries it
+            # into develop; it must be pushed before auto-merge can fire.
+            if not _commit_merged_status(
+                project_dir, plan_path, next_feature["name"], branch, pr_url
+            ):
+                log.info(
+                    "[%s] Could not push the status commit to %s; leaving %s unmerged.",
+                    project_dir.name,
+                    branch,
+                    pr_url,
+                )
+                continue
+            if _gh_enable_auto_merge(project_dir, branch):
+                log.info("[%s] Auto-merge enabled.", project_dir.name)
+            else:
+                log.info(
+                    "[%s] Auto-merge not available — manual merge required.",
+                    project_dir.name,
+                )
 
             # Poll for merge. Bounded: a PR whose checks have gone red will never
             # reach MERGED, so waiting on it starves every remaining feature.
@@ -5570,31 +5562,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         check=False,
                     )
                     subprocess.run(
-                        ["git", "pull", "origin", "develop"],
-                        cwd=project_dir,
-                        capture_output=True,
-                        check=False,
-                    )
-                    _update_feature_status(plan_path, next_feature["name"], "Merged")
-                    subprocess.run(
-                        ["git", "add", str(plan_path)],
-                        cwd=project_dir,
-                        capture_output=True,
-                        check=False,
-                    )
-                    subprocess.run(
-                        [
-                            "git",
-                            "commit",
-                            "-m",
-                            f"chore: update {next_feature['name']} status to Merged",
-                        ],
-                        cwd=project_dir,
-                        capture_output=True,
-                        check=False,
-                    )
-                    subprocess.run(
-                        ["git", "push"],
+                        ["git", "pull", "--ff-only", "origin", "develop"],
                         cwd=project_dir,
                         capture_output=True,
                         check=False,
