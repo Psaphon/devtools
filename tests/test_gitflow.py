@@ -221,16 +221,39 @@ class TestCmdWorkflowFinish:
             patch("dtl._run_lint_and_tests", return_value=(True, "all passed")),
             patch("dtl._git_is_dirty", return_value=False),
             patch("dtl._git_push_branch", return_value=True),
-            patch("dtl._gh_create_pr", return_value="https://github.com/test/pr/1") as mock_pr,
-            patch("dtl.subprocess.run"),  # for git add/commit/push of status
+            patch("dtl._gh_create_pr", return_value="https://github.com/test/pull/1") as mock_pr,
+            patch("dtl._gh_enable_auto_merge", return_value=True) as mock_auto,
+            patch("dtl.subprocess.run"),  # for git add/commit of status
         ):
             cmd_workflow_finish(args)
 
         mock_pr.assert_called_once()
-        # Status should be PR Open
+        mock_auto.assert_called_once()
+        # The status is recorded on the feature branch, so the merge carries it
         _, features = _parse_devplan(plan_file.read_text())
         beta = next(f for f in features if f["name"] == "beta-feature")
-        assert beta["status"] == "PR Open"
+        assert beta["status"] == "Merged (#1)"
+
+    def test_auto_merge_waits_for_status_push(self, tmp_path):
+        plan_file = self._make_project(tmp_path)
+        args = MagicMock()
+        args.plan = str(plan_file)
+        args.project = str(tmp_path)
+        args.watch = False
+
+        # First push (the feature) succeeds; the status push fails.
+        with (
+            patch("dtl._git_current_branch", return_value="feature/beta-feature"),
+            patch("dtl._run_lint_and_tests", return_value=(True, "ok")),
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_push_branch", side_effect=[True, False]),
+            patch("dtl._gh_create_pr", return_value="https://github.com/test/pull/1"),
+            patch("dtl._gh_enable_auto_merge") as mock_auto,
+            patch("dtl.subprocess.run"),
+            pytest.raises(SystemExit),
+        ):
+            cmd_workflow_finish(args)
+        mock_auto.assert_not_called()
 
     def test_exits_on_push_failure(self, tmp_path):
         plan_file = self._make_project(tmp_path)

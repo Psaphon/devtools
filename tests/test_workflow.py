@@ -1409,6 +1409,7 @@ Beta goal.
             patch("dtl._git_push_branch", return_value=True),
             patch("dtl._gh_create_pr", return_value="https://github.com/org/repo/pull/7"),
             patch("dtl._gh_enable_auto_merge", return_value=True),
+            patch("dtl._commit_merged_status", return_value=True),
             patch("dtl._gh_pr_state", return_value="MERGED"),
             patch("dtl._update_feature_status", side_effect=fake_update_status),
             patch("dtl.time.sleep"),
@@ -2279,6 +2280,7 @@ Beta goal.
             patch("dtl._git_push_branch", return_value=True),
             patch("dtl._gh_create_pr", return_value="https://github.com/org/repo/pull/7"),
             patch("dtl._gh_enable_auto_merge", return_value=True),
+            patch("dtl._commit_merged_status", return_value=True),
             # The PR never merges and is never closed -- the hang condition.
             patch("dtl._gh_pr_state", return_value="OPEN"),
             patch("dtl._gh_pr_checks", return_value=checks_return),
