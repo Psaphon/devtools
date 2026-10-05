@@ -152,8 +152,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        # ruff is a test dependency: tests run `ruff format --check` on generated files.
-        run: pip install pytest ruff==0.16.4
+        # ruff and pyyaml are test dependencies: tests run `ruff format --check` on
+        # generated files and parse the generated CI workflows.
+        run: pip install pytest pyyaml ruff==0.16.4
       - name: Run unit tests
         run: pytest tests/ -v
 

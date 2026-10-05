@@ -262,7 +262,8 @@ def test_scaffold_goes_green(tmp_path, exec_dir):
     - The subprocess cannot see the host's user site or ~/.local/bin, so a pytest
       installed on the developer's machine cannot stand in for a missing one.
     """
-    project_dir = scaffold_project("greentest", "python", [], tmp_path)
+    # With the AI sandbox, as `dtl new --ai claude` creates it: .ai/notify.py is linted too.
+    project_dir = scaffold_project("greentest", "python", [], tmp_path, ai_providers=["claude"])
     pyproject = project_dir / "pyproject.toml"
     assert pyproject.exists(), "python scaffold must declare its own dependencies"
 
@@ -298,6 +299,16 @@ def test_scaffold_goes_green(tmp_path, exec_dir):
                 assert devonlyprobe.MARKER == "dev-extra"
         """)
     )
+
+    # CI runs on a clone, and git does not keep empty directories. Running in the
+    # scaffold dir itself hid an empty src/ that broke `pip install -e .` on GitHub.
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run([*git, "init", "-q"], cwd=project_dir, check=True)
+    subprocess.run([*git, "add", "-A"], cwd=project_dir, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "scaffold"], cwd=project_dir, check=True)
+    clone_dir = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(project_dir), str(clone_dir)], check=True)
+    project_dir = clone_dir
 
     ci_sh = project_dir / "scripts" / "ci.sh"
     assert ci_sh.exists(), "Python scaffold must generate scripts/ci.sh"

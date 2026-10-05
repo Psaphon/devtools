@@ -1,8 +1,12 @@
 """Tests for ci-ok aggregation gate in generated CI workflows."""
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -139,3 +143,46 @@ def test_scaffold_ci_written_file_contains_ci_ok(tmp_path):
     assert "needs: [lint-and-test]" in content
     assert "if: always()" in content
     assert "needs.*.result" in content
+
+
+# ---------------------------------------------------------------------------
+# ci-ok structure and behaviour: parsed YAML, and the gate script actually run
+# ---------------------------------------------------------------------------
+
+_TEMPLATES = {name: make_ci_workflow("p", STACKS[name]) for name in STACKS}
+_TEMPLATES["fallback"] = _CI_YML_SCAFFOLD
+
+
+@pytest.mark.parametrize("label", sorted(_TEMPLATES))
+def test_ci_ok_is_a_job_that_needs_every_other_job(label: str) -> None:
+    jobs = yaml.safe_load(_TEMPLATES[label])["jobs"]
+    assert "ci-ok" in jobs, "ci-ok must sit under jobs:"
+    assert sorted(jobs["ci-ok"]["needs"]) == sorted(j for j in jobs if j != "ci-ok")
+    assert "contains(needs" not in _TEMPLATES[label], "skipped must not pass ci-ok"
+
+
+@pytest.mark.parametrize("label", sorted(_TEMPLATES))
+@pytest.mark.parametrize(
+    ("results", "ok"),
+    [
+        ("success success", True),
+        ("success skipped", False),
+        ("failure", False),
+        ("cancelled", False),
+    ],
+)
+def test_ci_ok_gate_requires_every_job_to_succeed(label: str, results: str, ok: bool) -> None:
+    step = yaml.safe_load(_TEMPLATES[label])["jobs"]["ci-ok"]["steps"][0]
+    proc = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={"RESULTS": results, "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        check=False,
+    )
+    assert (proc.returncode == 0) is ok
+
+
+def test_python_template_runs_on_fix_docs_chore_pushes() -> None:
+    push = yaml.safe_load(_TEMPLATES["python"])[True]["push"]["branches"]
+    for pattern in ("feature/**", "fix/**", "docs/**", "chore/**"):
+        assert pattern in push
