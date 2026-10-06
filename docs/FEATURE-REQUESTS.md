@@ -147,8 +147,13 @@ See separate meta parking-lot note. One-way forward handoff breaks when plans hi
 **Root cause.** Line 1874-1886 in `dtl.py`:
 ```python
 cmd = [
-    "docker", "compose", "-f", str(compose_file),
-    "run", "--rm", "claude-code",
+    "docker",
+    "compose",
+    "-f",
+    str(compose_file),
+    "run",
+    "--rm",
+    "claude-code",
     "--print",  # <-- THIS IS THE BUG
 ]
 cmd.extend(["-p", prompt])

@@ -47,7 +47,9 @@ dtl.py (single file, stdlib-only Python)
 | `dtl-autodev.service` | systemd user unit for boot-triggered autonomous dev |
 | `templates/DEVPLAN.md` | Reusable development plan template |
 | `templates/CLAUDE.md` | Reusable project context template |
-| `templates/PLANNING-GUIDE.md` | Instructions for creating DEVPLANs from phone |
+| `templates/PLAN.md` | Single-file plan (new project or features), dropped in Proton `hub/pm-inbox` |
+| `templates/PLANNING-GUIDE.md` | Instructions for the phone planner (claude.ai) producing a `PLAN.md` |
+| (private) `hub/docs/planning/PROJECTS-CONTEXT.md` | The stable and conventions every plan inherits; private, not in this repo |
 | `docs/DEVPLAN.md` | This project's own development plan |
 | `env.example` | Template for API keys and git identity |
 

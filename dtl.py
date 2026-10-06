@@ -36,7 +36,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import functools
+import hashlib
 import json
 import logging
 import os
@@ -44,17 +47,27 @@ import re
 import select
 import subprocess
 import sys
-import textwrap
 import tempfile
+import textwrap
 import time
+import tomllib
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Fleet-wide constants
+# ---------------------------------------------------------------------------
+
+# Pinned ruff version — used in generated scripts/ci.sh so that an upstream
+# ruff release cannot turn CI red with no change on our side.
+RUFF_VERSION = "0.16.4"
 
 # ---------------------------------------------------------------------------
 # Stack definitions
 # ---------------------------------------------------------------------------
 
-STACKS: Dict[str, dict] = {
+STACKS: dict[str, dict] = {
     "python": {
         "display": "Python 3.12",
         "image": "python:3.12-slim",
@@ -95,12 +108,26 @@ STACKS: Dict[str, dict] = {
               - uses: actions/setup-python@v5
                 with:
                   python-version: "3.12"
-              - run: pip install ruff pytest
-              - run: ruff check .
-              - run: ruff format --check .
-              - run: pytest --tb=short || true
+              - name: Run CI
+                run: bash scripts/ci.sh
         """),
         "claude_linter": "ruff check . && ruff format --check .",
+        "security_audit_step": textwrap.dedent("""\
+            - uses: actions/setup-python@v5
+              with:
+                python-version: "3.12"
+            - name: Dependency audit (pip-audit)
+              run: |
+                python -m venv /tmp/auditenv
+                /tmp/auditenv/bin/pip install -q --upgrade pip
+                if [ -f pyproject.toml ]; then
+                  /tmp/auditenv/bin/pip install -q -e .
+                elif [ -f requirements.txt ]; then
+                  /tmp/auditenv/bin/pip install -q -r requirements.txt
+                fi
+                /tmp/auditenv/bin/pip install -q pip-audit
+                /tmp/auditenv/bin/pip-audit --skip-editable
+        """),
     },
     "node": {
         "display": "Node.js 22 LTS",
@@ -140,6 +167,17 @@ STACKS: Dict[str, dict] = {
               - run: npm test || true
         """),
         "claude_linter": "npx eslint . && npx prettier --check .",
+        "security_audit_step": textwrap.dedent("""\
+            - uses: actions/setup-node@v4
+              with:
+                node-version: "22"
+            - name: Dependency audit (npm)
+              run: |
+                if [ -f package.json ]; then
+                  npm install --package-lock-only --ignore-scripts
+                  npm audit --audit-level=high
+                fi
+        """),
     },
     "go": {
         "display": "Go 1.23",
@@ -211,7 +249,7 @@ STACKS: Dict[str, dict] = {
     },
 }
 
-SERVICES: Dict[str, dict] = {
+SERVICES: dict[str, dict] = {
     "postgres": {
         "image": "postgres:16-alpine",
         "environment": {
@@ -234,15 +272,16 @@ SERVICES: Dict[str, dict] = {
 # AI provider, mode, and model definitions
 # ---------------------------------------------------------------------------
 
-AI_PROVIDERS_CONFIG: Dict[str, dict] = {
+AI_PROVIDERS_CONFIG: dict[str, dict] = {
     "claude": {
         "display": "Claude Code",
         "description": "Anthropic Claude Code CLI in a container",
         "image": "node:22-slim",
         "env_key": None,
+        "quota_source": "anthropic-shared",
         "models": {
-            "opus": "claude-opus-4-20250514",
-            "sonnet": "claude-sonnet-4-20250514",
+            "opus": "claude-opus-4-7",
+            "sonnet": "claude-sonnet-4-6",
             "haiku": "claude-haiku-4-5-20251001",
         },
         "default_model": "sonnet",
@@ -251,12 +290,13 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
     },
     "ollama": {
         "display": "Ollama (local models)",
-        "description": "Run open-source LLMs locally via Ollama",
+        "description": "Run open-source LLMs locally via Ollama (no-quota local fallback)",
         "image": "ollama/ollama:latest",
         "env_key": None,
+        "quota_source": "local",
         "models": {},
-        "default_model": None,
-        "supports_autonomous": False,
+        "default_model": "llama3",
+        "supports_autonomous": True,
         "supports_interactive": True,
     },
     "openclaw": {
@@ -264,6 +304,7 @@ AI_PROVIDERS_CONFIG: Dict[str, dict] = {
         "description": "Autonomous AI agent with native chat-app integration",
         "image": "ghcr.io/openclaw/openclaw:latest",
         "env_key": "ANTHROPIC_API_KEY",
+        "quota_source": "anthropic-shared",
         "models": {},
         "default_model": None,
         "supports_autonomous": True,
@@ -284,13 +325,29 @@ WORKFLOW_STALL_THRESHOLD = 3
 # Watchdog anomaly thresholds (v1 constants — not user-configurable).
 WATCHDOG_DIRTY_HOURS: int = 24  # dirty tree older than this triggers anomaly
 WATCHDOG_PR_IDLE_HOURS: int = 48  # no PR activity for this long triggers anomaly
+# Queued work waits for the next scheduled (nightly) run. Past this, no run has
+# picked it up, so the timer itself is suspect.
+WATCHDOG_QUEUE_WAIT_HOURS: int = 26
 WATCHDOG_LOG_GROWTH_MB_DAY: float = 100.0  # log growth rate above this triggers anomaly
+
+# Merge-wait bounds. The overnight loop used to poll `gh pr view` forever waiting
+# for a state of MERGED or CLOSED. A PR whose CI has gone red is neither -- it sits
+# at OPEN indefinitely -- so a single red check silently consumed an entire batch
+# and every later feature went unattempted (observed on atrade 2026-09-01, PR #7).
+# The loop now also inspects the check rollup and gives up after a hard deadline.
+MERGE_WAIT_POLL_S: int = 60  # seconds between PR state polls
+MERGE_WAIT_TIMEOUT_S: int = 3600  # abandon a PR that has neither merged nor failed
+
+# dtl never pushes these. The fleet rulesets reject direct pushes to them, and a
+# rejected push used to leave local develop one commit ahead of origin (observed
+# on batch-scout 2026-10-05). Status updates ride on the feature branch instead.
+PROTECTED_BRANCHES: tuple[str, ...] = ("main", "develop")
 
 # ---------------------------------------------------------------------------
 # CLAUDE.md template categories
 # ---------------------------------------------------------------------------
 
-CLAUDE_MD_TEMPLATES: Dict[str, str] = {
+CLAUDE_MD_TEMPLATES: dict[str, str] = {
     "general": "",  # uses make_claude_md default
     "terraform": textwrap.dedent("""\
 
@@ -375,6 +432,11 @@ CLAUDE_MD_TEMPLATES: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+def make_shellcheckrc() -> str:
+    """Generate .shellcheckrc so shellcheck behaves identically locally and in CI."""
+    return "external-sources=true\nsource-path=SCRIPTDIR\n"
+
+
 def make_gitignore(stack: dict) -> str:
     """Generate .gitignore content for the given stack."""
     common = textwrap.dedent("""\
@@ -430,6 +492,31 @@ def make_readme(name: str, stack_name: str) -> str:
 
         All development happens inside the devcontainer. See `CLAUDE.md`
         for commit conventions and workflow rules.
+
+        ## Branch Protection
+
+        In GitHub repository settings, require the `ci-ok` status check
+        (rather than individual matrix job names) so that all CI jobs must
+        pass before a pull request can merge.
+
+        ## Security Scanning
+
+        CI runs two security checks on every push:
+
+        - **Secret scanning** (gitleaks): detects committed credentials and API keys.
+        - **Dependency audit** (pip-audit / npm audit): flags packages with known CVEs.
+
+        ### Triaging findings
+
+        **Gitleaks** — if a secret is flagged:
+        1. Rotate the credential immediately (treat it as compromised).
+        2. Remove it from git history (`git filter-repo` or BFG Repo Cleaner).
+        3. If the match is a false positive, add a `.gitleaksignore` entry.
+
+        **Dependency audit** — if a vulnerable package is flagged:
+        1. Check the advisory for severity and whether your usage is affected.
+        2. Update to a patched version (`pip install -U <pkg>` / `npm update <pkg>`).
+        3. If no fix exists, assess workarounds or document the accepted risk.
     """)
 
 
@@ -455,7 +542,7 @@ def make_dockerfile(stack: dict) -> str:
 def make_devcontainer_json(
     name: str,
     stack: dict,
-    services: List[str],
+    services: list[str],
 ) -> str:
     """Generate devcontainer.json (returned as formatted JSON string)."""
     config: dict = {
@@ -484,14 +571,14 @@ def make_devcontainer_json(
 
 
 def make_docker_compose(
-    services_requested: List[str],
+    services_requested: list[str],
 ) -> str:
     """Generate docker-compose.yml for optional services."""
     lines = [
         "services:",
     ]
 
-    volumes_needed: List[str] = []
+    volumes_needed: list[str] = []
 
     for svc_name in services_requested:
         svc = SERVICES[svc_name]
@@ -649,36 +736,140 @@ def make_precommit_config() -> str:
     """)
 
 
+def make_pyproject(name: str) -> str:
+    """Generate a minimal pyproject.toml for the python scaffold.
+
+    scripts/ci.sh installs test tooling only from the project's own declaration.
+    Without this file a fresh scaffold declares nothing, so CI has no pytest and
+    the first push fails; the dev extra is where test dependencies belong.
+    """
+    return textwrap.dedent(f"""\
+        [project]
+        name = "{name}"
+        version = "0.1.0"
+        requires-python = ">=3.11"
+        dependencies = []
+
+        [project.optional-dependencies]
+        dev = ["pytest"]
+
+        [build-system]
+        requires = ["setuptools>=61"]
+        build-backend = "setuptools.build_meta"
+
+        [tool.setuptools.packages.find]
+        where = ["src"]
+
+        [tool.ruff]
+        line-length = 100
+        target-version = "py311"
+
+        [tool.ruff.lint]
+        select = ["E", "F", "W", "I", "UP", "B"]
+    """)
+
+
+def make_ci_sh(stack_name: str) -> str:
+    """Generate scripts/ci.sh — the single CI/local parity entrypoint for Python projects.
+
+    Both ci.yml and _run_lint_and_tests invoke this script so the two callers
+    cannot drift: there is only one definition of the lint/format/test sequence.
+    """
+    if stack_name != "python":
+        return ""  # only Python uses scripts/ci.sh today
+    return textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        # CI lint/format/test script — ONE definition, two callers.
+        # .github/workflows/ci.yml and dtl's local preflight (_run_lint_and_tests)
+        # both invoke this script.  Change steps here; CI and local cannot drift
+        # because there is only one of them.
+        set -euo pipefail
+
+        # Ruff at the pinned fleet version — installed separately from project deps
+        # so the pin is always honoured even when the project omits ruff from [dev].
+        pip install -q "ruff=={RUFF_VERSION}"
+
+        # Install from the project's declared dependencies — never a hand-written list.
+        # Detecting the [project.optional-dependencies] section selects the right form.
+        # A broken extra must fail CI loudly; there is NO || fallback.
+        if [ -f pyproject.toml ] && grep -qE '^\\[project\\.optional-dependencies\\]' pyproject.toml; then
+            pip install -q -e '.[dev]'
+        elif [ -f requirements.txt ]; then
+            pip install -q -r requirements.txt
+        elif [ -f pyproject.toml ]; then
+            pip install -q -e .
+        fi
+
+        ruff check .
+        ruff format --check .
+        # Tolerate exit-5 (no tests collected on an empty scaffold); fail on all others.
+        pytest --tb=short || {{ rc=$?; [ "$rc" -eq 5 ] && exit 0 || exit "$rc"; }}
+    """)
+
+
 def make_ci_workflow(name: str, stack: dict) -> str:
     """Generate .github/workflows/ci.yml."""
-    ci_setup = stack["ci_setup"].rstrip()
-    return textwrap.dedent(f"""\
-        name: CI
+    ci_setup = textwrap.indent(stack["ci_setup"].rstrip(), "      ")
+    security_audit_step = stack.get("security_audit_step", "").rstrip()
+    audit_block = textwrap.indent(security_audit_step, "      ") if security_audit_step else ""
+    return f"""\
+name: CI
 
-        on:
-          push:
-            branches: [main, develop, "feature/**", "release/**", "hotfix/**"]
-          pull_request:
-            branches: [main, develop]
+on:
+  push:
+    branches: [main, develop, "feature/**", "fix/**", "docs/**", "chore/**", "release/**", "hotfix/**"]
+  pull_request:
+    branches: [main, develop]
 
-        permissions:
-          contents: read
+permissions:
+  contents: read
 
-        jobs:
-          lint-and-test:
-            runs-on: ubuntu-latest
-            steps:
-              - uses: actions/checkout@v4
-        {ci_setup}
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+{ci_setup}
 
-          security-scan:
-            runs-on: ubuntu-latest
-            steps:
-              - uses: actions/checkout@v4
-              - uses: gitleaks/gitleaks-action@v2
-                env:
-                  GITLEAKS_LICENSE: ${{{{ secrets.GITLEAKS_LICENSE }}}}
-    """)
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: |
+          mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
+          [ ${{#scripts[@]}} -eq 0 ] && exit 0
+          shellcheck "${{scripts[@]}}"
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # gitleaks CLI against the working tree, unpacked to /tmp: the runner user
+      # cannot write /usr/local/bin. Same form as atrade's green CI.
+      - name: Secret scan (gitleaks)
+        run: |
+          GL=8.24.3
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${{GL}}/gitleaks_${{GL}}_linux_x64.tar.gz" \\
+            | tar -xz -C /tmp gitleaks
+          /tmp/gitleaks dir . --redact -v
+{audit_block}
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, shellcheck, security-scan]
+    if: always()
+    steps:
+      # Every needed job must SUCCEED: "skipped" fails too, so a mis-scoped job
+      # can't let a PR merge untested (devtools templates/ci/ci-ok-job.yml).
+      - name: All required jobs succeeded
+        env:
+          RESULTS: ${{{{ join(needs.*.result, ' ') }}}}
+        run: |
+          echo "job results: ${{RESULTS}}"
+          for r in ${{RESULTS}}; do
+            [[ "${{r}}" == "success" ]] || {{ echo "::error::a required job ended '${{r}}'"; exit 1; }}
+          done
+"""
 
 
 _CI_YML_SCAFFOLD = textwrap.dedent("""\
@@ -715,17 +906,44 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
 
           - name: Lint (ruff)
             if: steps.pycheck.outputs.found == 'true'
-            run: pip install ruff && ruff check .
+            run: pip install "ruff==0.16.4" && ruff check .
 
           - name: Format check (ruff)
             if: steps.pycheck.outputs.found == 'true'
             run: ruff format --check .
 
-          - name: Test (pytest)
+          - name: Install deps and test (pytest)
             if: steps.pycheck.outputs.found == 'true'
             run: |
-              pip install pytest
-              pytest --tb=short -q; RET=$?; [ $RET -eq 5 ] && exit 0 || exit $RET
+              if [ -f pyproject.toml ] && grep -qE '^\\[project\\.optional-dependencies\\]' pyproject.toml; then
+                pip install -q -e '.[dev]'
+              elif [ -f requirements.txt ]; then
+                pip install -q -r requirements.txt
+              elif [ -f pyproject.toml ]; then
+                pip install -q -e .
+              fi
+              pytest --tb=short -q || { rc=$?; [ "$rc" -eq 5 ] && exit 0 || exit "$rc"; }
+
+          - name: Shellcheck
+            run: |
+              mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
+              [ ${#scripts[@]} -eq 0 ] && exit 0
+              shellcheck "${scripts[@]}"
+
+      ci-ok:
+        runs-on: ubuntu-latest
+        needs: [lint-and-test]
+        if: always()
+        steps:
+          # Every needed job must SUCCEED; "skipped" fails too.
+          - name: All required jobs succeeded
+            env:
+              RESULTS: ${{ join(needs.*.result, ' ') }}
+            run: |
+              echo "job results: ${RESULTS}"
+              for r in ${RESULTS}; do
+                [[ "${r}" == "success" ]] || { echo "::error::a required job ended '${r}'"; exit 1; }
+              done
 """)
 
 
@@ -761,7 +979,7 @@ def make_cd_workflow(name: str) -> str:
     """)
 
 
-def make_env_example(services: List[str]) -> str:
+def make_env_example(services: list[str]) -> str:
     """Generate .env.example with placeholder values."""
     lines = ["# Copy to .env and fill in real values", ""]
     if "postgres" in services:
@@ -799,7 +1017,7 @@ def make_ai_cloud_init() -> str:
             shell: /bin/bash
             sudo: ALL=(ALL) NOPASSWD:ALL
             ssh_authorized_keys:
-              - {pub_key if pub_key else "# NO KEY FOUND -- run: ssh-keygen -t ed25519 -f ~/.ssh/ai-sandbox-key -N ''"}
+              - {pub_key or "# NO KEY FOUND -- run: ssh-keygen -t ed25519 -f ~/.ssh/ai-sandbox-key -N ''"}
 
         package_update: true
         packages:
@@ -856,7 +1074,7 @@ def make_ai_cloud_init() -> str:
     """)
 
 
-def make_ai_vm_config(name: str, ai_providers: List[str]) -> str:
+def make_ai_vm_config(name: str, ai_providers: list[str]) -> str:
     """Generate QEMU launch script for the AI sandbox VM."""
     # Build restricted SLIRP network: SSH + Anthropic API proxy + optional Ollama
     # restrict=on blocks all outbound traffic; guestfwd creates explicit allowlist
@@ -1059,8 +1277,8 @@ def make_ai_makefile(name: str) -> str:
 
 
 def make_ai_vm_compose(
-    ai_providers: List[str],
-    mcp_servers: List[str] | None = None,
+    ai_providers: list[str],
+    mcp_servers: list[str] | None = None,
 ) -> str:
     """Generate docker-compose.yml for containers inside the AI sandbox VM."""
     lines = ["services:"]
@@ -1103,7 +1321,7 @@ def make_ai_vm_compose(
     return "\n".join(lines) + "\n"
 
 
-def _mcp_compose_entry(server_name: str) -> List[str]:
+def _mcp_compose_entry(server_name: str) -> list[str]:
     """Return docker-compose lines for a single isolated MCP server."""
     return [
         f"  mcp-{server_name}:",
@@ -1137,6 +1355,7 @@ def make_ai_claude_dockerfile() -> str:
         RUN apt-get update && apt-get install -y --no-install-recommends \\
                 git \\
                 ripgrep \\
+                shellcheck \\
                 python3 \\
                 python3-pip \\
                 python3-venv \\
@@ -1147,12 +1366,16 @@ def make_ai_claude_dockerfile() -> str:
         # Install Claude Code
         RUN npm install -g @anthropic-ai/claude-code
 
-        # Set up home directory for host-mapped user (UID 1000)
-        RUN mkdir -p /home/claude/.claude && chown -R 1000:1000 /home/claude
+        # Home directory owned by the uid the container runs as. dtl passes it
+        # (compose build args HOME_UID/HOME_GID): the host uid, or 0 under
+        # rootless Docker, where container uid 0 is the host user.
+        ARG HOME_UID=1000
+        ARG HOME_GID=1000
+        RUN mkdir -p /home/claude/.claude && chown -R ${HOME_UID}:${HOME_GID} /home/claude
 
         # Copy settings into Claude Code's config directory
         COPY settings.json /home/claude/.claude/settings.json
-        RUN chown 1000:1000 /home/claude/.claude/settings.json
+        RUN chown ${HOME_UID}:${HOME_GID} /home/claude/.claude/settings.json
 
         ENV HOME=/home/claude
         WORKDIR /workspace
@@ -1162,10 +1385,17 @@ def make_ai_claude_dockerfile() -> str:
 
 
 def make_ai_claude_settings(
-    ai_providers: List[str],
-    mcp_servers: List[str] | None = None,
+    ai_providers: list[str],
+    mcp_servers: list[str] | None = None,
+    model: str | None = None,
 ) -> str:
-    """Generate Claude Code settings for the sandbox."""
+    """Generate Claude Code settings for the sandbox.
+
+    ``model`` is pinned in settings.json, which the container bind-mounts and the
+    CLI reads. Without a pin the sandbox runs on whatever the CLI defaults to,
+    which can change with an image rebuild. The default is the provider's
+    ``default_model`` alias (``sonnet``), so code writing stays on Sonnet.
+    """
     mcp_config: dict = {}
     for srv in mcp_servers or []:
         binary_name = MCP_KNOWN_PACKAGES.get(srv, srv).rsplit("/", 1)[-1]
@@ -1175,6 +1405,7 @@ def make_ai_claude_settings(
         }
 
     settings: dict = {
+        "model": model or AI_PROVIDERS_CONFIG["claude"]["default_model"],
         "permissions": {
             "allow": [
                 "Bash(*)",
@@ -1208,22 +1439,27 @@ def make_ai_claude_settings(
 def make_ai_docker_compose(
     provider: str,
     model: str | None = None,
-    mcp_servers: List[str] | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> str:
     """Generate docker-compose.yml for Docker-mode AI setup."""
     lines = ["services:"]
 
     if provider == "claude":
-        model_env = ""
-        if model:
-            pconfig = AI_PROVIDERS_CONFIG["claude"]
-            model_id = pconfig["models"].get(model, model)
-            model_env = f"      - CLAUDE_MODEL={model_id}"
+        # Claude Code reads ANTHROPIC_MODEL; CLAUDE_MODEL is ignored, so the old
+        # variable left every sandbox on the CLI default. Pass the alias through
+        # ("sonnet", not a dated id) so the CLI resolves its current Sonnet.
+        model_env = (
+            f"      - ANTHROPIC_MODEL={model or AI_PROVIDERS_CONFIG['claude']['default_model']}"
+        )
 
         lines.extend(
             [
                 "  claude-code:",
-                "    build: ./claude-code",
+                "    build:",
+                "      context: ./claude-code",
+                "      args:",
+                '        HOME_UID: "${UID:-1000}"',
+                '        HOME_GID: "${GID:-1000}"',
                 '    user: "${UID:-1000}:${GID:-1000}"',
                 "    volumes:",
                 "      - ../:/workspace",
@@ -1248,8 +1484,7 @@ def make_ai_docker_compose(
                 "      - GIT_COMMITTER_EMAIL=${GIT_AUTHOR_EMAIL:-dev@localhost}",
             ]
         )
-        if model_env:
-            lines.append(model_env)
+        lines.append(model_env)
         lines.append("")
 
     elif provider == "openclaw":
@@ -1310,7 +1545,7 @@ def make_ai_docker_compose(
             lines.extend(_mcp_compose_entry(srv))
 
     # Volumes
-    vol_lines: List[str] = []
+    vol_lines: list[str] = []
     compose_text = "\n".join(lines)
     if "claude-data:" in compose_text:
         vol_lines.append("  claude-data:")
@@ -1373,18 +1608,20 @@ def make_notify_script() -> str:
         import json
         import os
         import sys
-        import urllib.request
         import urllib.parse
+        import urllib.request
         from pathlib import Path
 
 
         def send_telegram(token: str, chat_id: str, message: str) -> bool:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            data = urllib.parse.urlencode({
-                "chat_id": chat_id,
-                "text": message[:4096],
-                "parse_mode": "Markdown",
-            }).encode()
+            data = urllib.parse.urlencode(
+                {
+                    "chat_id": chat_id,
+                    "text": message[:4096],
+                    "parse_mode": "Markdown",
+                }
+            ).encode()
             req = urllib.request.Request(url, data=data)
             try:
                 urllib.request.urlopen(req, timeout=10)
@@ -1410,7 +1647,10 @@ def make_notify_script() -> str:
             chat_id = os.environ.get("TELEGRAM_CHAT_ID", notify.get("telegram_chat_id") or "")
 
             if not token or not chat_id:
-                print("[notify] Telegram not configured. Set token and chat_id in .ai/config.json", file=sys.stderr)
+                print(
+                    "[notify] Telegram not configured. Set token and chat_id in .ai/config.json",
+                    file=sys.stderr,
+                )
                 print("[notify] or via TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars.", file=sys.stderr)
                 sys.exit(1)
 
@@ -1461,10 +1701,18 @@ def make_run_script(provider: str) -> str:
             echo "[dtl ai run] Prompt: $PROMPT"
 
             # Run Claude Code in print mode (non-interactive, autonomous)
+            #
+            # Capture the REAL exit status. `|| EXIT_CODE=$?` records what
+            # actually happened while stopping `set -e` from aborting first.
+            #
+            # Do NOT go back to `|| true` + ${PIPESTATUS[0]}: `|| true` runs a
+            # successful command, which resets PIPESTATUS, so the recorded
+            # status was unconditionally 0. Every failure — expired OAuth,
+            # crash, wall-clock kill — was reported as success.
+            EXIT_CODE=0
             RESULT=$(docker compose -f "$SCRIPT_DIR/docker-compose.yml" \\
                 run --rm claude-code \\
-                claude --print -p "$PROMPT" 2>&1) || true
-            EXIT_CODE=${PIPESTATUS[0]:-$?}
+                claude --print -p "$PROMPT" 2>&1) || EXIT_CODE=$?
 
             echo "$RESULT"
 
@@ -1551,7 +1799,7 @@ def make_run_script(provider: str) -> str:
 # Well-known MCP server packages (npm).  Keys are short names used with
 # ``add-mcp --name <key>``.  Unknown names are treated as raw npm package
 # identifiers so users can bring any server they want.
-MCP_KNOWN_PACKAGES: Dict[str, str] = {
+MCP_KNOWN_PACKAGES: dict[str, str] = {
     "filesystem": "@modelcontextprotocol/server-filesystem",
     "github": "@modelcontextprotocol/server-github",
     "memory": "@modelcontextprotocol/server-memory",
@@ -1608,9 +1856,9 @@ def make_mcp_server_config(server_name: str, project_path: str) -> str:
 def scaffold_project(
     name: str,
     stack_name: str,
-    services: List[str],
+    services: list[str],
     base_dir: Path,
-    ai_providers: List[str] | None = None,
+    ai_providers: list[str] | None = None,
     ai_mode: str = "docker",
     ai_model: str | None = None,
     claude_md_template: str = "general",
@@ -1631,18 +1879,18 @@ def scaffold_project(
         project_dir / "tests",
         project_dir / ".devcontainer",
         project_dir / ".github" / "workflows",
+        project_dir / "scripts",
     ]
 
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
     # -- files --
-    files: Dict[Path, str] = {
+    files: dict[Path, str] = {
+        project_dir / ".shellcheckrc": make_shellcheckrc(),
         project_dir / ".gitignore": make_gitignore(stack),
         project_dir / "README.md": make_readme(name, stack_name),
-        project_dir / "CLAUDE.md": make_claude_md(
-            name, stack_name, stack, claude_md_template
-        ),
+        project_dir / "CLAUDE.md": make_claude_md(name, stack_name, stack, claude_md_template),
         project_dir / ".pre-commit-config.yaml": make_precommit_config(),
         project_dir / ".github" / "workflows" / "ci.yml": make_ci_workflow(name, stack),
         project_dir / ".github" / "workflows" / "release.yml": make_cd_workflow(name),
@@ -1655,11 +1903,30 @@ def scaffold_project(
         project_dir / ".env.example": make_env_example(services),
     }
 
+    # Generate scripts/ci.sh for stacks that use it (Python).  The script is
+    # the single source of truth for lint/format/test: ci.yml calls it, and
+    # _run_lint_and_tests calls it too, so CI and local cannot drift.
+    ci_sh_content = make_ci_sh(stack_name)
+    if ci_sh_content:
+        ci_sh_path = project_dir / "scripts" / "ci.sh"
+        files[ci_sh_path] = ci_sh_content
+    if stack_name == "python":
+        files[project_dir / "pyproject.toml"] = make_pyproject(name)
+        # git does not track empty directories, so an empty src/ vanishes on the
+        # first clone and `pip install -e .` fails ("egg_base 'src' does not exist").
+        pkg = name.replace("-", "_")
+        (project_dir / "src" / pkg).mkdir(parents=True, exist_ok=True)
+        files[project_dir / "src" / pkg / "__init__.py"] = f'"""{name}."""\n'
+
     if services:
         files[project_dir / "docker-compose.yml"] = make_docker_compose(services)
 
     for path, content in files.items():
         path.write_text(content)
+
+    # Make scripts/ci.sh executable
+    if ci_sh_content:
+        (project_dir / "scripts" / "ci.sh").chmod(0o755)
 
     # -- AI setup (if requested during project creation) --
     if ai_providers:
@@ -1713,10 +1980,8 @@ def _ai_attach_docker(
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
-    files: Dict[Path, str] = {
-        ai_dir / "config.json": make_ai_config(
-            name, provider, "docker", model, key_source
-        ),
+    files: dict[Path, str] = {
+        ai_dir / "config.json": make_ai_config(name, provider, "docker", model, key_source),
         ai_dir / "docker-compose.yml": make_ai_docker_compose(provider, model),
         ai_dir / "notify.py": make_notify_script(),
         ai_dir / "run.sh": make_run_script(provider),
@@ -1726,7 +1991,7 @@ def _ai_attach_docker(
     if provider == "claude":
         files[ai_dir / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
         files[ai_dir / "claude-code" / "settings.json"] = make_ai_claude_settings(
-            [provider]
+            [provider], model=model
         )
 
     for path, content in files.items():
@@ -1761,25 +2026,21 @@ def _ai_attach_vm(
 
     ai_providers_list = [provider]
 
-    files: Dict[Path, str] = {
+    files: dict[Path, str] = {
         ai_dir / "config.json": make_ai_config(name, provider, "vm", model, key_source),
         ai_dir / "Makefile": make_ai_makefile(name),
         ai_dir / "vm" / "cloud-init.yaml": make_ai_cloud_init(),
         ai_dir / "vm" / "vm-config.sh": make_ai_vm_config(name, ai_providers_list),
-        ai_dir / "containers" / "docker-compose.yml": make_ai_vm_compose(
-            ai_providers_list
-        ),
+        ai_dir / "containers" / "docker-compose.yml": make_ai_vm_compose(ai_providers_list),
         ai_dir / "containers" / "mcp-servers" / ".gitkeep": "",
         ai_dir / "notify.py": make_notify_script(),
         ai_dir / "run.sh": make_run_script(provider),
     }
 
     if provider == "claude":
-        files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = (
-            make_ai_claude_dockerfile()
-        )
-        files[ai_dir / "containers" / "claude-code" / "settings.json"] = (
-            make_ai_claude_settings(ai_providers_list)
+        files[ai_dir / "containers" / "claude-code" / "Dockerfile"] = make_ai_claude_dockerfile()
+        files[ai_dir / "containers" / "claude-code" / "settings.json"] = make_ai_claude_settings(
+            ai_providers_list, model=model
         )
 
     for path, content in files.items():
@@ -1810,7 +2071,7 @@ def _load_ai_config(project_dir: Path) -> dict:
             file=sys.stderr,
         )
         sys.exit(1)
-    with open(config_path) as f:
+    with config_path.open() as f:
         return json.load(f)
 
 
@@ -1818,6 +2079,24 @@ def _save_ai_config(project_dir: Path, config: dict) -> None:
     """Save .ai/config.json."""
     config_path = project_dir / ".ai" / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def _resolve_provider_chain(project_dir: Path) -> list[str]:
+    """Return the ordered provider list for a project.
+
+    Reads ``provider_chain`` from .ai/config.json when present and non-empty;
+    falls back to ``[config["provider"]]`` for backward compatibility.
+    Returns ``["claude"]`` when no config file exists.
+    """
+    config_path = project_dir / ".ai" / "config.json"
+    if not config_path.exists():
+        return ["claude"]
+    with config_path.open() as f:
+        config = json.load(f)
+    chain = config.get("provider_chain")
+    if chain and isinstance(chain, list) and chain:
+        return [str(p) for p in chain]
+    return [config.get("provider", "claude")]
 
 
 def ai_start(project_dir: Path) -> None:
@@ -1834,15 +2113,22 @@ def ai_start(project_dir: Path) -> None:
 
         provider = config["provider"]
         if provider == "claude":
+            # UID is a bash builtin that is never exported, so the hint sets it
+            # through env(1); without it the sandbox runs as uid 1000.
+            env = _compose_env(project_dir)
             print("[dtl ai] Interactive session:")
-            print(f"  docker compose -f {compose_file} run --rm claude-code")
+            print(
+                f"  env UID={env['UID']} GID={env['GID']} "
+                f"docker compose -f {compose_file} run --rm claude-code"
+            )
         elif provider == "openclaw":
             print("[dtl ai] OpenClaw gateway running on port 18789")
             print("[dtl ai] Connect via Telegram or configured chat apps")
         elif provider == "ollama":
             print("[dtl ai] Ollama running on port 11434")
             print(
-                f"[dtl ai] Pull a model: docker compose -f {compose_file} exec ollama ollama pull llama3"
+                f"[dtl ai] Pull a model: docker compose -f {compose_file} "
+                "exec ollama ollama pull llama3"
             )
 
     elif mode == "vm":
@@ -1900,29 +2186,132 @@ def ai_status(project_dir: Path) -> None:
         _run_cmd(["bash", str(vm_script), "status"])
 
 
-def _write_failure_report(
+def _write_failure_snapshot(
     project_dir: Path,
-    feature_name: str,
-    limit_hit: str,
-    output_lines: list[str],
-) -> None:
-    """Write FAILURE-REPORT.md to the project root on bail-out."""
-    last_200 = output_lines[-200:] if len(output_lines) > 200 else output_lines
-    limit_desc = {
-        "wall_clock": "Wall-clock timeout exceeded",
-        "retry_cap": "AI retry cap exceeded",
-    }.get(limit_hit, limit_hit)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    report = (
-        f"# AI Failure Report\n\n"
-        f"**Generated:** {ts}  \n"
-        f"**Feature:** {feature_name or '(unknown)'}  \n"
-        f"**Limit hit:** {limit_desc}  \n\n"
-        f"## Last 200 Lines of Output\n\n"
-        f"```\n" + "".join(last_200) + "```\n"
-    )
-    report_path = project_dir / "FAILURE-REPORT.md"
-    report_path.write_text(report)
+    feature: dict,
+    branch: str,
+    ai_exit_code: int,
+    duration_secs: float,
+    ai_output: str,
+    log: logging.Logger,
+) -> Path | None:
+    """Write a triage bundle to ~/.local/state/dtl/ on AI non-zero exit.
+
+    Returns the snapshot path on success, None on failure.  Never raises.
+    """
+    try:
+        state_dir = _dtl_state_dir()
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        now_utc = datetime.datetime.now(datetime.UTC)
+        iso_ts = now_utc.strftime("%Y%m%dT%H%M%SZ")
+        snapshot_path = state_dir / f"{project_dir.name}-{feature['name']}-failure-{iso_ts}.md"
+
+        # Last 200 combined lines (already interleaved in ai_output)
+        all_lines = ai_output.splitlines(keepends=True)
+        last_lines = all_lines[-200:] if len(all_lines) > 200 else all_lines
+        last_block = "".join(last_lines)
+
+        # git status --porcelain
+        git_status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        git_status = git_status_result.stdout
+
+        # git diff --stat develop..HEAD
+        diff_stat_result = subprocess.run(
+            ["git", "diff", "--stat", "develop..HEAD"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diff_stat = diff_stat_result.stdout
+
+        # git diff develop..HEAD (capped at 5000 lines)
+        diff_result = subprocess.run(
+            ["git", "diff", "develop..HEAD"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diff_lines = diff_result.stdout.splitlines(keepends=True)
+        diff_truncated = len(diff_lines) > 5000
+        diff_body = "".join(diff_lines[:5000])
+
+        # Untracked files (relative paths only)
+        untracked_result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        untracked = untracked_result.stdout.strip()
+
+        duration_str = f"{int(duration_secs // 60)}m {int(duration_secs % 60)}s"
+        ts_display = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        lines = [
+            "# AI Failure Snapshot\n\n",
+            f"**Generated:** {ts_display}  \n",
+            f"**Project:** {project_dir}  \n",
+            f"**Feature:** {feature['name']}  \n",
+            f"**Branch:** {branch}  \n",
+            f"**AI exit code:** {ai_exit_code}  \n",
+            f"**Wall-clock duration:** {duration_str}  \n\n",
+            "## Last 200 Lines of AI Output\n\n",
+            "```\n",
+            last_block,
+            "```\n\n",
+            "## Git Status\n\n",
+            "```\n",
+            git_status,
+            "```\n\n",
+            "## Diff Stat (develop..HEAD)\n\n",
+            "```\n",
+            diff_stat,
+            "```\n\n",
+            "## Full Diff (develop..HEAD)\n\n",
+            "```diff\n",
+            diff_body,
+        ]
+        if diff_truncated:
+            lines.append("\n[... diff truncated at 5000 lines ...]\n")
+        lines.append("```\n\n")
+        lines.append("## Untracked Files\n\n")
+        if untracked:
+            for uf in untracked.splitlines():
+                lines.append(f"- {uf}\n")
+        else:
+            lines.append("*(none)*\n")
+
+        snapshot_path.write_text("".join(lines))
+        log.info("failure snapshot written: %s", snapshot_path)
+        return snapshot_path
+    except Exception as exc:  # noqa: BLE001 — best-effort diagnostic snapshot; already logged, must not mask the real error
+        log.info("Failed to write failure snapshot: %s", exc)
+        return None
+
+
+def _latest_failure_snapshot(project_dir: Path) -> Path | None:
+    """Return the most recent failure snapshot path for a project, or None."""
+    state_dir = _dtl_state_dir()
+    prefix = f"{project_dir.name}-"
+    suffix = "-failure-"
+    candidates = [
+        p
+        for p in state_dir.glob(f"{project_dir.name}-*-failure-*.md")
+        if p.name.startswith(prefix) and suffix in p.name
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.name)
 
 
 def _run_ai_with_limits(
@@ -1984,10 +2373,8 @@ def _run_ai_with_limits(
             if proc.poll() is not None:
                 break
 
-    try:
+    with contextlib.suppress(OSError):
         proc.stdout.close()
-    except OSError:
-        pass
     proc.wait()
 
     if kill_reason is not None:
@@ -2004,10 +2391,11 @@ def ai_run(
     max_wall_clock: int = 1800,
     max_ai_retries: int = 3,
     feature_name: str = "",
+    provider_override: str | None = None,
 ) -> None:
     """Run an autonomous AI session with a prompt."""
     config = _load_ai_config(project_dir)
-    provider = config["provider"]
+    provider = provider_override or config["provider"]
     mode = config["mode"]
     ai_dir = project_dir / ".ai"
 
@@ -2016,14 +2404,40 @@ def ai_run(
         print(
             f"Error: provider '{provider}' does not support autonomous mode.\n"
             f"  Providers with autonomous support: "
-            + ", ".join(
-                p
-                for p, c in AI_PROVIDERS_CONFIG.items()
-                if c.get("supports_autonomous")
-            ),
+            + ", ".join(p for p, c in AI_PROVIDERS_CONFIG.items() if c.get("supports_autonomous")),
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Ollama: run directly against the host daemon, regardless of configured mode.
+    # Uses `ollama run <model> <prompt>` in single-shot (non-interactive) mode.
+    if provider == "ollama":
+        model = config.get("model") or AI_PROVIDERS_CONFIG["ollama"]["default_model"]
+        print(f"[dtl ai run] Running Ollama autonomously (model: {model})...")
+        print(f"[dtl ai run] Prompt: {prompt}")
+        if max_wall_clock:
+            print(f"[dtl ai run] Wall-clock limit: {max_wall_clock}s")
+        print()
+        cmd = ["ollama", "run", model, prompt]
+        try:
+            exit_code, output_lines = _run_ai_with_limits(
+                cmd,
+                {**os.environ},
+                max_wall_clock,
+                max_ai_retries,
+            )
+        except FileNotFoundError:
+            print(
+                "Error: ollama not found. Install Ollama and ensure it is in PATH.",
+                file=sys.stderr,
+            )
+            sys.exit(127)
+        _send_notification(
+            ai_dir,
+            exit_code,
+            "".join(output_lines[-10:]) or "(no output)",
+        )
+        sys.exit(exit_code)
 
     if mode == "docker":
         if provider == "claude":
@@ -2033,6 +2447,7 @@ def ai_run(
             else:
                 print("[dtl ai run] Running Claude Code autonomously...")
             print(f"[dtl ai run] Prompt: {prompt}")
+            prompt = _sandbox_tooling_note(project_dir) + prompt
             if max_wall_clock:
                 print(f"[dtl ai run] Wall-clock limit: {max_wall_clock}s")
             if max_ai_retries:
@@ -2057,7 +2472,7 @@ def ai_run(
             try:
                 exit_code, output_lines = _run_ai_with_limits(
                     cmd,
-                    {**os.environ},
+                    _compose_env(project_dir),
                     max_wall_clock,
                     max_ai_retries,
                 )
@@ -2068,12 +2483,11 @@ def ai_run(
                 )
                 sys.exit(127)
 
-            # On bail-out: stop the container and write failure report
+            # On bail-out: stop the container
             if exit_code in (124, 125):
                 limit_hit = "wall_clock" if exit_code == 124 else "retry_cap"
                 print(
-                    f"\n[dtl ai run] Limit reached ({limit_hit}). "
-                    "Stopping container and writing FAILURE-REPORT.md...",
+                    f"\n[dtl ai run] Limit reached ({limit_hit}). Stopping container...",
                     file=sys.stderr,
                 )
                 subprocess.run(
@@ -2086,9 +2500,7 @@ def ai_run(
                     ],
                     capture_output=True,
                     timeout=30,
-                )
-                _write_failure_report(
-                    project_dir, feature_name, limit_hit, output_lines
+                    check=False,
                 )
 
             # Send notification
@@ -2117,9 +2529,7 @@ def ai_run(
                     "openclaw-gateway",
                 ]
             )
-            _send_notification(
-                ai_dir, 0, "OpenClaw gateway started. Send commands via Telegram."
-            )
+            _send_notification(ai_dir, 0, "OpenClaw gateway started. Send commands via Telegram.")
 
     elif mode == "vm":
         run_script = ai_dir / "run.sh"
@@ -2128,15 +2538,14 @@ def ai_run(
             try:
                 subprocess.run(
                     ["bash", str(run_script), prompt],
-                    timeout=max_wall_clock if max_wall_clock else None,
+                    timeout=max_wall_clock or None,
                     check=False,
                 )
             except subprocess.TimeoutExpired:
                 print(
-                    "\n[dtl ai run] Wall-clock timeout reached. Writing FAILURE-REPORT.md...",
+                    "\n[dtl ai run] Wall-clock timeout reached.",
                     file=sys.stderr,
                 )
-                _write_failure_report(project_dir, feature_name, "wall_clock", [])
                 sys.exit(124)
         elif provider == "openclaw":
             print("[dtl ai run] Starting OpenClaw in VM...")
@@ -2145,11 +2554,22 @@ def ai_run(
 
 def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
     """Send a notification via the configured provider."""
+    # A failed AI run also goes through notify.toml (ntfy on hub), which the
+    # Telegram-only notify.py below cannot reach.
+    if exit_code != 0:
+        notify_cfg = _load_notify_config()
+        if notify_cfg:
+            _emit_notify_event(
+                notify_cfg,
+                "ai-failure",
+                {"project": ai_dir.parent.name, "feature": "dtl ai run", "exit_code": exit_code},
+                logging.getLogger("dtl.notify"),
+            )
     config_path = ai_dir / "config.json"
     if not config_path.exists():
         return
 
-    with open(config_path) as f:
+    with config_path.open() as f:
         config = json.load(f)
 
     notify = config.get("notify", {})
@@ -2167,15 +2587,91 @@ def _send_notification(ai_dir: Path, exit_code: int, message: str) -> None:
             text=True,
             timeout=15,
             env={**os.environ},
+            check=False,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — notification is best-effort; already printed, never fail the run over it
         print(f"[dtl ai] Notification failed: {e}", file=sys.stderr)
 
 
-def _run_cmd(cmd: List[str]) -> int:
-    """Run a command, printing output in real time. Returns exit code."""
+@functools.lru_cache(maxsize=1)
+def _docker_is_rootless() -> bool:
+    """True when the docker CLI talks to a rootless daemon."""
     try:
-        result = subprocess.run(cmd, env={**os.environ})
+        out = subprocess.run(
+            ["docker", "info", "--format", "{{json .SecurityOptions}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return "name=rootless" in out
+
+
+def _compose_env(project_dir: Path | None = None) -> dict[str, str]:
+    """Environment for `docker compose`, with UID/GID set for the sandbox user.
+
+    The compose file runs the sandbox as ${UID}:${GID}, but bash never exports
+    UID, so it always fell back to 1000. Under rootless Docker, container uid 0
+    is the host user and uid 1000 is an unrelated subordinate id that cannot
+    write the bind-mounted repo (hub, 2026-09-29), so the sandbox runs as 0:0
+    there. It is not host root: the daemon itself runs as the user.
+
+    With a project_dir, the repo's git user.name/user.email become the sandbox's
+    GIT_AUTHOR_*/GIT_COMMITTER_* unless already exported; without an identity
+    the variables stay unset and the compose template default applies.
+    """
+    env = {**os.environ}
+    if _docker_is_rootless():
+        env["UID"] = env["GID"] = "0"
+    else:
+        env["UID"], env["GID"] = str(os.getuid()), str(os.getgid())
+    if project_dir is not None:
+        _apply_git_identity(env, project_dir)
+    return env
+
+
+def _apply_git_identity(env: dict[str, str], project_dir: Path) -> None:
+    """Fill unset GIT_AUTHOR_*/GIT_COMMITTER_* in env from the repo's git config."""
+    pairs = {"name": "NAME", "email": "EMAIL"}
+    if all(
+        f"GIT_{role}_{sfx}" in env for sfx in pairs.values() for role in ("AUTHOR", "COMMITTER")
+    ):
+        return
+
+    values: dict[str, str] = {}
+    for field in pairs:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(project_dir), "config", f"user.{field}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            break
+        value = result.stdout.strip() if result.returncode == 0 else ""
+        if value:
+            values[field] = value
+
+    if len(values) < len(pairs):
+        print(
+            f"[dtl ai] warning: no git user.name/user.email in {project_dir}; "
+            "sandbox commits will use the template default",
+            file=sys.stderr,
+        )
+        return
+    for field, suffix in pairs.items():
+        for role in ("AUTHOR", "COMMITTER"):
+            env.setdefault(f"GIT_{role}_{suffix}", values[field])
+
+
+def _run_cmd(cmd: list[str]) -> int:
+    """Run a command, printing output in real time. Returns exit code."""
+    env = _compose_env() if cmd[:2] == ["docker", "compose"] else {**os.environ}
+    try:
+        result = subprocess.run(cmd, env=env, check=False)
         return result.returncode
     except FileNotFoundError:
         print(f"Error: command not found: {cmd[0]}", file=sys.stderr)
@@ -2357,12 +2853,8 @@ def validate_project(project_dir: Path) -> bool:
                 if not srv_dir.is_dir() or srv_dir.name.startswith("."):
                     continue
                 srv = srv_dir.name
-                check(
-                    f"mcp-{srv}: Dockerfile exists", (srv_dir / "Dockerfile").exists()
-                )
-                check(
-                    f"mcp-{srv}: config.json exists", (srv_dir / "config.json").exists()
-                )
+                check(f"mcp-{srv}: Dockerfile exists", (srv_dir / "Dockerfile").exists())
+                check(f"mcp-{srv}: config.json exists", (srv_dir / "config.json").exists())
 
     # Legacy ai-sandbox/ checks (backward compat)
     sandbox = project_dir / "ai-sandbox"
@@ -2394,39 +2886,37 @@ def cmd_new(args: argparse.Namespace) -> None:
     # Validate stack
     if stack_name not in STACKS:
         print(
-            f"Error: unknown stack '{stack_name}'. "
-            f"Available: {', '.join(sorted(STACKS))}",
+            f"Error: unknown stack '{stack_name}'. Available: {', '.join(sorted(STACKS))}",
             file=sys.stderr,
         )
         sys.exit(1)
 
     # Validate services
-    services: List[str] = []
+    services: list[str] = []
     if args.services:
-        for s in args.services.split(","):
-            s = s.strip()
-            if s not in SERVICES:
+        for raw in args.services.split(","):
+            service = raw.strip()
+            if service not in SERVICES:
                 print(
-                    f"Error: unknown service '{s}'. "
-                    f"Available: {', '.join(sorted(SERVICES))}",
+                    f"Error: unknown service '{service}'. Available: {', '.join(sorted(SERVICES))}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            services.append(s)
+            services.append(service)
 
     # Validate AI providers
-    ai_providers: List[str] = []
+    ai_providers: list[str] = []
     if args.ai:
-        for a in args.ai.split(","):
-            a = a.strip()
-            if a not in AI_PROVIDERS:
+        for raw in args.ai.split(","):
+            provider = raw.strip()
+            if provider not in AI_PROVIDERS:
                 print(
-                    f"Error: unknown AI provider '{a}'. "
+                    f"Error: unknown AI provider '{provider}'. "
                     f"Available: {', '.join(AI_PROVIDERS)}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            ai_providers.append(a)
+            ai_providers.append(provider)
 
     # Validate AI mode
     ai_mode = getattr(args, "mode", "docker") or "docker"
@@ -2517,9 +3007,7 @@ def cmd_list_stacks(args: argparse.Namespace) -> None:
         print(f"  {key:12s}  {pconfig['display']}{auto}")
         if pconfig["models"]:
             models = ", ".join(sorted(pconfig["models"].keys()))
-            print(
-                f"  {' ':12s}  Models: {models} (default: {pconfig['default_model']})"
-            )
+            print(f"  {' ':12s}  Models: {models} (default: {pconfig['default_model']})")
 
     print("\nAI modes:\n")
     print("  docker      Lightweight — containers on host Docker")
@@ -2574,17 +3062,15 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
 
     # Write Dockerfile and config
     (srv_dir / "Dockerfile").write_text(make_mcp_server_dockerfile(server_name))
-    (srv_dir / "config.json").write_text(
-        make_mcp_server_config(server_name, project_path)
-    )
+    (srv_dir / "config.json").write_text(make_mcp_server_config(server_name, project_path))
 
     # Discover all MCP servers
-    existing_servers: List[str] = sorted(
+    existing_servers: list[str] = sorted(
         d.name for d in mcp_dir.iterdir() if d.is_dir() and not d.name.startswith(".")
     )
 
     # Detect active AI providers from existing compose
-    ai_providers: List[str] = []
+    ai_providers: list[str] = []
     if compose_path.exists():
         compose_text = compose_path.read_text()
         if "claude-code:" in compose_text:
@@ -2593,9 +3079,7 @@ def cmd_add_mcp(args: argparse.Namespace) -> None:
         ai_providers = ["claude"]
 
     # Regenerate docker-compose and settings with all MCP servers
-    compose_path.write_text(
-        make_ai_vm_compose(ai_providers, mcp_servers=existing_servers)
-    )
+    compose_path.write_text(make_ai_vm_compose(ai_providers, mcp_servers=existing_servers))
 
     settings_path = settings_dir / "settings.json"
     if settings_path.parent.is_dir():
@@ -2698,7 +3182,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
                 "Error: no CI workflow found at .github/workflows/*.yml",
                 file=sys.stderr,
             )
-            print("", file=sys.stderr)
+            print(file=sys.stderr)
             print(
                 "CI is required because 'gh pr merge --auto --squash' needs a passing",
                 file=sys.stderr,
@@ -2708,15 +3192,13 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             print("for merge.", file=sys.stderr)
-            print("", file=sys.stderr)
+            print(file=sys.stderr)
             print("Options:", file=sys.stderr)
             print(
                 "  --scaffold-ci   write a standard .github/workflows/ci.yml and continue",
                 file=sys.stderr,
             )
-            print(
-                "  --no-ci         skip this check (not recommended)", file=sys.stderr
-            )
+            print("  --no-ci         skip this check (not recommended)", file=sys.stderr)
             sys.exit(1)
 
     print(f"Attaching {pconfig['display']} to {project_dir.name}")
@@ -2744,9 +3226,7 @@ def cmd_ai_attach(args: argparse.Namespace) -> None:
     if mode == "docker":
         print(f"  dtl ai start --project {project_dir}")
         if provider == "claude":
-            print(
-                f"  # Then: docker compose -f {ai_dir}/docker-compose.yml run --rm claude-code"
-            )
+            print(f"  # Then: docker compose -f {ai_dir}/docker-compose.yml run --rm claude-code")
         elif provider == "openclaw":
             print("  # Then connect via Telegram")
     elif mode == "vm":
@@ -2816,6 +3296,13 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
     """Handle 'dtl ai run'."""
     project_dir = Path(args.project).resolve()
     prompt = args.prompt
+    # --provider overrides the config; --provider-chain sets the first provider in a
+    # chain (rotation is handled by cmd_workflow_run at the outer loop level).
+    provider_override = getattr(args, "provider", None) or None
+    if not provider_override:
+        chain_arg = getattr(args, "provider_chain", None)
+        if chain_arg:
+            provider_override = chain_arg.split(",")[0].strip() or None
     ai_run(
         project_dir,
         prompt,
@@ -2823,6 +3310,7 @@ def cmd_ai_run(args: argparse.Namespace) -> None:
         max_wall_clock=getattr(args, "max_wall_clock", 1800),
         max_ai_retries=getattr(args, "max_ai_retries", 3),
         feature_name=getattr(args, "feature_name", ""),
+        provider_override=provider_override,
     )
 
 
@@ -2856,10 +3344,17 @@ def cmd_ai_config_notify(args: argparse.Namespace) -> None:
 def cmd_ai_list_providers(args: argparse.Namespace) -> None:
     """Handle 'dtl ai list-providers'."""
     print("Available AI providers:\n")
+    print(
+        "  Quota-source annotations:\n"
+        "    [anthropic-shared]  Shares the same Anthropic quota — "
+        "claude and openclaw exhaust the same pool.\n"
+        "    [local]             No external quota — runs on local hardware.\n"
+    )
     for key, pconfig in sorted(AI_PROVIDERS_CONFIG.items()):
         auto = " [autonomous]" if pconfig.get("supports_autonomous") else ""
         inter = " [interactive]" if pconfig.get("supports_interactive") else ""
-        print(f"  {key}")
+        quota_src = pconfig.get("quota_source", "unknown")
+        print(f"  {key}  [{quota_src}]")
         print(f"    {pconfig['description']}")
         print(f"    Image: {pconfig['image']}")
         print(f"    Modes:{auto}{inter}")
@@ -2914,9 +3409,7 @@ def _parse_devplan(text: str) -> tuple[str, list[dict]]:
 
         # Extract **Branch:**
         branch_match = re.search(r"\*\*Branch:\*\*\s*`?([^`\n]+)`?", body)
-        branch = (
-            branch_match.group(1).strip() if branch_match else f"feature/{heading_name}"
-        )
+        branch = branch_match.group(1).strip() if branch_match else f"feature/{heading_name}"
 
         # Extract **Depends on:**
         depends_match = re.search(r"\*\*Depends on:\*\*\s*(.+)", body)
@@ -2967,6 +3460,7 @@ def _git_is_dirty(project_dir: Path) -> bool:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return bool(result.stdout.strip())
 
@@ -2977,24 +3471,69 @@ def _git_current_branch(project_dir: Path) -> str:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.stdout.strip()
 
 
 def _git_create_branch(project_dir: Path, branch: str, base: str = "develop") -> None:
-    """Create and checkout a new branch off base."""
+    """Create and checkout a new branch off base, or resume it if it exists.
+
+    A retry after a failed finish (lint/tests) finds the branch from the first
+    attempt. `checkout -b` then failed, so the retry gave up and the AI's work
+    was stranded (hub, 2026-09-30). Resume the branch instead, keeping its commits.
+    """
+    exists = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=project_dir,
+        capture_output=True,
+        check=False,
+    )
+    if exists.returncode == 0:
+        subprocess.run(["git", "checkout", branch], cwd=project_dir, check=True)
+        # Bring the resumed branch up to date with base, or the checks run
+        # against a stale tree: on hub a branch from before scripts/ci.sh
+        # merged was resumed and tested without it (2026-09-30).
+        merged = subprocess.run(
+            ["git", "merge", "--no-edit", base],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if merged.returncode != 0:
+            subprocess.run(["git", "merge", "--abort"], cwd=project_dir, check=False)
+            subprocess.run(["git", "checkout", base], cwd=project_dir, check=False)
+            raise subprocess.CalledProcessError(
+                merged.returncode, merged.args, merged.stdout, merged.stderr
+            )
+        return
     subprocess.run(["git", "checkout", base], cwd=project_dir, check=True)
     subprocess.run(["git", "checkout", "-b", branch], cwd=project_dir, check=True)
 
 
-def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
-    """Build the prompt string passed to the AI for a feature."""
+def _build_ai_prompt(constraints_block: str, feature: dict, previous_failure: str = "") -> str:
+    """Build the prompt string passed to the AI for a feature.
+
+    previous_failure: tail of the host lint/test output from the last attempt.
+    Without it a retry repeats the same mistake blind (hub, 2026-09-30).
+    """
     parts = []
     if constraints_block:
         parts.append(constraints_block)
         parts.append("")
     parts.append(feature["block"])
     parts.append("")
+    if previous_failure:
+        parts.append(
+            "A previous attempt at this feature is already committed on this branch, "
+            "but the host's lint/test step failed afterwards. Fix the cause; do not "
+            "start over. The tail of that failure output:"
+        )
+        parts.append("```")
+        parts.append(previous_failure)
+        parts.append("```")
+        parts.append("")
     parts.append(
         "Implement this feature exactly as specified above. "
         "Follow all constraints. "
@@ -3005,10 +3544,19 @@ def _build_ai_prompt(constraints_block: str, feature: dict) -> str:
         "GitHub appends one automatically on squash-merge, so including one "
         "here produces a duplicate suffix (e.g. feat: foo (#4) (#4))."
     )
+    parts.append("")
+    parts.append(
+        "After your final commit (or when you cannot proceed), print exactly "
+        "this line as your final output (no trailing text on the same line): "
+        "<<<DTL:OUTCOME=COMPLETED>>> if you successfully implemented the "
+        "feature, or <<<DTL:OUTCOME=FAILED_AI>>> followed by a one-line "
+        "reason on the next line if you could not. The host workflow uses "
+        "this marker as the authoritative signal of run outcome."
+    )
     return "\n".join(parts)
 
 
-def _setup_workflow_logger(log_path: Optional[Path] = None) -> logging.Logger:
+def _setup_workflow_logger(log_path: Path | None = None) -> logging.Logger:
     """Set up a logger that writes to both stderr and a log file."""
     logger = logging.getLogger("dtl.workflow")
     if logger.handlers:
@@ -3047,7 +3595,7 @@ def _read_workflow_state(project_dir: Path) -> dict:
     state_path = _workflow_state_path(project_dir)
     if state_path.exists():
         try:
-            with open(state_path) as f:
+            with state_path.open() as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -3076,10 +3624,8 @@ def _write_workflow_state(
             json.dump(state, f, indent=2)
         Path(tmp).rename(state_path)
     except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink()
         raise
 
 
@@ -3104,6 +3650,7 @@ def _maybe_notify_stalled(
             [sys.executable, str(notify_script), "1", message],
             capture_output=True,
             timeout=30,
+            check=False,
         )
         log.info(
             "[%s] Stall notification sent after %d consecutive skips (%s).",
@@ -3111,7 +3658,7 @@ def _maybe_notify_stalled(
             consecutive_skips,
             skip_reason,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — notify.py is user-supplied; already logged, must not break the workflow
         log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
 
 
@@ -3127,6 +3674,54 @@ def _dtl_state_dir() -> Path:
     return state_home / "dtl"
 
 
+def _feature_state_path(project_dir: Path, feature_name: str) -> Path:
+    """Return ~/.local/state/dtl/<project>/<feature>.json for per-feature workflow state."""
+    return _dtl_state_dir() / project_dir.name / f"{feature_name}.json"
+
+
+_FEATURE_STATE_DEFAULT: dict = {
+    "last_outcome": "",
+    "last_run_iso": "",
+    "attempts_completed": 0,
+    "attempts_interrupted": 0,
+    "partial_work_branch": None,
+    # Tail of the last lint/test failure, handed to the next attempt's prompt.
+    "last_failure_output": "",
+}
+
+
+def _read_feature_state(project_dir: Path, feature_name: str) -> dict:
+    """Read per-feature state file, returning defaults if absent or unreadable."""
+    p = _feature_state_path(project_dir, feature_name)
+    if p.exists():
+        try:
+            with p.open() as f:
+                data = json.load(f)
+            # Merge with defaults so new keys are always present
+            return {**_FEATURE_STATE_DEFAULT, **data}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return dict(_FEATURE_STATE_DEFAULT)
+
+
+def _write_feature_state(project_dir: Path, feature_name: str, state: dict) -> None:
+    """Atomically write per-feature state (tempfile + rename, mode 0o600)."""
+    import tempfile
+
+    p = _feature_state_path(project_dir, feature_name)
+    p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+    try:
+        Path(tmp_path).chmod(0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        Path(tmp_path).replace(p)
+    except Exception:
+        with contextlib.suppress(OSError):
+            Path(tmp_path).unlink()
+        raise
+
+
 def _watchdog_state_path() -> Path:
     """Return path to the watchdog run-state JSON file."""
     return _dtl_state_dir() / "watchdog-state.json"
@@ -3137,7 +3732,7 @@ def _watchdog_read_state() -> dict:
     p = _watchdog_state_path()
     if p.exists():
         try:
-            with open(p) as f:
+            with p.open() as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -3154,14 +3749,28 @@ def _watchdog_write_state(state: dict) -> None:
             json.dump(state, f, indent=2)
         Path(tmp).rename(p)
     except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink()
         raise
 
 
-def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
+def _watchdog_queue_waiting_for_next_run(project_dir: Path, plan_path: Path) -> bool:
+    """True when the queue changed after the last run and hasn't waited too long."""
+    queued_at = datetime.datetime.fromtimestamp(plan_path.stat().st_mtime)
+    now = datetime.datetime.now()
+    if now - queued_at >= datetime.timedelta(hours=WATCHDOG_QUEUE_WAIT_HOURS):
+        return False
+    last_check = _read_workflow_state(project_dir).get("last_check")
+    if not last_check:
+        return True  # never run yet: the first scheduled run is still ahead
+    try:
+        last_run = datetime.datetime.fromisoformat(last_check)
+    except ValueError:
+        return False  # unreadable state: don't hide a possible anomaly
+    return last_run < queued_at
+
+
+def _watchdog_check_missing_runner(project_dir: Path) -> str | None:
     """Anomaly A: 'dtl workflow run' absent when DEVPLAN has Not Started features."""
     plan_path = project_dir / "docs" / "DEVPLAN.md"
     if not plan_path.exists():
@@ -3171,19 +3780,55 @@ def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
     if not not_started:
         return None
 
-    # Check whether a matching 'dtl workflow run' process exists.
+    # Primary signal: per-feature state file. If every Not Started feature's
+    # last outcome was a human-attention interruption, the workflow halted
+    # intentionally — suppressing a spurious anomaly.
+    human_attention = (RunOutcome.INTERRUPTED_AUTH, RunOutcome.INTERRUPTED_QUOTA)
+    all_intentionally_halted = all(
+        _read_feature_state(project_dir, f["name"]).get("last_outcome") in human_attention
+        for f in not_started
+    )
+    if all_intentionally_halted:
+        return None
+
+    # Nightly scheduling: work queued since the last run is simply waiting for
+    # the next one, and is no anomaly until it has waited longer than a day.
+    # The DEVPLAN's mtime marks when the local queue last changed (edit or pull);
+    # the workflow state's last_check marks the last run that looked at it.
+    # Without this, every queued feature alerted every watchdog tick all day.
+    if _watchdog_queue_waiting_for_next_run(project_dir, plan_path):
+        return None
+
+    # Fallback: check whether a matching 'dtl workflow run' process exists.
     try:
         result = subprocess.run(
             ["ps", "aux"],
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
-        project_str = str(project_dir)
+        # Only the --projects argument says which projects a run actually covers.
+        # Testing the whole command line for the path as a substring was wrong:
+        # every 'dtl workflow run' line contains the location of dtl.py itself,
+        # so a run launched for one project made the repo hosting dtl.py look
+        # covered. In practice devtools could never be watched while any workflow
+        # was running anywhere — its anomaly vanished the moment a run was armed.
+        target = project_dir.expanduser().resolve()
         for line in result.stdout.splitlines():
-            if "workflow" in line and "run" in line and project_str in line:
-                return None  # process found — no anomaly
-    except Exception:
+            if "workflow" not in line or "run" not in line:
+                continue
+            match = re.search(r"--projects[=\s]+(\S+)", line)
+            if not match:
+                continue
+            for raw in match.group(1).split(","):
+                candidate = raw.strip()
+                if not candidate:
+                    continue
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    if Path(candidate).expanduser().resolve() == target:
+                        return None  # a run covering THIS project exists
+    except Exception:  # noqa: S110,BLE001 — pgrep unavailable means 'cannot tell'; caller treats that as no-anomaly
         pass
 
     return (
@@ -3192,13 +3837,14 @@ def _watchdog_check_missing_runner(project_dir: Path) -> Optional[str]:
     )
 
 
-def _watchdog_check_dirty_age(project_dir: Path) -> Optional[str]:
+def _watchdog_check_dirty_age(project_dir: Path) -> str | None:
     """Anomaly B: dirty working tree whose most-recent change is older than WATCHDOG_DIRTY_HOURS."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
     if not lines:
@@ -3229,7 +3875,7 @@ def _watchdog_check_dirty_age(project_dir: Path) -> Optional[str]:
     return None
 
 
-def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
+def _watchdog_check_pr_activity(project_dir: Path) -> str | None:
     """Anomaly C: no open-PR activity for WATCHDOG_PR_IDLE_HOURS when Not Started features exist."""
     plan_path = project_dir / "docs" / "DEVPLAN.md"
     if not plan_path.exists():
@@ -3246,11 +3892,19 @@ def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
         if result.returncode != 0:
             return None  # gh unavailable or not a GitHub repo — skip
         prs: list[dict] = json.loads(result.stdout or "[]")
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — a watchdog must not crash the run
+        # Returning None reads downstream as "no anomaly", so a failure here
+        # silently DISABLES this check. Record it rather than failing open mute.
+        logging.getLogger("dtl.watchdog").warning(
+            "[%s] PR-activity check could not run (%s) — check skipped this cycle.",
+            project_dir.name,
+            exc,
+        )
         return None
 
     if not prs:
@@ -3261,25 +3915,19 @@ def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
         return f"{project_dir.name}: features 'In Progress' but no open PRs found"
 
     # Find the most-recently-updated PR and check its age.
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        hours=WATCHDOG_PR_IDLE_HOURS
-    )
-    most_recent: Optional[datetime.datetime] = None
+    cutoff = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=WATCHDOG_PR_IDLE_HOURS)
+    most_recent: datetime.datetime | None = None
     for pr in prs:
         updated_str = pr.get("updatedAt", "")
         try:
-            updated = datetime.datetime.fromisoformat(
-                updated_str.replace("Z", "+00:00")
-            )
+            updated = datetime.datetime.fromisoformat(updated_str)
             if most_recent is None or updated > most_recent:
                 most_recent = updated
         except (ValueError, AttributeError):
             pass
 
     if most_recent is not None and most_recent < cutoff:
-        idle_hours = (
-            datetime.datetime.now(datetime.timezone.utc) - most_recent
-        ).total_seconds() / 3600.0
+        idle_hours = (datetime.datetime.now(datetime.UTC) - most_recent).total_seconds() / 3600.0
         return (
             f"{project_dir.name}: no PR activity for {idle_hours:.0f}h "
             f"(threshold: {WATCHDOG_PR_IDLE_HOURS}h) with Not Started features"
@@ -3287,7 +3935,7 @@ def _watchdog_check_pr_activity(project_dir: Path) -> Optional[str]:
     return None
 
 
-def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
+def _watchdog_check_log_growth(prev_state: dict) -> tuple[str | None, int]:
     """Anomaly D: dtl log growth > WATCHDOG_LOG_GROWTH_MB_DAY MB/day.
 
     Returns (anomaly_message_or_None, current_total_bytes).
@@ -3297,12 +3945,10 @@ def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
     if state_dir.exists():
         for entry in state_dir.iterdir():
             if entry.is_file() and entry.suffix in (".log", ".txt", ".json"):
-                try:
+                with contextlib.suppress(OSError):
                     total_bytes += entry.stat().st_size
-                except OSError:
-                    pass
 
-    anomaly: Optional[str] = None
+    anomaly: str | None = None
     prev_bytes: int = prev_state.get("log_size_bytes", 0)
     prev_ts_str: str = prev_state.get("log_size_timestamp", "")
     if prev_ts_str and prev_bytes >= 0:
@@ -3311,9 +3957,7 @@ def _watchdog_check_log_growth(prev_state: dict) -> tuple[Optional[str], int]:
             elapsed_hours = (datetime.datetime.now() - prev_ts).total_seconds() / 3600.0
             if elapsed_hours > 0:
                 growth_bytes = max(0, total_bytes - prev_bytes)
-                growth_mb_per_day = (growth_bytes / (1024 * 1024)) / (
-                    elapsed_hours / 24.0
-                )
+                growth_mb_per_day = (growth_bytes / (1024 * 1024)) / (elapsed_hours / 24.0)
                 if growth_mb_per_day > WATCHDOG_LOG_GROWTH_MB_DAY:
                     anomaly = (
                         f"dtl log growth {growth_mb_per_day:.1f} MB/day "
@@ -3330,31 +3974,73 @@ def _watchdog_notify_project(
     anomalies: list[str],
     log: logging.Logger,
 ) -> None:
-    """Invoke a project's .ai/notify.py once with all anomaly details."""
+    """Report anomalies: via notify.toml when configured, else .ai/notify.py."""
     if not anomalies:
+        return
+    # notify.py only speaks Telegram, which is not wired on hub; without this the
+    # watchdog found problems and told no one.
+    notify_cfg = _load_notify_config()
+    if notify_cfg:
+        _emit_notify_event(
+            notify_cfg,
+            "needs-attention",
+            {
+                "project": project_dir.name,
+                "feature": "watchdog",
+                "criterion": "; ".join(anomalies),
+            },
+            log,
+        )
+        # notify.toml is the configured channel; running the Telegram-only
+        # notify.py too would log a false "NOT delivered" on hub.
         return
     notify_script = project_dir / ".ai" / "notify.py"
     if not notify_script.exists():
-        log.info(
-            "[%s] No .ai/notify.py found; skipping notification.", project_dir.name
-        )
+        log.info("[%s] No .ai/notify.py found; skipping notification.", project_dir.name)
         return
     message = f"[dtl watchdog] Anomalies detected in {project_dir.name}:\n" + "\n".join(
         f"  • {a}" for a in anomalies
     )
     try:
-        subprocess.run(
+        result = subprocess.run(
             [sys.executable, str(notify_script), "1", message],
             capture_output=True,
             timeout=30,
+            check=False,
         )
-        log.info(
-            "[%s] Watchdog notification sent (%d anomaly/anomalies).",
+    except Exception as exc:  # noqa: BLE001 — notify.py is user-supplied; must not break the watchdog
+        log.warning(
+            "[%s] Failed to invoke notify.py (%s) — %d anomaly/anomalies NOT delivered.",
             project_dir.name,
+            exc,
             len(anomalies),
         )
-    except Exception as exc:
-        log.info("[%s] Failed to invoke notify.py: %s", project_dir.name, exc)
+        return
+
+    # This used to log "notification sent" unconditionally, with check=False and
+    # the captured output discarded. notify.py exits 1 when it has no credentials,
+    # so an entire fleet could go months delivering nothing while the journal
+    # reported success every 30 minutes. A watchdog that lies about its own alerting
+    # is worse than no watchdog: it converts a visible outage into a silent one.
+    if result.returncode != 0:
+        stderr = result.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        detail = f" stderr: {stderr.strip()[:500]}" if stderr.strip() else ""
+        log.warning(
+            "[%s] notify.py FAILED (exit %d) — %d anomaly/anomalies NOT delivered.%s",
+            project_dir.name,
+            result.returncode,
+            len(anomalies),
+            detail,
+        )
+        return
+
+    log.info(
+        "[%s] Watchdog notification sent (%d anomaly/anomalies).",
+        project_dir.name,
+        len(anomalies),
+    )
 
 
 def _make_watchdog_service(projects_str: str) -> str:
@@ -3394,81 +4080,178 @@ def _make_watchdog_timer(interval_minutes: int) -> str:
     )
 
 
+def _is_python_project(project_dir: Path) -> bool:
+    return any(
+        (project_dir / f).exists() for f in ("pyproject.toml", "setup.py", "requirements.txt")
+    )
+
+
+def _has_dev_extra(project_dir: Path) -> bool:
+    """True when pyproject.toml declares a ``dev`` optional-dependencies extra."""
+    pyproject = project_dir / "pyproject.toml"
+    if not pyproject.exists():
+        return False
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return "dev" in data.get("project", {}).get("optional-dependencies", {})
+
+
+def _project_venv(project_dir: Path) -> Path:
+    """Return the per-project venv path, creating the venv if missing.
+
+    Lives under $XDG_CACHE_HOME/dtl/venvs (never inside the project directory),
+    keyed by project name plus a short hash of the absolute path.
+    """
+    resolved = project_dir.resolve()
+    xdg = os.environ.get("XDG_CACHE_HOME", "")
+    cache = Path(xdg) if xdg else Path.home() / ".cache"
+    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
+    venv = cache / "dtl" / "venvs" / f"{resolved.name}-{digest}"
+    if not (venv / "bin" / "python").exists():
+        venv.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    return venv
+
+
+def _venv_env(venv: Path) -> dict[str, str]:
+    """Environment that activates ``venv`` (no PEP 668 override)."""
+    env = os.environ.copy()
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PATH"] = f"{venv / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    env.pop("PIP_BREAK_SYSTEM_PACKAGES", None)
+    return env
+
+
+def _sandbox_tooling_note(project_dir: Path) -> str:
+    """Prompt preamble telling the sandboxed AI how to get lint/test tools."""
+    if not _is_python_project(project_dir):
+        return ""
+    name = project_dir.name
+    note = (
+        f"Sandbox tooling: the container has no project test tools preinstalled. "
+        f"Create a venv OUTSIDE /workspace with `python3 -m venv /home/claude/.venvs/{name}` "
+        f"(so `git status` stays clean), then install the project from its own declaration "
+        f"with that venv's pip: `-e '.[dev]'` when a `dev` extra exists, else "
+        f"`-r requirements.txt`, else `-e .`, plus `ruff=={RUFF_VERSION}`. "
+        f"Do not hand-install other test tools."
+    )
+    if (project_dir / "scripts" / "ci.sh").exists():
+        note += (
+            " Before committing, run `bash scripts/ci.sh` with that venv active "
+            f"(`. /home/claude/.venvs/{name}/bin/activate`)."
+        )
+    return note + "\n\n"
+
+
 def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
     """Run lint and tests in the project. Returns (passed, output)."""
-    # Detect stack from files present
-    lint_cmd = None
-    test_cmd = None
-    if (project_dir / "pyproject.toml").exists() or (project_dir / "setup.py").exists():
-        lint_cmd = ["ruff", "check", "."]
-        test_cmd = ["pytest", "--tb=short"]
-    elif (project_dir / "package.json").exists():
-        lint_cmd = ["npm", "run", "lint"]
-        test_cmd = ["npm", "test"]
-    elif (project_dir / "go.mod").exists():
-        lint_cmd = ["golangci-lint", "run"]
-        test_cmd = ["go", "test", "./..."]
-    elif (project_dir / "Cargo.toml").exists():
-        lint_cmd = ["cargo", "clippy"]
-        test_cmd = ["cargo", "test"]
+    python_project = _is_python_project(project_dir)
+    venv_env: dict[str, str] | None = None
+    if python_project:
+        try:
+            venv = _project_venv(project_dir)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            return False, f"=== venv ===\nCould not create project venv: {detail}"
+        venv_env = _venv_env(venv)
 
-    output_parts = []
+    # When a generated scripts/ci.sh exists it is the single source of truth for
+    # lint/format/test — the same script that ci.yml invokes.  Run it directly so
+    # the two callers cannot drift; it installs from the project's own declaration.
+    ci_sh = project_dir / "scripts" / "ci.sh"
+    if ci_sh.exists():
+        result = subprocess.run(
+            ["bash", str(ci_sh)],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=venv_env,
+        )
+        return result.returncode == 0, result.stdout + result.stderr
 
-    if (project_dir / "pyproject.toml").exists():
-        # --break-system-packages bypasses PEP 668 rejection on Debian/Ubuntu system
-        # Python. Safe here: the ephemeral USB workstation's system Python is rebuilt
-        # weekly, so installing into site-packages has no durable downside. The flag
-        # is a no-op on venvs and CI runners that don't enforce PEP 668.
+    # Fall back to the legacy per-stack behaviour for projects without scripts/ci.sh
+    # (existing scaffolded repos that predate this feature keep working unchanged).
+    output_parts: list[str] = []
+
+    if python_project and venv_env is not None:
+        venv_python = str(Path(venv_env["VIRTUAL_ENV"]) / "bin" / "python")
+        if _has_dev_extra(project_dir):
+            target = ["-e", ".[dev]"]
+        elif (project_dir / "requirements.txt").exists():
+            target = ["-r", "requirements.txt"]
+        else:
+            target = ["-e", "."]
         pip_cmd = [
-            sys.executable,
+            venv_python,
             "-m",
             "pip",
             "install",
-            "-e",
-            ".[dev]",
             "--quiet",
-            "--break-system-packages",
+            *target,
+            f"ruff=={RUFF_VERSION}",
         ]
         pip_result = subprocess.run(
-            pip_cmd, cwd=project_dir, capture_output=True, text=True
+            pip_cmd,
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=venv_env,
         )
+        output_parts.append(f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}")
         if pip_result.returncode != 0:
-            pip_cmd = [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-e",
-                ".",
-                "--quiet",
-                "--break-system-packages",
-            ]
-            pip_result = subprocess.run(
-                pip_cmd, cwd=project_dir, capture_output=True, text=True
+            return False, "\n".join(output_parts)
+
+        probe = subprocess.run(
+            [venv_python, "-c", "import pytest"],
+            cwd=project_dir,
+            capture_output=True,
+            check=False,
+            env=venv_env,
+        )
+        if probe.returncode != 0:
+            output_parts.append(
+                "pytest is not installed after installing the project's own declaration "
+                f"({' '.join(target)}). Declare it in the project's dev extra "
+                "(pyproject.toml [project.optional-dependencies] dev) or requirements.txt."
             )
-        output_parts.append(
-            f"=== pip install ===\n{pip_result.stdout}{pip_result.stderr}"
-        )
-        if pip_result.returncode != 0:
             return False, "\n".join(output_parts)
 
-    if lint_cmd:
-        result = subprocess.run(
-            lint_cmd, cwd=project_dir, capture_output=True, text=True
-        )
-        output_parts.append(
-            f"=== lint ({' '.join(lint_cmd)}) ===\n{result.stdout}{result.stderr}"
-        )
-        if result.returncode != 0:
-            return False, "\n".join(output_parts)
+        steps = [
+            ("lint (ruff check .)", ["ruff", "check", "."]),
+            ("test (pytest --tb=short)", ["pytest", "--tb=short"]),
+        ]
+    elif (project_dir / "package.json").exists():
+        steps = [
+            ("lint (npm run lint)", ["npm", "run", "lint"]),
+            ("test (npm test)", ["npm", "test"]),
+        ]
+    elif (project_dir / "go.mod").exists():
+        steps = [
+            ("lint (golangci-lint run)", ["golangci-lint", "run"]),
+            ("test (go test ./...)", ["go", "test", "./..."]),
+        ]
+    elif (project_dir / "Cargo.toml").exists():
+        steps = [
+            ("lint (cargo clippy)", ["cargo", "clippy"]),
+            ("test (cargo test)", ["cargo", "test"]),
+        ]
+    else:
+        steps = []
 
-    if test_cmd:
+    for label, cmd in steps:
         result = subprocess.run(
-            test_cmd, cwd=project_dir, capture_output=True, text=True
+            cmd, cwd=project_dir, capture_output=True, text=True, check=False, env=venv_env
         )
-        output_parts.append(
-            f"=== test ({' '.join(test_cmd)}) ===\n{result.stdout}{result.stderr}"
-        )
+        output_parts.append(f"=== {label} ===\n{result.stdout}{result.stderr}")
         if result.returncode != 0:
             return False, "\n".join(output_parts)
 
@@ -3476,25 +4259,58 @@ def _run_lint_and_tests(project_dir: Path) -> tuple[bool, str]:
 
 
 def _git_push_branch(project_dir: Path, branch: str) -> bool:
-    """Push the current branch to origin. Returns True on success."""
+    """Push the current branch to origin. Returns True on success.
+
+    This is dtl's only push. It refuses protected branches outright.
+    """
+    if branch in PROTECTED_BRANCHES:
+        return False
     result = subprocess.run(
         ["git", "push", "-u", "origin", branch],
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode == 0
 
 
+def _commit_merged_status(
+    project_dir: Path, plan_path: Path, feature_name: str, branch: str, pr_url: str
+) -> bool:
+    """Mark the feature Merged on its own branch and push, before auto-merge is on.
+
+    The squash merge then carries the status into develop, so nothing is ever
+    committed to develop directly. Returns False (and commits nothing) when the
+    checkout is not on ``branch`` or ``branch`` is protected.
+    """
+    if branch in PROTECTED_BRANCHES or _git_current_branch(project_dir) != branch:
+        return False
+    pr_match = re.search(r"/pull/(\d+)", pr_url)
+    status = f"Merged (#{pr_match.group(1)})" if pr_match else "Merged"
+    _update_feature_status(plan_path, feature_name, status)
+    subprocess.run(
+        ["git", "add", str(plan_path)], cwd=project_dir, capture_output=True, check=False
+    )
+    subprocess.run(
+        ["git", "commit", "-m", f"chore: mark {feature_name} {status}"],
+        cwd=project_dir,
+        capture_output=True,
+        check=False,
+    )
+    return _git_push_branch(project_dir, branch)
+
+
 def _gh_create_pr(
     project_dir: Path, branch: str, title: str, body: str, base: str = "develop"
-) -> Optional[str]:
+) -> str | None:
     """Create a PR using gh CLI. Returns the PR URL or None on failure."""
     result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body, "--base", base],
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode == 0:
         return result.stdout.strip()
@@ -3505,6 +4321,7 @@ def _gh_create_pr(
             cwd=project_dir,
             capture_output=True,
             text=True,
+            check=False,
         )
         if view.returncode == 0:
             return view.stdout.strip()
@@ -3518,39 +4335,202 @@ def _gh_enable_auto_merge(project_dir: Path, branch: str) -> bool:
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode == 0
 
 
-def _gh_pr_state(project_dir: Path, branch: str) -> Optional[str]:
+def _gh_pr_state(project_dir: Path, branch: str) -> str | None:
     """Check PR state via gh CLI. Returns 'MERGED', 'OPEN', 'CLOSED', or None."""
     result = subprocess.run(
         ["gh", "pr", "view", branch, "--json", "state", "-q", ".state"],
         cwd=project_dir,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode == 0:
         return result.stdout.strip()
     return None
 
 
-def _detect_auth_failure(output: str) -> bool:
-    """Check if AI output indicates an authentication failure."""
-    auth_patterns = [
-        "authentication failed",
-        "auth error",
-        "invalid api key",
-        "unauthorized",
-        "expired token",
-        "please run claude login",
-        "not authenticated",
-    ]
-    lower = output.lower()
-    return any(p in lower for p in auth_patterns)
+# Conclusions that mean a check has definitively failed. Anything else that has
+# completed (SUCCESS, NEUTRAL, SKIPPED) is treated as not-blocking.
+_CHECK_FAILURE_CONCLUSIONS = frozenset(
+    {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE", "ERROR"}
+)
 
 
-def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict]:
+def _gh_pr_checks(project_dir: Path, branch: str) -> tuple[str, list[str]]:
+    """Summarise a PR's check rollup.
+
+    Returns ``(state, failing_names)`` where state is one of:
+
+    - ``"FAILING"`` -- at least one check has definitively failed; the PR can
+      never auto-merge and waiting on it is pointless.
+    - ``"PENDING"`` -- checks still running, or none reported yet.
+    - ``"PASSING"`` -- every reported check completed without failing.
+    - ``"UNKNOWN"`` -- gh call failed or returned unparseable output. Treated as
+      PENDING by callers so a transient network blip never abandons a good PR.
+
+    Handles both CheckRun (status/conclusion) and StatusContext (state) entries,
+    since a rollup can legitimately contain either.
+    """
+    result = subprocess.run(
+        ["gh", "pr", "view", branch, "--json", "statusCheckRollup", "-q", ".statusCheckRollup"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return "UNKNOWN", []
+    raw = result.stdout.strip()
+    if not raw or raw == "null":
+        return "PENDING", []
+    try:
+        checks = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return "UNKNOWN", []
+    if not isinstance(checks, list) or not checks:
+        return "PENDING", []
+
+    failing: list[str] = []
+    pending = False
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        name = check.get("name") or check.get("context") or "unnamed-check"
+        # StatusContext uses `state`; CheckRun uses `status` + `conclusion`.
+        if "conclusion" in check or "status" in check:
+            status = (check.get("status") or "").upper()
+            conclusion = (check.get("conclusion") or "").upper()
+            if status and status != "COMPLETED":
+                pending = True
+                continue
+            if conclusion in _CHECK_FAILURE_CONCLUSIONS:
+                failing.append(name)
+            elif not conclusion:
+                pending = True
+        else:
+            state = (check.get("state") or "").upper()
+            if state in _CHECK_FAILURE_CONCLUSIONS:
+                failing.append(name)
+            elif state != "SUCCESS":
+                pending = True
+
+    if failing:
+        return "FAILING", failing
+    return ("PENDING", []) if pending else ("PASSING", [])
+
+
+class RunOutcome:
+    """Structured outcomes of an AI run, used by _classify_run.
+
+    String-constants form (not Enum) to keep dtl.py stdlib-friendly and
+    let the values pass through subprocess output cleanly.
+    """
+
+    COMPLETED = "COMPLETED"
+    COMPLETED_TESTS_FAILED = "COMPLETED_TESTS_FAILED"
+    COMPLETED_NOTHING_TO_PUSH = "COMPLETED_NOTHING_TO_PUSH"
+    INTERRUPTED_QUOTA = "INTERRUPTED_QUOTA"
+    INTERRUPTED_AUTH = "INTERRUPTED_AUTH"
+    INTERRUPTED_WALL_CLOCK = "INTERRUPTED_WALL_CLOCK"
+    INTERRUPTED_NETWORK = "INTERRUPTED_NETWORK"
+    FAILED_AI = "FAILED_AI"
+    FAILED_INFRA = "FAILED_INFRA"
+
+    ALL = (
+        COMPLETED,
+        COMPLETED_TESTS_FAILED,
+        COMPLETED_NOTHING_TO_PUSH,
+        INTERRUPTED_QUOTA,
+        INTERRUPTED_AUTH,
+        INTERRUPTED_WALL_CLOCK,
+        INTERRUPTED_NETWORK,
+        FAILED_AI,
+        FAILED_INFRA,
+    )
+
+    INTERRUPTED = (
+        INTERRUPTED_QUOTA,
+        INTERRUPTED_AUTH,
+        INTERRUPTED_WALL_CLOCK,
+        INTERRUPTED_NETWORK,
+    )
+
+
+SENTINEL_RE = re.compile(r"<<<DTL:OUTCOME=([A-Z_]+)>>>")
+
+# Disjoint pattern groups for tail-only fallback classification.
+# Patterns are tested in order; the first group with a match wins.
+_TAIL_PATTERNS: tuple = (
+    (
+        RunOutcome.INTERRUPTED_QUOTA,
+        (
+            "claude usage limit reached",
+            "usage limit reached",
+            "rate_limit_error",
+            "rate limit exceeded",
+            "quota exceeded",
+        ),
+    ),
+    (
+        RunOutcome.INTERRUPTED_AUTH,
+        (
+            "please run claude login",
+            "expired token",
+            "not authenticated",
+            "invalid api key",
+        ),
+    ),
+    (
+        RunOutcome.INTERRUPTED_NETWORK,
+        (
+            "connection reset by peer",
+            "temporary failure in name resolution",
+            "no route to host",
+            "connection timed out",
+        ),
+    ),
+)
+
+
+def _classify_run(exit_code: int, output_lines: list[str]) -> str:
+    """Classify a finished AI run as a RunOutcome value.
+
+    Detection order:
+
+    1. Sentinel marker — scan output_lines for ``<<<DTL:OUTCOME=NAME>>>``.
+       A recognized sentinel value is authoritative.
+    2. Tail-only substring scan (last 50 lines) with disjoint per-outcome
+       patterns. Tail-only is deliberate: full-text scans false-positive on
+       the AI's own narration of writing auth/quota-related code (see the
+       2026-05-14 stranded-research-worker incident).
+    3. Exit-code fallback — 0 -> COMPLETED, 124 -> INTERRUPTED_WALL_CLOCK,
+       anything else (including 125 retry-cap) -> FAILED_AI.
+    """
+    for line in reversed(output_lines):
+        m = SENTINEL_RE.search(line)
+        if m:
+            name = m.group(1)
+            if name in RunOutcome.ALL:
+                return name
+
+    tail = "\n".join(output_lines[-50:]).lower()
+    for outcome, patterns in _TAIL_PATTERNS:
+        if any(p in tail for p in patterns):
+            return outcome
+
+    if exit_code == 0:
+        return RunOutcome.COMPLETED
+    if exit_code == 124:
+        return RunOutcome.INTERRUPTED_WALL_CLOCK
+    return RunOutcome.FAILED_AI
+
+
+def _find_feature_for_branch(features: list[dict], branch: str) -> dict | None:
     """Find the feature dict matching the given branch name."""
     for f in features:
         if f["branch"] == branch:
@@ -3558,8 +4538,182 @@ def _find_feature_for_branch(features: list[dict], branch: str) -> Optional[dict
     return None
 
 
+# ---------------------------------------------------------------------------
+# Notification hook helpers
+# ---------------------------------------------------------------------------
+
+
+def _notify_config_path() -> Path:
+    """$XDG_CONFIG_HOME/dtl/notify.toml, falling back to ~/.config/dtl/notify.toml."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "dtl" / "notify.toml"
+
+
+_NTFY_PRIORITY = {"ai-failure": "high", "needs-attention": "high", "idle": "low"}
+_NTFY_TAGS = {
+    "ai-failure": "x",
+    "feature-merged": "white_check_mark",
+    "needs-attention": "warning",
+    "idle": "zzz",
+}
+
+
+def _ntfy_message(event_type: str, payload: dict) -> str:
+    """One human-readable line for an event, for ntfy's plain-text body."""
+    project = payload.get("project")
+    feature = payload.get("feature")
+    prefix = f"{project}: " if project else ""
+    if event_type == "feature-merged":
+        pr = payload.get("pr_number")
+        return f"{prefix}feature {feature} merged" + (f" (#{pr})" if pr is not None else "")
+    if event_type == "ai-failure":
+        return f"{prefix}AI run failed on {feature} (exit {payload.get('exit_code')})"
+    if event_type == "needs-attention":
+        return f"{prefix}{feature} needs attention: {payload.get('criterion', '')}"
+    if event_type == "idle":
+        return "dtl workflow idle"
+    return f"{prefix}{event_type}"
+
+
+def _load_notify_config() -> dict | None:
+    """Load $XDG_CONFIG_HOME/dtl/notify.toml (default ~/.config/dtl/notify.toml).
+
+    Returns the parsed config dict, or None if the file is absent or unparseable.
+    Config is optional — absent means no notifications, log-only.
+    """
+    config_path = _notify_config_path()
+    if not config_path.exists():
+        return None
+    try:
+        import tomllib  # Python 3.11+ stdlib
+
+        with config_path.open("rb") as fh:
+            return tomllib.load(fh)
+    except Exception as exc:  # noqa: BLE001 — never let config parsing crash a run
+        # A malformed config file used to return None silently, which turns
+        # ALL notifications off with no signal at all. Say so.
+        logging.getLogger("dtl.notify").warning(
+            "Notify config at %s could not be read (%s) — notifications are DISABLED.",
+            config_path,
+            exc,
+        )
+        return None
+
+
+def _emit_notify_event(
+    config: dict | None,
+    event_type: str,
+    payload: dict,
+    log: logging.Logger,
+) -> None:
+    """POST a structured notification event to the configured HTTP endpoint.
+
+    Never raises; delivery failures are logged but never block the workflow.
+    Config is loaded once per workflow run and passed in here.
+
+    Event body shape:
+        {event, event_id, timestamp, actions, **payload}
+    """
+    if not config:
+        return
+
+    events_filter = config.get("events", [])
+    if events_filter and event_type not in events_filter:
+        return
+
+    url = config.get("url", "")
+    if not url:
+        return
+
+    # Only ever POST over http(s). urlopen honours whatever scheme it is given,
+    # so a `file:` or custom scheme in the config would turn this notifier into
+    # a local-file reader — and an Authorization header read from disk is
+    # attached below. Reject anything else loudly rather than silently doing
+    # something other than a network call.
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        log.error(
+            "Notify: refusing to send to unsupported URL scheme %r (only http/https are allowed).",
+            scheme or "<none>",
+        )
+        return
+
+    # Stable event_id for deduplication — survives retries and hub restarts
+    id_src = f"{event_type}:{json.dumps(payload, sort_keys=True)}"
+    event_id = hashlib.sha256(id_src.encode()).hexdigest()[:16]
+
+    body: dict = {
+        "event": event_type,
+        "event_id": event_id,
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        "actions": [],
+    }
+    body.update(payload)
+
+    fmt = config.get("format", "json")
+    if fmt == "ntfy":
+        project = payload.get("project")
+        # http.client sends header values as Latin-1 and ntfy decodes them as
+        # UTF-8, so the literal part of the title stays ASCII ("·" reached the
+        # phone as U+FFFD, hub 2026-09-29).
+        title = f"dtl: {project}" if project else "dtl"
+        headers = {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Title": title.encode("latin-1", "replace").decode("latin-1"),
+            "Priority": _NTFY_PRIORITY.get(event_type, "default"),
+            "Tags": _NTFY_TAGS.get(event_type, "bell"),
+            "X-Dtl-Event-Id": event_id,
+        }
+        data = _ntfy_message(event_type, payload).encode("utf-8")
+    else:
+        if fmt != "json":
+            log.warning("Notify: unknown format %r — falling back to json.", fmt)
+        headers = {"Content-Type": "application/json"}
+        data = json.dumps(body).encode()
+    auth_file = config.get("auth_header_file", "")
+    if auth_file:
+        try:
+            auth_value = Path(auth_file).read_text().strip()
+            if auth_value:
+                headers["Authorization"] = auth_value
+        except Exception as exc:  # noqa: BLE001 — notification must not crash a run
+            # Proceeding without auth is deliberate, but it means the request
+            # goes out UNAUTHENTICATED to an endpoint that was configured to
+            # expect a credential. That is worth saying out loud.
+            log.warning(
+                "Notify: auth header file %s unreadable (%s) — "
+                "sending request WITHOUT authentication.",
+                auth_file,
+                exc,
+            )
+
+    retry_seconds: list = config.get("retry_seconds", [1, 5, 30])
+
+    for attempt, delay in enumerate(retry_seconds):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")  # noqa: S310 — scheme is validated to http/https above before this call
+            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 — scheme is validated to http/https above before this call
+                if resp.status < 300:
+                    log.info("Notify: %s delivered (event_id=%s).", event_type, event_id)
+                    return
+                log.info(
+                    "Notify: %s HTTP %d on attempt %d.",
+                    event_type,
+                    resp.status,
+                    attempt + 1,
+                )
+        except Exception as exc:  # noqa: BLE001 — retry loop; already logged per attempt, exhausts retries rather than crashing
+            log.info("Notify: attempt %d failed for %s: %s", attempt + 1, event_type, exc)
+        if attempt < len(retry_seconds) - 1 and delay > 0:
+            time.sleep(delay)
+
+    log.info("Notify: giving up on %s after %d attempts.", event_type, len(retry_seconds))
+
+
 def cmd_workflow_finish(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow finish'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     project_dir = Path(args.project).resolve()
     watch = getattr(args, "watch", False)
@@ -3632,35 +4786,21 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
 
     log.info("Creating PR...")
     pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
-    if pr_url:
-        log.info("PR created: %s", pr_url)
-        print(f"\nPR: {pr_url}")
-        if _gh_enable_auto_merge(project_dir, branch):
-            log.info("Auto-merge enabled.")
-            print("Auto-merge: enabled (will merge when CI passes)")
-        else:
-            log.info("Auto-merge not available — manual merge required.")
-    else:
+    if not pr_url:
         log.info("Failed to create PR — check gh auth status.")
         sys.exit(1)
+    log.info("PR created: %s", pr_url)
+    print(f"\nPR: {pr_url}")
 
-    # Step 5: update status
-    _update_feature_status(plan_path, feature["name"], "PR Open")
-    subprocess.run(
-        ["git", "add", str(plan_path)],
-        cwd=project_dir,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", f"chore: update {feature['name']} status to PR Open"],
-        cwd=project_dir,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "push"],
-        cwd=project_dir,
-        capture_output=True,
-    )
+    # Step 5: record the status on the feature branch, then let it merge
+    if not _commit_merged_status(project_dir, plan_path, feature["name"], branch, pr_url):
+        log.info("Could not push the status commit to %s — enable auto-merge by hand.", branch)
+        sys.exit(1)
+    if _gh_enable_auto_merge(project_dir, branch):
+        log.info("Auto-merge enabled.")
+        print("Auto-merge: enabled (will merge when CI passes)")
+    else:
+        log.info("Auto-merge not available — manual merge required.")
 
     if not watch:
         return
@@ -3671,33 +4811,16 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
         time.sleep(60)
         state = _gh_pr_state(project_dir, branch)
         if state == "MERGED":
-            log.info("PR merged! Updating status.")
-            # Checkout develop and pull to get merge
+            log.info("PR merged; syncing develop (the status arrived with the merge).")
             subprocess.run(
-                ["git", "checkout", "develop"], cwd=project_dir, capture_output=True
+                ["git", "checkout", "develop"], cwd=project_dir, capture_output=True, check=False
             )
             subprocess.run(
-                ["git", "pull", "origin", "develop"],
+                ["git", "pull", "--ff-only", "origin", "develop"],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
-            _update_feature_status(plan_path, feature["name"], "Merged")
-            subprocess.run(
-                ["git", "add", str(plan_path)],
-                cwd=project_dir,
-                capture_output=True,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "commit",
-                    "-m",
-                    f"chore: update {feature['name']} status to Merged",
-                ],
-                cwd=project_dir,
-                capture_output=True,
-            )
-            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True)
             break
         elif state == "CLOSED":
             log.info("PR was closed without merging. Stopping.")
@@ -3707,6 +4830,249 @@ def cmd_workflow_finish(args: argparse.Namespace) -> None:
             log.info("Could not check PR state — will retry.")
 
 
+def _check_install_freshness(schedule_mode: bool) -> None:
+    """Warn (or abort) when the running dtl.py differs from the repo source-of-truth.
+
+    Compares SHA-256 hashes of the running script and ~/Projects/devtools/dtl.py.
+    - If both paths are the same file: returns immediately (running from repo).
+    - If source-of-truth does not exist: returns silently.
+    - On hash match: returns.
+    - On hash mismatch:
+        schedule_mode=True  → print error to stderr and sys.exit(1)
+        schedule_mode=False → print warning to stderr and return.
+    """
+    import hashlib
+
+    running = Path(sys.argv[0]).resolve()
+    source_of_truth = (Path.home() / "Projects" / "devtools" / "dtl.py").resolve()
+
+    # Same file — running directly from the repo, no comparison needed.
+    if running == source_of_truth:
+        return
+
+    # No repo to compare against.
+    if not source_of_truth.exists():
+        return
+
+    def _sha256(path: Path) -> str:
+        h = hashlib.sha256()
+        h.update(path.read_bytes())
+        return h.hexdigest()
+
+    if _sha256(running) == _sha256(source_of_truth):
+        return
+
+    install_cmd = "sudo /home/comp/Projects/devtools/install.sh"
+    msg = (
+        f"dtl install is stale: the running script does not match the repo source.\n"
+        f"  running        : {running}\n"
+        f"  source-of-truth: {source_of_truth}\n"
+        f"  fix            : {install_cmd}"
+    )
+
+    if schedule_mode:
+        print(f"error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"warning: {msg}", file=sys.stderr)
+
+
+def _preflight_auto_merge(project_dir: Path) -> bool | None:
+    """Check whether the GitHub repo for project_dir has allow_auto_merge enabled.
+
+    Returns:
+        True  — allow_auto_merge is enabled
+        False — allow_auto_merge is explicitly disabled
+        None  — check skipped (not a GitHub remote, gh unavailable, or any error)
+    """
+    # Get the remote URL
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        remote_url = result.stdout.strip()
+    except Exception:  # noqa: BLE001 — git remote lookup is best-effort; None means 'unknown remote'
+        return None
+
+    # Parse owner/name from GitHub remote URLs
+    # Supports https://github.com/owner/name(.git) and git@github.com:owner/name(.git)
+    import re as _re
+
+    match = _re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote_url)
+    if not match:
+        return None  # not a GitHub remote
+
+    owner, name = match.group(1), match.group(2)
+
+    # Query GitHub API
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{owner}/{name}", "--jq", ".allow_auto_merge"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None  # gh unavailable or API error
+        value = result.stdout.strip()
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        return None  # unexpected output
+    except Exception:  # noqa: BLE001 — gh auto-merge probe is best-effort; None means 'cannot determine'
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Notify commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_notify_test(args: argparse.Namespace) -> None:
+    """Handle 'dtl notify test' — send a synthetic event to verify notification config."""
+    cfg = _load_notify_config()
+    if not cfg:
+        print(
+            f"No notify config found at {_notify_config_path()}\n"
+            "Create the file first. See docs/notify.md for the config schema.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    log = logging.getLogger("dtl.notify.test")
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+
+    event_type = getattr(args, "event", "idle")
+    now_ts = datetime.datetime.now(datetime.UTC).isoformat()
+
+    _synthetic: dict[str, dict] = {
+        "ai-failure": {
+            "project": "test-project",
+            "feature": "test-feature",
+            "exit_code": 1,
+            "failure_snapshot_path": None,
+        },
+        "feature-merged": {
+            "project": "test-project",
+            "feature": "test-feature",
+            "pr_number": 42,
+        },
+        "needs-attention": {
+            "project": "test-project",
+            "feature": "test-feature",
+            "criterion": "- [ ] [HUMAN] Manually verify the output",
+        },
+        "idle": {"timestamp": now_ts},
+    }
+
+    payload = _synthetic.get(event_type, {"timestamp": now_ts})
+    url = cfg.get("url", "(no url configured)")
+    print(f"Sending synthetic '{event_type}' event to {url} ...")
+    _emit_notify_event(cfg, event_type, payload, log)
+    print("Done.")
+
+
+def _handle_interruption(
+    project_dir: Path,
+    plan_path: Path,
+    feature: dict,
+    branch: str,
+    outcome: str,
+    ai_exit_code: int,
+    ai_output: str,
+    ai_start: float,
+    log: logging.Logger,
+    notify_cfg: dict | None,
+) -> None:
+    """Record an interruption: snapshot, notify, restore clean tree on develop.
+
+    Interruptions are NOT failures — the AI was prevented from completing,
+    not unable to complete. They never consume the feature's failure budget.
+    The feature branch is left intact for forensics; develop is checked out
+    cleanly so the next loop iteration can retry the feature without
+    tripping the dirty-tree skip.
+    """
+    snapshot_path: Path | None = None
+    try:
+        snapshot_path = _write_failure_snapshot(
+            project_dir,
+            feature,
+            branch,
+            ai_exit_code,
+            time.monotonic() - ai_start,
+            ai_output,
+            log,
+        )
+    except Exception as exc:  # noqa: BLE001 — state snapshot is best-effort; already logged, must not lose the run
+        log.info("Snapshot write failed: %s", exc)
+
+    # Write per-feature state: interruptions increment attempts_interrupted only,
+    # not attempts_completed, so they don't burn the retry budget.
+    try:
+        _fstate = _read_feature_state(project_dir, feature["name"])
+        _fstate["last_outcome"] = outcome
+        _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
+        _fstate["attempts_interrupted"] = _fstate["attempts_interrupted"] + 1
+        if outcome == RunOutcome.INTERRUPTED_WALL_CLOCK:
+            _fstate["partial_work_branch"] = branch
+        _write_feature_state(project_dir, feature["name"], _fstate)
+    except Exception as exc:  # noqa: BLE001 — interrupt-path state write; already logged, must not mask the interrupt
+        log.info("Failed to write feature state on interruption: %s", exc)
+
+    _emit_notify_event(
+        notify_cfg,
+        "ai-interruption",
+        {
+            "project": project_dir.name,
+            "feature": feature["name"],
+            "outcome": outcome,
+            "exit_code": ai_exit_code,
+            "failure_snapshot_path": str(snapshot_path) if snapshot_path else None,
+        },
+        log,
+    )
+
+    _discard_status_edit_and_return(project_dir, plan_path)
+
+
+def _discard_status_edit_and_return(project_dir: Path, plan_path: Path) -> None:
+    """Drop the workflow's own uncommitted DEVPLAN status edit, then go back to develop.
+
+    Targeted to DEVPLAN.md only: any other dirty file still triggers the
+    dirty-tree skip on the next loop instead of being silently erased. Used by
+    every failure path; writing a status instead left the edit uncommitted,
+    the checkout to develop failed, and the next pass skipped the project as
+    dirty (hub, 2026-09-30).
+    """
+    rel_plan = plan_path.relative_to(project_dir)
+    subprocess.run(
+        ["git", "checkout", "--", str(rel_plan)],
+        cwd=project_dir,
+        capture_output=True,
+        check=False,
+    )
+    subprocess.run(
+        ["git", "checkout", "develop"],
+        cwd=project_dir,
+        capture_output=True,
+        check=False,
+    )
+
+
 def cmd_workflow_run(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow run' — the full autonomous loop."""
     projects = [Path(p.strip()).resolve() for p in args.projects.split(",")]
@@ -3714,6 +5080,7 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
     max_failures = getattr(args, "max_failures", 3)
     max_wall_clock = getattr(args, "max_wall_clock", 1800)
     max_ai_retries = getattr(args, "max_ai_retries", 3)
+    quota_reset_sleep = getattr(args, "quota_reset_sleep", 3600)
 
     # Resolve log path: explicit --log overrides XDG default
     log_arg = getattr(args, "log", None)
@@ -3740,6 +5107,52 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             pass
 
     log = _setup_workflow_logger(log_path)
+
+    # Load notification config once for the entire run
+    notify_cfg = _load_notify_config()
+    log.info(
+        "Notify config: %s",
+        "loaded" if notify_cfg else "absent (notifications disabled)",
+    )
+
+    _check_install_freshness(schedule_mode=bool(schedule_time))
+
+    # Preflight: check allow_auto_merge on each project's GitHub repo
+    failed_repos: list[str] = []
+    for proj in projects:
+        result = _preflight_auto_merge(proj)
+        if result is None:
+            log.info(
+                "[%s] Preflight auto-merge check skipped (not a GitHub remote or gh unavailable).",
+                proj.name,
+            )
+        elif result is False:
+            failed_repos.append(proj.name)
+        # result is True: no action needed
+
+    if failed_repos:
+        if schedule_time:
+            log.error(
+                "Preflight FAILED: allow_auto_merge is not enabled on: %s",
+                ", ".join(failed_repos),
+            )
+            log.error(
+                "A scheduled run cannot proceed — without auto-merge, PRs stall "
+                "overnight with no human available to merge them."
+            )
+            log.error(
+                "Recommended fixes:\n"
+                "  • Upgrade to GitHub Pro to enable auto-merge on private repos.\n"
+                "  • Or run without --schedule (interactive mode) and merge PRs "
+                "manually via the GitHub app."
+            )
+            sys.exit(1)
+        else:
+            log.warning(
+                "WARNING: allow_auto_merge is not enabled on: %s. "
+                "PRs require manual merge via the GitHub app.",
+                ", ".join(failed_repos),
+            )
 
     # Wait for scheduled time if specified
     if schedule_time:
@@ -3774,13 +5187,15 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
         ]
         if log_arg is not None:
             child_argv += ["--log", log_arg]
-        result = subprocess.run(child_argv)
+        result = subprocess.run(child_argv, check=False)
         sys.exit(result.returncode)
 
     log.info("=== dtl workflow run starting ===")
     log.info("Projects: %s", ", ".join(str(p) for p in projects))
 
-    consecutive_failures: dict[str, int] = {}
+    # Per-project provider chain index.  Incremented on INTERRUPTED_QUOTA to
+    # rotate to the next provider; reset to 0 after chain is exhausted.
+    chain_indices: dict[Path, int] = {}
 
     while True:
         any_work_done = False
@@ -3798,15 +5213,29 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             next_feature = None
             for f in features:
                 if f["status"] == "Not Started":
-                    fail_key = f"{project_dir.name}:{f['name']}"
-                    if consecutive_failures.get(fail_key, 0) >= max_failures:
+                    fstate = _read_feature_state(project_dir, f["name"])
+                    if fstate["attempts_completed"] >= max_failures:
                         log.info(
                             "[%s] Skipping %s (failed %d times).",
                             project_dir.name,
                             f["name"],
                             max_failures,
                         )
-                        _update_feature_status(plan_path, f["name"], "Failed")
+                        # Do NOT write "Failed" into the DEVPLAN here: this runs on
+                        # develop, the edit stays uncommitted, and the dirty-tree
+                        # check then skips the project on every later run (hub,
+                        # 2026-09-30). The state file already records the give-up;
+                        # tell the operator instead.
+                        _emit_notify_event(
+                            _load_notify_config(),
+                            "needs-attention",
+                            {
+                                "project": project_dir.name,
+                                "feature": f["name"],
+                                "criterion": f"gave up after {max_failures} failed attempts",
+                            },
+                            log,
+                        )
                         continue
                     next_feature = f
                     break
@@ -3815,11 +5244,8 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 log.info("[%s] No unstarted features remaining.", project_dir.name)
                 continue
 
-            fail_key = f"{project_dir.name}:{next_feature['name']}"
             branch = next_feature["branch"]
-            log.info(
-                "[%s] Starting feature: %s", project_dir.name, next_feature["name"]
-            )
+            log.info("[%s] Starting feature: %s", project_dir.name, next_feature["name"])
 
             # Ensure clean tree and on develop
             if _git_is_dirty(project_dir):
@@ -3839,11 +5265,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 ["git", "checkout", "develop"],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
             subprocess.run(
                 ["git", "pull", "origin", "develop"],
                 cwd=project_dir,
                 capture_output=True,
+                check=False,
             )
 
             # Create branch
@@ -3851,9 +5279,11 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                 _git_create_branch(project_dir, branch, base="develop")
             except subprocess.CalledProcessError:
                 log.info("[%s] Failed to create branch %s.", project_dir.name, branch)
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = RunOutcome.FAILED_INFRA
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
+                _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _reason = "branch_create_failed"
                 _prev = _read_workflow_state(project_dir)
                 _skip_count = (
@@ -3874,18 +5304,32 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
 
             # Build prompt and run AI
             constraints_block, _ = _parse_devplan(plan_path.read_text())
-            prompt = _build_ai_prompt(constraints_block, next_feature)
-
-            log.info(
-                "[%s] Launching AI for %s...", project_dir.name, next_feature["name"]
+            prompt = _build_ai_prompt(
+                constraints_block,
+                next_feature,
+                _read_feature_state(project_dir, next_feature["name"])["last_failure_output"],
             )
+
+            log.info("[%s] Launching AI for %s...", project_dir.name, next_feature["name"])
 
             ai_dir = project_dir / ".ai"
             ai_config_path = ai_dir / "config.json"
             ai_exit_code = 1
             ai_output = ""
+            ai_start = time.monotonic()
 
             if ai_config_path.exists():
+                # Resolve the active provider from the chain.
+                _chain = _resolve_provider_chain(project_dir)
+                _chain_idx = chain_indices.get(project_dir, 0)
+                _active_provider = _chain[_chain_idx]
+                log.info(
+                    "[%s] Provider chain: %s (using index %d: %s)",
+                    project_dir.name,
+                    _chain,
+                    _chain_idx,
+                    _active_provider,
+                )
                 # Use dtl's ai_run mechanism via subprocess to isolate failures
                 result = subprocess.run(
                     [
@@ -3903,10 +5347,13 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         str(max_wall_clock),
                         "--max-ai-retries",
                         str(max_ai_retries),
+                        "--provider",
+                        _active_provider,
                     ],
                     capture_output=True,
                     text=True,
                     env={**os.environ},
+                    check=False,
                 )
                 ai_exit_code = result.returncode
                 ai_output = result.stdout + result.stderr
@@ -3921,32 +5368,71 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                         cwd=project_dir,
                         capture_output=True,
                         text=True,
-                        timeout=max_wall_clock if max_wall_clock else None,
+                        timeout=max_wall_clock or None,
                         env={**os.environ},
+                        check=False,
                     )
                     ai_exit_code = result.returncode
                     ai_output = result.stdout + result.stderr
                 except subprocess.TimeoutExpired:
                     log.info(
-                        "[%s] AI wall-clock timeout for %s. Writing FAILURE-REPORT.md.",
+                        "[%s] AI wall-clock timeout for %s.",
                         project_dir.name,
                         next_feature["name"],
-                    )
-                    _write_failure_report(
-                        project_dir, next_feature["name"], "wall_clock", []
                     )
                     ai_exit_code = 124
                     ai_output = ""
 
             # Check for auth failure
-            if _detect_auth_failure(ai_output):
-                log.info(
-                    "[%s] AUTH FAILURE detected — pausing workflow. "
-                    "Run 'claude login' to re-authenticate.",
-                    project_dir.name,
+            outcome = _classify_run(ai_exit_code, ai_output.splitlines())
+            log.info("[%s] AI run outcome: %s", project_dir.name, outcome)
+
+            if outcome in RunOutcome.INTERRUPTED:
+                _handle_interruption(
+                    project_dir,
+                    plan_path,
+                    next_feature,
+                    branch,
+                    outcome,
+                    ai_exit_code,
+                    ai_output,
+                    ai_start,
+                    log,
+                    notify_cfg,
                 )
-                _update_feature_status(plan_path, next_feature["name"], "Not Started")
-                sys.exit(2)
+                if outcome == RunOutcome.INTERRUPTED_AUTH:
+                    log.info(
+                        "[%s] Auth interruption — pausing workflow cleanly.",
+                        project_dir.name,
+                    )
+                    sys.exit(0)
+                elif outcome == RunOutcome.INTERRUPTED_QUOTA:
+                    _chain = _resolve_provider_chain(project_dir)
+                    _cur_idx = chain_indices.get(project_dir, 0)
+                    _next_idx = _cur_idx + 1
+                    if _next_idx < len(_chain):
+                        log.info(
+                            "[%s] Quota hit on '%s'; rotating to '%s' (chain index %d → %d of %d).",
+                            project_dir.name,
+                            _chain[_cur_idx],
+                            _chain[_next_idx],
+                            _cur_idx,
+                            _next_idx,
+                            len(_chain) - 1,
+                        )
+                        chain_indices[project_dir] = _next_idx
+                        any_work_done = True  # Don't sleep between chain retries
+                    else:
+                        log.info(
+                            "[%s] Quota hit on '%s'; provider chain exhausted. "
+                            "Sleeping %ds before retrying from chain start.",
+                            project_dir.name,
+                            _chain[_cur_idx],
+                            quota_reset_sleep,
+                        )
+                        chain_indices[project_dir] = 0
+                        time.sleep(quota_reset_sleep)
+                continue
 
             if ai_exit_code != 0:
                 log.info(
@@ -3955,19 +5441,47 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ai_exit_code,
                     next_feature["name"],
                 )
+                _snapshot_path: Path | None = None
+                try:
+                    _snapshot_path = _write_failure_snapshot(
+                        project_dir,
+                        next_feature,
+                        branch,
+                        ai_exit_code,
+                        time.monotonic() - ai_start,
+                        ai_output,
+                        log,
+                    )
+                except Exception as _snap_exc:  # noqa: BLE001 — nested snapshot write inside an error path; already logged
+                    log.info("Unexpected error writing failure snapshot: %s", _snap_exc)
+                _emit_notify_event(
+                    notify_cfg,
+                    "ai-failure",
+                    {
+                        "project": project_dir.name,
+                        "feature": next_feature["name"],
+                        "exit_code": ai_exit_code,
+                        "failure_snapshot_path": str(_snapshot_path) if _snapshot_path else None,
+                    },
+                    log,
+                )
                 # Bail-out codes (wall-clock or retry-cap) pin the failure count
                 # so the next loop iteration marks the feature as Failed immediately.
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = (
+                    outcome if outcome != RunOutcome.COMPLETED else RunOutcome.FAILED_AI
+                )
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
                 if ai_exit_code in (124, 125):
                     log.info(
                         "[%s] Bail-out limit hit for %s — marking as permanently failed.",
                         project_dir.name,
                         next_feature["name"],
                     )
-                    consecutive_failures[fail_key] = max_failures
+                    _fstate["attempts_completed"] = max_failures
                 else:
-                    consecutive_failures[fail_key] = (
-                        consecutive_failures.get(fail_key, 0) + 1
-                    )
+                    _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 _update_feature_status(plan_path, next_feature["name"], "Not Started")
                 continue
 
@@ -3981,22 +5495,44 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     project_dir.name,
                     test_output,
                 )
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
-                _update_feature_status(plan_path, next_feature["name"], "Not Started")
-                # Return to develop
-                subprocess.run(
-                    ["git", "checkout", "develop"],
-                    cwd=project_dir,
-                    capture_output=True,
-                )
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = RunOutcome.FAILED_AI
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
+                _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _fstate["last_failure_output"] = test_output[-4000:]
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
+                # The state file records the failure; don't write a status here.
+                _discard_status_edit_and_return(project_dir, plan_path)
                 continue
+
+            # Emit needs-attention for any [HUMAN] acceptance criteria
+            _human_criteria = [
+                line.strip()
+                for line in next_feature["block"].splitlines()
+                if "[HUMAN]" in line and line.strip().startswith("- [")
+            ]
+            for _criterion in _human_criteria:
+                _emit_notify_event(
+                    notify_cfg,
+                    "needs-attention",
+                    {
+                        "project": project_dir.name,
+                        "feature": next_feature["name"],
+                        "criterion": _criterion,
+                    },
+                    log,
+                )
+            if _human_criteria:
+                log.info(
+                    "[%s] %d [HUMAN] criterion/criteria — needs-attention event(s) emitted.",
+                    project_dir.name,
+                    len(_human_criteria),
+                )
 
             # Commit any remaining changes
             if _git_is_dirty(project_dir):
                 subprocess.run(
-                    ["git", "add", "-A"], cwd=project_dir, capture_output=True
+                    ["git", "add", "-A"], cwd=project_dir, capture_output=True, check=False
                 )
                 subprocess.run(
                     [
@@ -4007,14 +5543,17 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     ],
                     cwd=project_dir,
                     capture_output=True,
+                    check=False,
                 )
 
             # Push
             if not _git_push_branch(project_dir, branch):
                 log.info("[%s] Push failed for %s.", project_dir.name, branch)
-                consecutive_failures[fail_key] = (
-                    consecutive_failures.get(fail_key, 0) + 1
-                )
+                _fstate = _read_feature_state(project_dir, next_feature["name"])
+                _fstate["last_outcome"] = RunOutcome.FAILED_INFRA
+                _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
+                _fstate["attempts_completed"] = _fstate["attempts_completed"] + 1
+                _write_feature_state(project_dir, next_feature["name"], _fstate)
                 continue
 
             # Create PR
@@ -4022,86 +5561,75 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
             goal_match = re.search(
                 r"### Goal\s*\n(.*?)(?=###|\Z)", next_feature["block"], re.DOTALL
             )
-            goal_text = (
-                goal_match.group(1).strip() if goal_match else next_feature["name"]
-            )
-            pr_body = (
-                f"## Summary\n\n{goal_text}\n\n---\n*Automated by `dtl workflow run`*"
-            )
+            goal_text = goal_match.group(1).strip() if goal_match else next_feature["name"]
+            pr_body = f"## Summary\n\n{goal_text}\n\n---\n*Automated by `dtl workflow run`*"
             pr_url = _gh_create_pr(project_dir, branch, pr_title, pr_body)
             if pr_url:
                 log.info("[%s] PR created: %s", project_dir.name, pr_url)
-                if _gh_enable_auto_merge(project_dir, branch):
-                    log.info("[%s] Auto-merge enabled.", project_dir.name)
-                else:
-                    log.info(
-                        "[%s] Auto-merge not available — manual merge required.",
-                        project_dir.name,
-                    )
             else:
                 log.info("[%s] Failed to create PR.", project_dir.name)
                 continue
 
-            _update_feature_status(plan_path, next_feature["name"], "PR Open")
-            subprocess.run(
-                ["git", "add", str(plan_path)],
-                cwd=project_dir,
-                capture_output=True,
-            )
-            subprocess.run(
-                [
-                    "git",
-                    "commit",
-                    "-m",
-                    f"chore: update {next_feature['name']} status to PR Open",
-                ],
-                cwd=project_dir,
-                capture_output=True,
-            )
-            subprocess.run(["git", "push"], cwd=project_dir, capture_output=True)
+            # Status rides on the feature branch so the squash merge carries it
+            # into develop; it must be pushed before auto-merge can fire.
+            if not _commit_merged_status(
+                project_dir, plan_path, next_feature["name"], branch, pr_url
+            ):
+                log.info(
+                    "[%s] Could not push the status commit to %s; leaving %s unmerged.",
+                    project_dir.name,
+                    branch,
+                    pr_url,
+                )
+                continue
+            if _gh_enable_auto_merge(project_dir, branch):
+                log.info("[%s] Auto-merge enabled.", project_dir.name)
+            else:
+                log.info(
+                    "[%s] Auto-merge not available — manual merge required.",
+                    project_dir.name,
+                )
 
-            # Poll for merge
+            # Poll for merge. Bounded: a PR whose checks have gone red will never
+            # reach MERGED, so waiting on it starves every remaining feature.
             log.info("[%s] Waiting for PR merge...", project_dir.name)
+            merge_deadline = time.monotonic() + MERGE_WAIT_TIMEOUT_S
             while True:
-                time.sleep(60)
+                time.sleep(MERGE_WAIT_POLL_S)
                 state = _gh_pr_state(project_dir, branch)
                 if state == "MERGED":
-                    log.info(
-                        "[%s] PR merged for %s!", project_dir.name, next_feature["name"]
-                    )
+                    log.info("[%s] PR merged for %s!", project_dir.name, next_feature["name"])
                     subprocess.run(
                         ["git", "checkout", "develop"],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
                     subprocess.run(
-                        ["git", "pull", "origin", "develop"],
+                        ["git", "pull", "--ff-only", "origin", "develop"],
                         cwd=project_dir,
                         capture_output=True,
+                        check=False,
                     )
-                    _update_feature_status(plan_path, next_feature["name"], "Merged")
-                    subprocess.run(
-                        ["git", "add", str(plan_path)],
-                        cwd=project_dir,
-                        capture_output=True,
+                    # Reset per-feature state on success
+                    _fstate = _read_feature_state(project_dir, next_feature["name"])
+                    _fstate["last_outcome"] = RunOutcome.COMPLETED
+                    _fstate["last_run_iso"] = datetime.datetime.now(datetime.UTC).isoformat()
+                    _fstate["attempts_completed"] = 0
+                    _fstate["partial_work_branch"] = None
+                    _write_feature_state(project_dir, next_feature["name"], _fstate)
+                    # Emit feature-merged event
+                    _pr_num_match = re.search(r"/pull/(\d+)", pr_url or "")
+                    _emit_notify_event(
+                        notify_cfg,
+                        "feature-merged",
+                        {
+                            "project": project_dir.name,
+                            "feature": next_feature["name"],
+                            "pr_number": int(_pr_num_match.group(1)) if _pr_num_match else None,
+                        },
+                        log,
                     )
-                    subprocess.run(
-                        [
-                            "git",
-                            "commit",
-                            "-m",
-                            f"chore: update {next_feature['name']} status to Merged",
-                        ],
-                        cwd=project_dir,
-                        capture_output=True,
-                    )
-                    subprocess.run(
-                        ["git", "push"],
-                        cwd=project_dir,
-                        capture_output=True,
-                    )
-                    # Reset failure counter on success
-                    consecutive_failures[fail_key] = 0
                     break
                 elif state == "CLOSED":
                     log.info(
@@ -4112,8 +5640,72 @@ def cmd_workflow_run(args: argparse.Namespace) -> None:
                     _update_feature_status(plan_path, next_feature["name"], "Closed")
                     break
 
+                # Still OPEN. Decide whether waiting is still worth it.
+                check_state, failing = _gh_pr_checks(project_dir, branch)
+                pr_ref = pr_url or branch
+                if check_state == "FAILING":
+                    log.info(
+                        "[%s] CI FAILED for %s (%s) -- checks: %s. "
+                        "Abandoning the wait and moving to the next feature.",
+                        project_dir.name,
+                        next_feature["name"],
+                        pr_ref,
+                        ", ".join(failing) or "unknown",
+                    )
+                    _update_feature_status(
+                        plan_path,
+                        next_feature["name"],
+                        f"Blocked (CI red on {pr_ref}: {', '.join(failing) or 'unknown'})",
+                    )
+                    _emit_notify_event(
+                        notify_cfg,
+                        "ci-failed",
+                        {
+                            "project": project_dir.name,
+                            "feature": next_feature["name"],
+                            "pr_url": pr_url,
+                            "failing_checks": failing,
+                        },
+                        log,
+                    )
+                    break
+
+                if time.monotonic() > merge_deadline:
+                    log.info(
+                        "[%s] Timed out after %d min waiting on %s (%s); checks are %s. "
+                        "Moving to the next feature.",
+                        project_dir.name,
+                        MERGE_WAIT_TIMEOUT_S // 60,
+                        next_feature["name"],
+                        pr_ref,
+                        check_state,
+                    )
+                    _update_feature_status(
+                        plan_path,
+                        next_feature["name"],
+                        f"Blocked (merge wait timed out on {pr_ref})",
+                    )
+                    _emit_notify_event(
+                        notify_cfg,
+                        "merge-timeout",
+                        {
+                            "project": project_dir.name,
+                            "feature": next_feature["name"],
+                            "pr_url": pr_url,
+                            "check_state": check_state,
+                        },
+                        log,
+                    )
+                    break
+
         if not any_work_done:
             log.info("=== All projects complete. Exiting. ===")
+            _emit_notify_event(
+                notify_cfg,
+                "idle",
+                {"timestamp": datetime.datetime.now(datetime.UTC).isoformat()},
+                log,
+            )
             break
 
         # Floor sleep — belt-and-suspenders to prevent spin if any_work_done
@@ -4243,13 +5835,14 @@ def cmd_watchdog_status(args: argparse.Namespace) -> None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         if result.returncode == 0:
             for line in result.stdout.splitlines():
                 if "dtl-watchdog" in line:
                     print(f"\nNext scheduled run (systemd):\n  {line.strip()}")
                     break
-    except Exception:
+    except Exception:  # noqa: S110,BLE001 — systemctl output is cosmetic status display only
         pass
 
 
@@ -4260,6 +5853,7 @@ def cmd_watchdog_status(args: argparse.Namespace) -> None:
 
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow list'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     if not plan_path.exists():
         print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
@@ -4281,22 +5875,53 @@ def cmd_workflow_list(args: argparse.Namespace) -> None:
 
 def cmd_workflow_status(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow status'."""
-    project_dir = Path(args.project).resolve()
+    _check_install_freshness(schedule_mode=False)
+    plan_path = Path(args.plan).resolve()
+    if not plan_path.exists():
+        print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+        sys.exit(1)
+
+    project_dir = plan_path.parent.parent
+
+    _, features = _parse_devplan(plan_path.read_text())
+
+    # Workflow skip state (lifecycle)
     state_path = _workflow_state_path(project_dir)
-    if not state_path.exists():
-        print(f"No workflow state found for {project_dir.name}.")
-        return
-    with open(state_path) as f:
-        state = json.load(f)
-    print(f"Project:           {project_dir.name}")
-    print(f"Last check:        {state.get('last_check', 'unknown')}")
-    print(f"Last skip reason:  {state.get('last_skip_reason', 'unknown')}")
-    print(f"Consecutive skips: {state.get('consecutive_skips', 0)}")
-    print(f"Next retry:        {state.get('next_retry', 'unknown')}")
+    if state_path.exists():
+        with state_path.open() as f:
+            wf_state = json.load(f)
+        print(f"Project:           {project_dir.name}")
+        print(f"Last skip reason:  {wf_state.get('last_skip_reason', 'none')}")
+        print(f"Consecutive skips: {wf_state.get('consecutive_skips', 0)}")
+    else:
+        print(f"Project:           {project_dir.name}")
+        print("Workflow state:    (no run state recorded yet)")
+
+    print()
+    print(
+        f"{'Feature':<30}  {'DEVPLAN':<14}  {'Last outcome':<24}  "
+        f"{'Done':<4}  {'Int':<4}  Partial branch"
+    )
+    print("-" * 100)
+    for f in features:
+        fstate = _read_feature_state(project_dir, f["name"])
+        partial = fstate.get("partial_work_branch") or ""
+        print(
+            f"{f['name']:<30}  {f['status']:<14}  "
+            f"{fstate.get('last_outcome', ''):<24}  "
+            f"{fstate.get('attempts_completed', 0):<4}  "
+            f"{fstate.get('attempts_interrupted', 0):<4}  "
+            f"{partial}"
+        )
+    print()
+    latest_snapshot = _latest_failure_snapshot(project_dir)
+    if latest_snapshot:
+        print(f"Last failure snapshot: {latest_snapshot}")
 
 
 def cmd_workflow_next(args: argparse.Namespace) -> None:
     """Handle 'dtl workflow next'."""
+    _check_install_freshness(schedule_mode=False)
     plan_path = Path(args.plan).resolve()
     project_dir = (
         Path(args.project).resolve()
@@ -4316,7 +5941,7 @@ def cmd_workflow_next(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Find next unstarted feature
-    next_feature: Optional[dict] = None
+    next_feature: dict | None = None
     for f in features:
         if f["status"] == "Not Started":
             next_feature = f
@@ -4348,6 +5973,92 @@ def cmd_workflow_next(args: argparse.Namespace) -> None:
     print("[dtl workflow] Launching AI with feature spec...")
     print()
     ai_run(project_dir, prompt)
+
+
+# ---------------------------------------------------------------------------
+# PM commands
+# ---------------------------------------------------------------------------
+
+
+def _pm_source_dir() -> Path:
+    """Return the pm/ directory adjacent to dtl.py (dev clone or installed)."""
+    candidate = Path(__file__).parent / "pm"
+    if candidate.is_dir():
+        return candidate
+    installed = Path("/opt/devtools/pm")
+    if installed.is_dir():
+        return installed
+    raise FileNotFoundError(f"pm/ source not found next to {__file__} or at /opt/devtools/pm")
+
+
+def cmd_pm_install(args: argparse.Namespace) -> None:
+    """Handle 'dtl pm install'."""
+    workspace = Path(args.workspace).expanduser().resolve()
+    dry_run: bool = args.dry_run
+
+    try:
+        pm_src = _pm_source_dir()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    claude_dir = workspace / ".claude"
+    preserve = {
+        claude_dir / "settings.local.json",
+        claude_dir / "HANDOFF.md",
+    }
+
+    def _log(msg: str) -> None:
+        print(f"[dtl pm install] {msg}")
+
+    def _cp(src: Path, dst: Path) -> None:
+        if dst in preserve and dst.exists():
+            _log(f"  preserve  {dst.relative_to(workspace)}")
+            return
+        if dry_run:
+            _log(f"  [dry-run] copy {src.name} -> {dst.relative_to(workspace)}")
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+        _log(f"  copy      {dst.relative_to(workspace)}")
+
+    _log(f"source:    {pm_src}")
+    _log(f"workspace: {workspace}")
+
+    if not dry_run:
+        for subdir in ("rules", "commands", "scripts"):
+            (claude_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    # workspace/CLAUDE.md
+    _cp(pm_src / "CLAUDE.md", workspace / "CLAUDE.md")
+
+    # .claude/settings.json and PROJECTS.md
+    _cp(pm_src / "settings.json", claude_dir / "settings.json")
+    _cp(pm_src / "PROJECTS.md", claude_dir / "PROJECTS.md")
+
+    # subdirs: rules, commands, scripts
+    for subdir in ("rules", "commands", "scripts"):
+        src_subdir = pm_src / subdir
+        if not src_subdir.is_dir():
+            continue
+        for src_file in sorted(src_subdir.iterdir()):
+            if not src_file.is_file():
+                continue
+            _cp(src_file, claude_dir / subdir / src_file.name)
+
+    # chmod +x scripts
+    if not dry_run:
+        scripts_dir = claude_dir / "scripts"
+        if scripts_dir.is_dir():
+            for script in scripts_dir.iterdir():
+                if script.suffix == ".sh":
+                    script.chmod(script.stat().st_mode | 0o111)
+
+    preserved_present = sorted(p for p in preserve if p.exists())
+    if preserved_present:
+        names = ", ".join(str(p.relative_to(workspace)) for p in preserved_present)
+        _log(f"Preserved:  {names}")
+    _log("Done.")
 
 
 # ---------------------------------------------------------------------------
@@ -4589,8 +6300,7 @@ def main() -> None:
         default=3,
         metavar="N",
         help=(
-            "Kill the session after N detected retry loops in AI output "
-            "(default: 3; 0 = disabled)"
+            "Kill the session after N detected retry loops in AI output (default: 3; 0 = disabled)"
         ),
     )
     ai_run_parser.add_argument(
@@ -4598,6 +6308,25 @@ def main() -> None:
         dest="feature_name",
         default="",
         help="Feature name to include in FAILURE-REPORT.md (set by workflow run)",
+    )
+    ai_run_parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Override the AI provider for this run (e.g. claude, ollama, openclaw). "
+            "Defaults to the provider configured in .ai/config.json."
+        ),
+    )
+    ai_run_parser.add_argument(
+        "--provider-chain",
+        dest="provider_chain",
+        default=None,
+        metavar="CHAIN",
+        help=(
+            "Comma-separated list of providers to try in order "
+            "(e.g. claude,ollama). The first provider in the chain is used; "
+            "rotation on quota exhaustion is handled by 'dtl workflow run'."
+        ),
     )
     ai_run_parser.set_defaults(func=cmd_ai_run)
 
@@ -4820,19 +6549,73 @@ def main() -> None:
             "(default: 3; 0 = disabled). Passed through to 'dtl ai run'."
         ),
     )
+    wf_run_parser.add_argument(
+        "--quota-reset-sleep",
+        dest="quota_reset_sleep",
+        type=int,
+        default=3600,
+        metavar="SECONDS",
+        help=(
+            "Seconds to sleep after the provider chain is exhausted by quota limits "
+            "before retrying from the first provider (default: 3600 = 1 hour)."
+        ),
+    )
     wf_run_parser.set_defaults(func=cmd_workflow_run)
 
     # -- workflow status --
     wf_status_parser = workflow_subparsers.add_parser(
         "status",
-        help="Print the current workflow skip state for a project",
+        help="Show per-feature state (cause) alongside DEVPLAN status (lifecycle)",
     )
     wf_status_parser.add_argument(
-        "--project",
+        "--plan",
         required=True,
-        help="Path to the project directory",
+        help="Path to DEVPLAN.md",
     )
     wf_status_parser.set_defaults(func=cmd_workflow_status)
+
+    # -- notify --
+    notify_parser = subparsers.add_parser(
+        "notify",
+        help="Notification hook management",
+    )
+    notify_subparsers = notify_parser.add_subparsers(dest="notify_command")
+    nt_test_parser = notify_subparsers.add_parser(
+        "test",
+        help="Send a synthetic event to verify notification config",
+    )
+    nt_test_parser.add_argument(
+        "--event",
+        default="idle",
+        choices=["ai-failure", "feature-merged", "needs-attention", "idle"],
+        help="Event type to send (default: idle)",
+    )
+    nt_test_parser.set_defaults(func=cmd_notify_test)
+
+    # -- pm (subcommand group) --
+    pm_parser = subparsers.add_parser(
+        "pm",
+        help="PM coordination layer management",
+    )
+    pm_subparsers = pm_parser.add_subparsers(dest="pm_command")
+
+    # -- pm install --
+    pm_install_parser = pm_subparsers.add_parser(
+        "install",
+        help="Materialize the canonical PM config (pm/) into a workspace",
+    )
+    pm_install_parser.add_argument(
+        "--workspace",
+        default="~/Projects",
+        help="Target workspace directory (default: ~/Projects)",
+    )
+    pm_install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Show what would be copied without making changes",
+    )
+    pm_install_parser.set_defaults(func=cmd_pm_install)
 
     # -- Parse and dispatch --
     args = parser.parse_args()
@@ -4841,22 +6624,29 @@ def main() -> None:
         sys.exit(1)
 
     # Handle 'ai' subcommand group
-    if args.command == "ai":
-        if not getattr(args, "ai_command", None):
-            ai_parser.print_help()
-            sys.exit(1)
+    if args.command == "ai" and not getattr(args, "ai_command", None):
+        ai_parser.print_help()
+        sys.exit(1)
 
     # Handle 'workflow' subcommand group
-    if args.command == "workflow":
-        if not getattr(args, "workflow_command", None):
-            workflow_parser.print_help()
-            sys.exit(1)
+    if args.command == "workflow" and not getattr(args, "workflow_command", None):
+        workflow_parser.print_help()
+        sys.exit(1)
 
     # Handle 'watchdog' subcommand group
-    if args.command == "watchdog":
-        if not getattr(args, "watchdog_command", None):
-            watchdog_parser.print_help()
-            sys.exit(1)
+    if args.command == "watchdog" and not getattr(args, "watchdog_command", None):
+        watchdog_parser.print_help()
+        sys.exit(1)
+
+    # Handle 'notify' subcommand group
+    if args.command == "notify" and not getattr(args, "notify_command", None):
+        notify_parser.print_help()
+        sys.exit(1)
+
+    # Handle 'pm' subcommand group
+    if args.command == "pm" and not getattr(args, "pm_command", None):
+        pm_parser.print_help()
+        sys.exit(1)
 
     args.func(args)
 

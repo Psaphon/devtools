@@ -1,0 +1,19 @@
+# Paste as the LAST job in .github/workflows/ci.yml. The rulesets require only this
+# check ("ci-ok", pinned to GitHub Actions), so adding or renaming jobs never needs a
+# ruleset change, and a new job can't be forgotten: list every job in `needs`.
+#
+# It requires every needed job to SUCCEED. "skipped" counts as failure: a job that
+# silently skipped (bad `if:`, path filter) must not let a PR merge untested.
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test]          # every other job in this workflow
+    if: always()
+    steps:
+      - name: All required jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: ${RESULTS}"
+          for r in ${RESULTS}; do
+            [[ "${r}" == "success" ]] || { echo "::error::a required job ended '${r}'"; exit 1; }
+          done

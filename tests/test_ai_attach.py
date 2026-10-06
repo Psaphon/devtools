@@ -13,15 +13,15 @@ from dtl import cmd_ai_attach
 
 def _make_args(project: Path, **kwargs) -> argparse.Namespace:
     """Build a minimal argparse.Namespace for cmd_ai_attach."""
-    defaults = dict(
-        project=str(project),
-        provider="claude",
-        mode="docker",
-        model=None,
-        key_source="env",
-        scaffold_ci=False,
-        no_ci=False,
-    )
+    defaults = {
+        "project": str(project),
+        "provider": "claude",
+        "mode": "docker",
+        "model": None,
+        "key_source": "env",
+        "scaffold_ci": False,
+        "no_ci": False,
+    }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
@@ -66,6 +66,4 @@ def test_attach_with_no_ci_skips_check(tmp_path):
     args = _make_args(project, no_ci=True)
     cmd_ai_attach(args)  # should not raise SystemExit(1)
 
-    assert not ci_path.exists(), (
-        "CI workflow should NOT be written when --no-ci is passed"
-    )
+    assert not ci_path.exists(), "CI workflow should NOT be written when --no-ci is passed"

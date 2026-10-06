@@ -28,6 +28,25 @@ dtl is a single-file Python scaffolder for containerized dev environments with A
 
 Add a `dtl workflow next` command that reads a DEVPLAN.md, finds the next unstarted feature, creates a feature branch off develop, and launches the AI with the feature spec as context.
 
+7. **CI installs a hand-listed dependency set, not the project's declared one.**
+   The template runs `pip install pytest` (and `pip install ruff`, unpinned). A repo
+   that declares test dependencies the correct way -- in `[project.optional-dependencies]
+   dev` or `requirements.txt` -- has them silently ignored by CI. On 2026-09-01 the
+   atrade overnight batch added `respx` to the `dev` extra, passed the local preflight
+   (which installs `-e .[dev]`), and red-failed CI on `ModuleNotFoundError: respx`.
+   The local preflight and CI must install from the SAME declaration.
+
+### Goal (addendum) -- CI parity entrypoint
+
+Defect 7 is a symptom of a structural problem: the steps CI runs are defined in
+`ci.yml`, and the steps the local preflight runs are defined separately in
+`_run_lint_and_tests`. Two definitions that must agree by discipline will
+eventually disagree, and the disagreement is only discovered on a PR at 02:00.
+
+Generate a single `scripts/ci.sh` holding the lint/format/test sequence. The
+scaffolded `ci.yml` invokes it, and `_run_lint_and_tests` invokes it when present.
+One script, two callers -- they cannot drift, because there is only one of them.
+
 ### Acceptance Criteria
 
 - [x] `dtl workflow next --plan docs/DEVPLAN.md` parses the plan and identifies the next feature with status "Not Started"
@@ -442,7 +461,7 @@ A locally-scheduled watchdog that periodically checks all `dtl`-managed projects
 - [x] Check detects: (a) `dtl workflow run` process absent when DEVPLAN has Not Started features; (b) dirty tree older than 24h; (c) no PR activity in 48h when Not Started features exist; (d) log growth > 100MB/day in `~/.local/state/dtl/`
 - [x] On any anomaly, invokes every project's `.ai/notify.py` with a structured message
 - [x] `dtl watchdog status` prints last run result and next scheduled run
-- [ ] [HUMAN] Install the timer via `systemctl --user enable --now dtl-watchdog.timer`
+- [x] [HUMAN] Install the timer via `systemctl --user enable --now dtl-watchdog.timer`
 - [x] Test: fixture projects exercising each anomaly type trigger exactly one notify call
 - [x] Lint clean, tests pass
 
@@ -676,7 +695,7 @@ Diagnostic confirmation: `loom-workflow-night3.log` shows `02:00:00 [loom] Start
 
 **Branch:** `feature/preflight-auto-merge-check`
 **Depends on:** none
-**Status:** Not Started
+**Status:** Merged
 **Requires:** ai
 
 ### Goal
@@ -724,3 +743,622 @@ Why GitHub blocks the setting: `allow_auto_merge` requires GitHub Pro on private
 Until Psaphon upgrades to GitHub Pro (~$4/mo), private-repo development uses interactive `dtl workflow run` (no `--schedule`). The user merges PRs from the GitHub mobile app as they appear.
 
 Cross-reference: night-4 brief misdiagnosed this as "auto-merge wasn't enabled on loom" — implying a setting flip would fix it. The actual constraint is plan + visibility, not setting state. This feature makes that distinction explicit at runtime.
+
+---
+
+## Feature: ai-failure-snapshot
+
+**Branch:** `feature/ai-failure-snapshot`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+When the AI subprocess in `dtl workflow run` exits non-zero, capture a triage bundle to `~/.local/state/dtl/` so the next PM session can diagnose without spelunking through a half-implemented branch. Today, on AI exit-code-1 the workflow marks the feature failed and moves on (or refuses on dirty tree); the dirty paths and the AI's last-N stderr lines are scattered across the project and the workflow log.
+
+A triage bundle gives the next PM one place to look.
+
+### Acceptance Criteria
+
+- [ ] On AI subprocess non-zero exit in `cmd_workflow_run`, write `~/.local/state/dtl/<project>-<feature>-failure-<UTC-iso>.md` containing:
+  - Project path, feature name, branch name, AI exit code, wall-clock duration
+  - Last 200 lines of AI stdout/stderr (combined, in order, prefixed with stream name)
+  - `git status --porcelain` snapshot at the moment of failure
+  - `git diff --stat develop..HEAD` and the full `git diff develop..HEAD` (capped at 5000 lines, with a "truncated" marker if exceeded)
+  - List of untracked files (relative paths only — no contents)
+- [ ] Snapshot is written *before* any cleanup or branch-state change, so the captured `git status` matches the AI's view at exit
+- [ ] If the snapshot directory does not exist, create it (mode 0700)
+- [ ] If snapshot write fails (disk full, permissions), log the failure but do not propagate — the workflow's existing failure handling continues uninterrupted
+- [ ] Snapshot path is logged as a single `INFO` line to the workflow log: `failure snapshot written: <path>`
+- [ ] `dtl workflow status --project <path>` (existing subcommand from `workflow-stall-visibility`) prints the most recent failure snapshot path for the project, if any
+- [ ] Two new tests in `tests/test_workflow.py`: (a) simulated AI exit-1 produces a snapshot file with all required sections; (b) snapshot write failure does not raise out of `cmd_workflow_run`
+- [ ] Existing AI-failure / dirty-tree / consecutive-failure tests still pass
+- [ ] Lint clean (`ruff check . && ruff format --check .`)
+- [ ] All tests pass
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_write_failure_snapshot(project, feature, ai_log_lines)` helper; call it from the AI-exit-non-zero branch in `cmd_workflow_run`; extend `cmd_workflow_status` to surface latest snapshot path |
+| `tests/test_workflow.py` | Modify | Two new tests: snapshot content + snapshot-write-failure tolerance |
+
+### Key Decisions
+
+- **Snapshot lives in `~/.local/state/dtl/`, not the project directory.** Same rationale as `workflow-log-defaults` and `workflow-stall-visibility` — never write into a project root, the dirty-tree skip loop is a footgun.
+- **Markdown over JSON.** A PM (human or LLM) reads this on incident; a markdown report is grep-able, copy-paste-friendly, and renders on phone. JSON adds parsing burden without a consumer.
+- **Capture stdout/stderr combined and ordered, not separately.** The diagnostic value is the *sequence* — what the AI said before it died. Splitting streams reverses that.
+- **Cap the diff at 5000 lines, mark when truncated.** Pathological cases (vendored deps, large generated files) shouldn't blow up the snapshot. 5000 lines covers >99% of feature-sized diffs and keeps the file <1MB.
+- **Untracked file *list*, not contents.** Untracked files might include large binaries, secrets-shaped fixtures, or personal scratch. Filenames let the PM read what they want; embedding contents inflates the snapshot and risks leaking sensitive material.
+- **Snapshot-write failure is non-fatal.** The original failure (AI exit-1) is what matters; a snapshot failure on top would mask it.
+
+### Notes
+
+Origin: loom night 4 (2026-04-27). The `diffusion-stylize` AI returned exit code 1 mid-feature; the workflow's retry refused on a dirty tree and exited. Triage the next morning required reading `git status`, opening four dirty files, running the test suite manually, and inferring from the lint output that the AI was 95% done but tripped on `ruff check`. With this snapshot, that morning would have been one file read instead of seven.
+
+Open question (resolve in implementation): how to capture AI stdout/stderr. The current `dtl ai run` subprocess wiring may already tee to the workflow log; if so, extracting last-200 from that log is cheaper than re-buffering. If stdout/stderr are not currently captured, this feature requires adding a ring buffer in the subprocess wrapper. Worth a quick read of the existing `_run_ai` (or equivalent) before settling the approach.
+
+Cross-reference: this complements `workflow-stall-visibility` (state file on every skip) and `ai-dev-loop-break` (FAILURE-REPORT.md on retry-cap or wall-clock kill). Those cover *successful refusal* and *self-detected stuck-loop*. This covers the *AI exited but produced uncommitted work* case — which is what actually happened on loom night 4.
+
+---
+
+## Feature: planning-templates-v2
+
+**Branch:** `feature/planning-templates-v2`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Refine the planning-Claude templates (PROJECT-BRIEF.md, DEVPLAN.md, CLAUDE.md, PLANNING-GUIDE.md, PROJECTS-CONTEXT.md) so that planning sessions held on a phone produce briefs the PM can act on without back-and-forth: explicit repo-visibility decision, optional Hardware Target section, mandatory Security & Trust Boundaries section, and a duplicate-detection step before proposing a brief.
+
+Origin: 2026-05-12 reconcile. The hub/hdlss-ws/watch-ops trio surfaced four gaps in the templates — duplicate planning of the same machine, missing public/private repo declaration, missing hardware section, no security-boundaries discipline.
+
+### Acceptance Criteria
+
+- [x] `templates/PLANNING-GUIDE.md` adds a "Before You Plan: Check What Already Exists" step (scan `~/Projects/NEW-PROJECTS/` for in-flight plans)
+- [x] `templates/PLANNING-GUIDE.md` adds Q11 (public/private repo), Q12 (hardware provisioning), Q13 (security/trust boundaries)
+- [x] `templates/PLANNING-GUIDE.md` adds a "Repo Visibility & Scheduling Eligibility" section explaining the GH Free auto-merge constraint
+- [x] `templates/PLANNING-GUIDE.md` adds a "Security & Trust Boundaries — How to Plan" section
+- [x] `templates/PROJECT-BRIEF.md` adds a Repo Visibility section (required)
+- [x] `templates/PROJECT-BRIEF.md` adds an optional Hardware Target section (required when project provisions a machine)
+- [x] `templates/PROJECT-BRIEF.md` adds an optional Security & Trust Boundaries section (required when project touches networking, credentials, devices, or deploys to metal)
+- [x] `templates/CLAUDE.md` adds a Network Segmentation and Trust Boundaries section after Coordination
+- [x] `templates/PROJECTS-CONTEXT.md` adds a Network Segmentation convention, a Repo Visibility & Scheduling Eligibility convention, and an "In-Flight Plans" pointer to `~/Projects/NEW-PROJECTS/`
+- [x] All tests pass (no code changed — templates only)
+- [x] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `templates/PLANNING-GUIDE.md` | Modify | Pre-plan scan, 3 new interview questions, 2 new sections |
+| `templates/PROJECT-BRIEF.md` | Modify | 3 new sections (Repo Visibility required, Hardware/Security optional-but-conditional) |
+| `templates/CLAUDE.md` | Modify | Network Segmentation and Trust Boundaries section |
+| `templates/PROJECTS-CONTEXT.md` | Modify | Two new conventions + in-flight-plans pointer |
+
+### Key Decisions
+
+- **Templates carry the discipline, not the planner's improvisation.** Every gap surfaced by hub/hdlss-ws/watch-ops becomes an explicit section so the next planning round doesn't rely on the planning Claude remembering to ask.
+- **Repo visibility is a hard fork in the development model** — public means overnight-scheduled, private means manual day-only. The template surfaces this so it's decided up front.
+- **Security & Trust Boundaries is conditional-mandatory.** Pure-software localhost-only projects skip it; anything touching networking, credentials, or hardware requires it.
+- **Bind addresses are never defaults.** The CLAUDE.md template's Network Segmentation block forces `127.0.0.1` / `tailscale0` / `0.0.0.0` to be a stated decision per service.
+- **In-flight plans live in `~/Projects/NEW-PROJECTS/`** and the planner is now instructed to scan them. Structural fix for the hub/hdlss-ws duplicate.
+
+### Notes
+
+Second round of planning-template refinement after PRs #19 and #25. Templates now carry the lessons from the first 4 production planning sessions, including the two failures (duplicate plan, missing segmentation thinking).
+
+Companion change made the same day: `~/Projects/NEW-PROJECTS/hub/PROJECT-BRIEF.md` and `DEVPLAN.md` rewritten against these refined templates; old `hub/Project-Brief.md`, `hub/Devplan.md`, `hdlss-ws/`, and `watch-ops/` moved to `~/Projects/NEW-PROJECTS/ARCHIVE/`.
+
+---
+
+## Feature: dtl-notify-hook
+
+**Branch:** `feature/dtl-notify-hook`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Add a notification hook to `dtl workflow run` that emits structured events (`needs-attention`, `feature-merged`, `test-failure`, `idle`, `ai-failure`) to a configurable HTTP endpoint. The endpoint is typically ntfy on the user's hub, which forwards to iOS via APNs and to a watch action-button surface. This decouples `dtl` from any specific notification backend.
+
+Origin: 2026-05-12, carved out of `watch-ops` planning. ntfy lives on hub (separate repo); the hook lives here because `dtl` is the event source.
+
+### Acceptance Criteria
+
+- [ ] `dtl workflow run` reads notification config from `~/.config/dtl/notify.toml` (gitignored, optional — absent = no notifications, log-only)
+- [ ] Config schema:
+  ```toml
+  url = "https://ntfy.<tailnet>.ts.net/dtl"
+  events = ["ai-failure", "feature-merged", "needs-attention", "idle"]
+  auth_header_file = "/etc/dtl/ntfy-auth"  # optional; contents become Authorization: header
+  retry_seconds = [1, 5, 30]                # backoff for delivery failures; then give up
+  ```
+- [ ] Events emitted (JSON POST body):
+  - `ai-failure` — AI subprocess exited non-zero (project, feature, exit_code, failure_snapshot_path from ai-failure-snapshot)
+  - `feature-merged` — workflow detected PR merged (project, feature, pr_number)
+  - `needs-attention` — workflow paused for [HUMAN] criterion (project, feature, criterion)
+  - `idle` — workflow has no Not-Started features left across all projects (timestamp)
+- [ ] Each POST includes a stable `event_id` for deduplication
+- [ ] Each POST includes optional `actions` array with `{label, url}` for ntfy action buttons (e.g., `approve PR 9` → POST to hub's action-handler endpoint)
+- [ ] Delivery failures retried per `retry_seconds`; total delivery time bounded; failed deliveries logged but never block the workflow
+- [ ] Notification config loaded once per workflow run, not per event
+- [ ] `dtl notify test` subcommand sends a synthetic event for testing
+- [ ] New tests in `tests/test_workflow.py`: (a) emits ai-failure event with correct shape on AI exit-1; (b) emits feature-merged on PR merge detection; (c) delivery failure is non-fatal
+- [ ] `docs/notify.md` documents config + event shapes + ntfy action-handler integration
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_load_notify_config`, `_emit_notify_event`, integrate at the 4 event sites in `cmd_workflow_run`; add `dtl notify test` subcommand |
+| `tests/test_workflow.py` | Modify | Three new tests covering event emission and delivery failure tolerance |
+| `docs/notify.md` | Create | Config + event shapes + ntfy action-handler integration |
+
+### Key Decisions
+
+- **stdlib HTTP** (`urllib.request`) — preserves the dtl stdlib-only constraint
+- **TOML config**, gitignored, optional — no surprise notifications, opt-in per machine
+- **Stable `event_id`** — lets ntfy / action-handlers deduplicate, supports retries
+- **Action buttons in the event payload** — the hook generates action URLs (e.g., `POST /api/approve/<project>/<pr>`); the hub-side action-handler endpoint dispatches them. Keeps verb vocabulary in one place (hub's dispatcher) but URL generation close to the event
+- **Delivery failures are silent (logged, not raised)** — workflow must never fail because a notification failed
+
+### Notes
+
+- **Companion features in `hub`:** `ntfy-stack`, `action-handlers`. The hub side cannot do anything without this feature shipping first as the event source
+- Authentication via `auth_header_file` is generic — works for Bearer, Basic, or none
+
+## Feature: interruption-taxonomy
+
+**Branch:** `feature/interruption-taxonomy`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Replace the substring-on-stdout auth-failure detection with a structured outcome signal. `_detect_auth_failure` (dtl.py:3666) does a full-text scan of AI output for strings like `"authentication failed"` — and on 2026-05-14 02:20 EDT it false-positive'd on the AI's own narration of writing a Cloudflare Worker error message, abandoning a fully-completed `research-worker` feature mid-run. This feature introduces a `RunOutcome` enum, a sentinel marker the AI prints as its final line, and tail-only fallback detection. No more stranded work because of substring collisions.
+
+### Acceptance Criteria
+
+- [ ] New `class RunOutcome` (string constants) defined in `dtl.py`: `COMPLETED`, `COMPLETED_TESTS_FAILED`, `COMPLETED_NOTHING_TO_PUSH`, `INTERRUPTED_QUOTA`, `INTERRUPTED_AUTH`, `INTERRUPTED_WALL_CLOCK`, `INTERRUPTED_NETWORK`, `FAILED_AI`, `FAILED_INFRA`
+- [ ] New `_classify_run(exit_code, output_lines)` returns a `RunOutcome`. Looks for `<<<DTL:OUTCOME=NAME>>>` sentinel first, then falls back to tail-only scan (last 50 lines) with disjoint pattern sets per outcome
+- [ ] `_build_ai_prompt` (dtl.py:3118) appends: *"After committing, print exactly this line as your final output: `<<<DTL:OUTCOME=COMPLETED>>>`. If you cannot complete, print `<<<DTL:OUTCOME=FAILED_AI>>>` followed by a one-line reason."*
+- [ ] `_detect_auth_failure` is deleted; all callers route through `_classify_run`
+- [ ] `cmd_workflow_run` (dtl.py:4322) replaces the `if _detect_auth_failure(ai_output): sys.exit(2)` block with a switch on `_classify_run(...)`. Each outcome has explicit handling (no silent `sys.exit`)
+- [ ] `INTERRUPTED_AUTH` writes a snapshot, emits a notify event, and pauses cleanly
+- [ ] `INTERRUPTED_QUOTA` and `INTERRUPTED_NETWORK` do NOT count toward the feature's failure budget (environmental)
+- [ ] On any interruption, working tree is left clean (DEVPLAN status reverted, branch returned to develop) — no more dirty-tree skip loops on the next run
+- [ ] Tests in `tests/test_workflow.py`: `TestRunClassification` covers one test per outcome plus a regression test for last night's bug (output containing `"authentication failed"` PLUS `<<<DTL:OUTCOME=COMPLETED>>>` must classify as `COMPLETED`)
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `RunOutcome`, `_classify_run`; delete `_detect_auth_failure`; update `_build_ai_prompt` and `cmd_workflow_run` |
+| `tests/test_workflow.py` | Modify | Add `TestRunClassification` |
+
+### Notes
+
+- **Single-file constraint:** `RunOutcome` is a class of string constants in `dtl.py`, not a separate module
+- **Sentinel format:** `<<<DTL:OUTCOME=NAME>>>` chosen for low collision risk — triple-bracket sentinels are unusual in code, AI narration, or test output
+- **Tail-only fallback:** scan `output_lines[-50:]` not full output. Last night's bug class is impossible if the AI never narrates auth errors in its closing 50 lines
+- **Backward compat:** when the sentinel is absent (AI ignored the instruction), classification falls back to tail scan — never to full-text scan
+- **Bootstrapping caveat:** this feature changes the very detection that would otherwise strand it. Build via direct edit, not via `dtl workflow run` (which would false-positive on its own test patterns)
+
+## Feature: per-feature-state
+
+**Branch:** `feature/per-feature-state`
+**Depends on:** interruption-taxonomy
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Move the workflow's per-feature retry budget out of an in-memory dict (`consecutive_failures` in `cmd_workflow_run`) and into a persistent per-feature state file. Adds a clean separation: DEVPLAN status is the *lifecycle* (humans plan from it); per-feature state is the *cause* (workflow recovers from it). Makes interruption-recovery decisions possible across workflow restarts.
+
+### Acceptance Criteria
+
+- [ ] New `_feature_state_path(project_dir, feature_name)` returns `~/.local/state/dtl/<project>/<feature>.json`
+- [ ] New `_read_feature_state` and `_write_feature_state` (atomic write via tempfile + rename, mode 0o600)
+- [ ] State schema: `{"last_outcome": str, "last_run_iso": str, "attempts_completed": int, "attempts_interrupted": int, "partial_work_branch": str|null}`
+- [ ] `cmd_workflow_run` removes `consecutive_failures: dict[str, int]` and reads/writes per-feature state instead
+- [ ] `INTERRUPTED_*` outcomes increment `attempts_interrupted`, NOT `attempts_completed` (so quota interruptions don't burn the retry budget)
+- [ ] `FAILED_*` outcomes increment `attempts_completed`; after `max_failures`, feature is marked `Failed` in DEVPLAN
+- [ ] `_write_failure_snapshot` is the single snapshot writer. `_write_failure_report` is deleted (it dirtied the project root with `FAILURE-REPORT.md`)
+- [ ] `_watchdog_check_*` reads `<project>/<feature>.json` as primary signal where applicable; falls back to git/gh
+- [ ] New `dtl workflow status --plan <plan>` subcommand shows per-feature state alongside DEVPLAN status (lifecycle vs cause)
+- [ ] Tests verify: state survives a simulated process restart; `INTERRUPTED_QUOTA` does not increment `attempts_completed`; existing workflow paths work unchanged
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add state helpers, refactor `cmd_workflow_run`, delete `_write_failure_report`, update watchdog |
+| `tests/test_workflow.py` | Modify | Add `TestFeatureState` |
+| `tests/test_watchdog.py` | Modify | Verify watchdog reads state file |
+
+### Notes
+
+- **State directory:** uses existing `_dtl_state_dir()` (dtl.py:3251). New per-feature subdirectory: `~/.local/state/dtl/<project>/`
+- **Migration:** none — first read of an absent file returns the empty default
+- **`partial_work_branch`:** populated on `INTERRUPTED_WALL_CLOCK` so a future feature can teach the AI to resume on its existing branch
+- **Lifecycle/cause split:** DEVPLAN status remains the planning-side source of truth; per-feature state is the workflow-side source of truth. Workflow trusts DEVPLAN for lifecycle, trusts state file for cause
+
+## Feature: provider-chain
+
+**Branch:** `feature/provider-chain`
+**Depends on:** per-feature-state
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Make `dtl ai run` and `dtl workflow run` aware of an ordered list of AI providers, and rotate to the next provider on `INTERRUPTED_QUOTA`. Replaces the current single-provider-per-project model. Also refreshes the stale model IDs in `AI_PROVIDERS_CONFIG` (dtl.py:239) to current versions.
+
+### Acceptance Criteria
+
+- [ ] `<project>/.ai/config.json` accepts a new optional `provider_chain` field: ordered list of provider names. Falls back to single `provider` if absent (backward compat)
+- [ ] `cmd_workflow_run` consults `provider_chain` on `INTERRUPTED_QUOTA`: writes `last_outcome=INTERRUPTED_QUOTA`, retries the same feature with the next provider in the chain. After exhausting the chain, sleeps until quota window resets (configurable, default 3600s)
+- [ ] `AI_PROVIDERS_CONFIG` model IDs updated: opus → `claude-opus-4-7`, sonnet → `claude-sonnet-4-6`, haiku → `claude-haiku-4-5-20251001`
+- [ ] `ollama` gains an autonomous adapter (`supports_autonomous: True`), serving as a no-quota fallback. Uses `ollama run` in print mode against the host daemon
+- [ ] `dtl ai list-providers` output shows a quota-source annotation (e.g. `[anthropic-shared]` for claude/openclaw, `[local]` for ollama)
+- [ ] `dtl ai run` accepts `--provider-chain claude,ollama` to override per-call (optional)
+- [ ] Tests cover: chain rotation on simulated `INTERRUPTED_QUOTA`; chain exhaustion sleep; backward compat with single-provider config
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add ollama autonomous adapter, refactor dispatcher, refresh model IDs |
+| `tests/test_workflow.py` | Modify | Add `TestProviderChain` |
+| `tests/test_ai_run.py` | Modify | Verify chain rotation |
+
+### Notes
+
+- **`openclaw` and `claude` share the Anthropic quota** when both use `ANTHROPIC_API_KEY` from the same account. Document this in `dtl ai list-providers` so users don't pick a useless chain
+- **Local Ollama is the only true no-quota fallback** today, but its `supports_autonomous` is False — this PR adds the autonomous adapter
+- **Model ID drift:** the current IDs (`claude-opus-4-20250514`) are pre-4.7. Update at merge time and document the bump convention
+
+---
+
+## Feature: install-staleness-guard
+
+**Branch:** `feature/install-staleness-guard`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Refuse to start (or warn loudly) when `dtl workflow *` is invoked against an installed `dtl.py` that differs from the source-of-truth repo `dtl.py`. Closes the gap that produced 2026-05-17's overnight: PR #38 (`per-feature-state`) merged at 17:18 EDT, the overnight was scheduled at 19:42 against a stale `/opt/devtools/dtl.py`, and ran code that pre-dated `_write_feature_state`. The existing `scheduled-run-freshness` ensures the child re-reads `/opt` at fire time but cannot detect that `/opt` itself is stale relative to the repo.
+
+### Acceptance Criteria
+
+- [ ] New helper `_check_install_freshness(schedule_mode: bool) -> None` in `dtl.py`:
+  - Resolves the running script: `Path(sys.argv[0]).resolve()`
+  - Resolves the source-of-truth: `Path.home() / "Projects" / "devtools" / "dtl.py"` (also `.resolve()`)
+  - Returns immediately if both paths resolve to the same file (running directly from repo)
+  - Returns immediately if the source-of-truth path does not exist (no repo to compare against)
+  - Compares file contents by sha256 hash
+  - On match: returns
+  - On mismatch: if `schedule_mode=True`, prints clear error to stderr (showing both paths + the exact `sudo install.sh` command) and `sys.exit(1)`; otherwise prints a warning to stderr and returns
+- [ ] Called at the top of `cmd_workflow_run` (with `schedule_mode=bool(args.schedule)`), `cmd_workflow_next`, `cmd_workflow_finish`, `cmd_workflow_list`, and `cmd_workflow_status` — always with `schedule_mode=False` except in `cmd_workflow_run`
+- [ ] Called BEFORE `_preflight_auto_merge` in `cmd_workflow_run` so staleness is reported before any GitHub API call
+- [ ] When `--schedule` is set and the guard passes at parent-launch time, the spawned child also runs the guard (automatic because the child re-enters `cmd_workflow_run`)
+- [ ] Tests in `tests/test_workflow.py`:
+  - Same content → no exception, no exit
+  - Different content + `schedule_mode=False` → returns, stderr contains "stale"
+  - Different content + `schedule_mode=True` → `SystemExit(1)`
+  - Source-of-truth missing → returns silently
+  - `sys.argv[0]` resolves to the source-of-truth path → returns silently (running from repo)
+- [ ] All existing tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `_check_install_freshness`; call from all five `cmd_workflow_*` entry points |
+| `tests/test_workflow.py` | Modify | New `TestInstallFreshnessGuard` class covering the five scenarios above |
+
+### Key Decisions
+
+- **Hash comparison, not mtime or git rev**: hashes are unambiguous and survive `cp -p`. mtimes drift; git revs assume the running script comes from a clone (not always true on the ephemeral install).
+- **Hardcoded repo path** (`~/Projects/devtools/dtl.py`): matches the PM's filesystem convention documented in CLAUDE.md. A `--dev-repo` override is YAGNI for a single-user single-machine tool.
+- **Asymmetric failure mode**: `--schedule` hard-bails because an autonomous overnight against stale code wastes hours; interactive runs only warn because the human is at the keyboard and can decide. Mirrors the existing `preflight_auto_merge` asymmetry.
+- **Guard runs in every `workflow` subcommand**, not just `run`: `next` and `finish` also drive automation behavior that depends on current code.
+
+### Notes
+
+Origin: 2026-05-17 overnight reconciliation. Stale `/opt/devtools/dtl.py` (pre-PR #38) ran the workflow, producing 4 clean merges but skipping all `_write_feature_state` calls because that function did not yet exist in the installed copy. Per-feature state directory `~/.local/state/dtl/<project>/<feature>.json` was therefore never created. Complement to (not replacement for) `scheduled-run-freshness`.
+
+---
+
+## Feature: scaffold-shellcheck-parity
+
+**Branch:** `feature/scaffold-shellcheck-parity`
+**Depends on:** none
+**Status:** Merged
+
+### Goal
+
+Make shellcheck behave identically in the AI dev loop and in CI for every scaffolded repo, so source-following lint failures (SC1091) can never slip through to CI and stall auto-merge. Ship a repo-root `.shellcheckrc` with `external-sources=true`, install `shellcheck` in the scaffolded `claude-code` container so the AI can lint shell locally before committing, and ensure the generated CI shellcheck step is consistent with local.
+
+### Acceptance Criteria
+
+- [ ] `dtl` scaffolding writes a repo-root `.shellcheckrc` containing `external-sources=true` and `source-path=SCRIPTDIR` for newly scaffolded projects
+- [ ] The scaffolded inline `claude-code` Dockerfile template installs `shellcheck` (apt) so the containerized AI can run it pre-commit, matching CI
+- [ ] The generated CI lint workflow's shellcheck step succeeds on a script that `source`s a sibling file via a `# shellcheck source=` directive (regression for the hub PR #8 failure)
+- [ ] Backward-compatible: existing scaffolded projects are unaffected; `docs/` documents the one-line retrofit for repos already created
+- [ ] A test asserts the scaffolder emits `.shellcheckrc` with `external-sources=true`
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Emit `.shellcheckrc` in project scaffolding; add `shellcheck` to the inline `claude-code` Dockerfile template; align the generated CI shellcheck step |
+| `tests/test_*.py` | Modify | Assert scaffolded output includes `.shellcheckrc` (external-sources=true) |
+
+### Key Decisions
+
+- **`.shellcheckrc` with `external-sources=true` over per-line `disable=SC1091`**: fixes the root cause repo-wide and *honors* the `# shellcheck source=` hints the AI already writes, rather than suppressing them. A lint gate only *prevents* (vs merely *catches*) when local and CI run the same tool, flags, and config.
+- **Install shellcheck in the AI container**, not just CI: the host has no shellcheck, so "run lint before every commit" silently skips shell unless the container provides it.
+- **Additive only** (new file + one Dockerfile line): preserves the backward-compatibility constraint; existing repos keep working and opt in by re-scaffolding or the documented one-liner.
+
+### Notes
+
+Origin: hub PR #8 (2026-05-20) stalled on SC1091 — CI ran `shellcheck` without `-x` while `scripts/install-*.sh` carried `# shellcheck source=bootstrap/versions.env` hints (only honored with `-x`), and shellcheck was not in the dev loop to catch it locally. This feature is the scaffolder-level prevention; retrofitting existing repos (hub, loom, morning-brief) with `.shellcheckrc` is separate per-repo cleanup.
+
+
+---
+
+## Feature: dtl-pm-install
+
+**Branch:** `feature/dtl-pm-install`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Add a `dtl pm install` subcommand that materializes the canonical PM coordination config (`pm/`) into a workspace — wrapping the logic already in `pm/install.sh` — so a rebuilt workstation (or hub first-boot) restores the PM layer with one command.
+
+### Acceptance Criteria
+
+- [ ] `dtl pm install [--dry-run] [--workspace DIR]` copies `pm/` (CLAUDE.md + the `.claude` payload: PROJECTS.md, rules/, commands/, scripts/, settings.json) into the target workspace (default `~/Projects`)
+- [ ] PRESERVES `.claude/settings.local.json` and `.claude/HANDOFF.md` if they already exist (never overwrite machine-local / volatile files)
+- [ ] Resolves the `pm/` source whether dtl runs from `/opt/devtools` or a dev clone
+- [ ] `dtl pm --help` documents the command
+- [ ] Unit test installs into a tmp workspace and asserts the files land AND a pre-existing settings.local.json is preserved (real boundary, not a string check)
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `pm` subcommand + `cmd_pm_install` (stdlib-only) |
+| `tests/test_pm_install.py` | Create | Install-to-tmp test + preservation assertion |
+
+### Notes
+
+`pm/install.sh` already implements the copy/preserve logic — reimplement in stdlib Python or shell out to it. Match existing dtl subcommand patterns.
+
+---
+
+## Feature: ci-aggregation-gate
+
+**Branch:** `feature/ci-aggregation-gate`
+**Depends on:** none
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Make scaffolded CI gate merges reliably even with matrix jobs. Add a single `ci-ok` aggregation job (`needs:` all other jobs) to the generated CI workflow so branch protection can require just `ci-ok` instead of brittle per-matrix-cell contexts (the exact gap that let untested code merge on hub/devtools).
+
+### Acceptance Criteria
+
+- [ ] The scaffolded CI workflow template in `dtl.py` includes a final `ci-ok` job that `needs` every other job, runs with `if: always()`, and FAILS if any needed job's result is not `success`
+- [ ] Scaffolded README/docs instruct requiring only `ci-ok` in branch protection
+- [ ] test-templates / test-scaffold assert the generated workflow contains `ci-ok` wired to the other jobs
+- [ ] Backward compatible — existing scaffolded repos unaffected
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `ci-ok` gate job to the CI workflow template |
+| `tests/` | Modify | Assert the gate job is generated and wired |
+
+### Notes
+
+Standard solution to "matrix jobs can't be required status checks." The result-check step should inspect `needs.*.result`.
+
+---
+
+## Feature: scaffold-security-scan
+
+**Branch:** `feature/scaffold-security-scan`
+**Depends on:** ci-aggregation-gate
+**Status:** Merged
+**Requires:** ai
+
+### Goal
+
+Make security scanning a scaffolding default so every new repo gets baseline AppSec without manual setup — the "right checks installed at scaffold time" principle extended to security.
+
+### Acceptance Criteria
+
+- [ ] Scaffolded CI includes a `security-scan` job: gitleaks (secrets) + `pip-audit` (python stack) / `npm audit` (node stack)
+- [ ] The `security-scan` job is wired into the `ci-ok` gate (or documented as required)
+- [ ] test-templates / test-scaffold assert the security-scan job is generated for the python and node stacks
+- [ ] Scaffolded docs note how to read findings and triage
+- [ ] All tests pass
+- [ ] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Add `security-scan` job to the CI workflow template |
+| `tests/` | Modify | Assert generation per stack |
+
+### Notes
+
+Complements `pm/weekly-review.sh` (scans existing repos); this bakes scanning into new repos from day one. devtools' own security model already references gitleaks/semgrep.
+
+---
+
+## Feature: scaffold-ci-greenable
+
+**Branch:** `fix/scaffold-ci-template`
+**Depends on:** scaffold-security-scan, ci-aggregation-gate
+**Status:** Merged (#68)
+**Requires:** ai
+
+### Goal
+
+A freshly scaffolded repo must pass its own CI on the very first push. Today `dtl new` (python stack) produces a repo that fails CI out of the box on four independent template defects — all found standing up the `atrade` repo 2026-06-05 and patched by hand there. Fix them at the source in `dtl.py` so every future scaffold is green from birth, and add a test that actually exercises the generated CI logic (not just its shape).
+
+### Background — the six defects (all in `dtl.py` inline templates)
+
+Defects 1–4 were found on the empty scaffold; 5–6 surfaced only once the first real feature (with a src-layout package + importing tests) landed — they were previously masked by defect 1's `|| true`.
+
+1. **`pytest` never gates.** The CI `lint-and-test` job runs `pytest --tb=short || true`, so test failures can never fail the build. Combined with the `ci-ok` aggregation gate, a repo can auto-merge broken tests (green-but-blind). The `|| true` exists only to tolerate pytest exit code 5 ("no tests collected") on an empty scaffold.
+2. **`notify.py` ships unformatted.** The scaffolded `.ai/notify.py` fails `ruff format --check .`, so the first push red-fails `lint-and-test`.
+3. **`gitleaks-action` is brittle on PRs.** It requires `GITHUB_TOKEN` and `pull-requests: write`, and even with both it returns "Unexpected exit code 1" on a clean PR commit-range scan. The `security-scan` job fails on every PR.
+4. **`security-scan` perms too narrow.** Top-level `permissions: contents: read` is insufficient for any action that comments on PRs.
+5. **`lint-and-test` never installs the package.** It runs `pip install ruff pytest` only, then `pytest` — so a src-layout package can't be imported and collection fails with `ModuleNotFoundError`. Needs `pip install -e .` (or `.[dev]`) before pytest.
+6. **`pip-audit` audits the ambient environment, not the project.** `pip-audit` with no args audits whatever is globally installed; on the GH runner that's dozens of stale, vulnerable system packages (certifi/cryptography/idna/pip…) unrelated to the project, so `security-scan` always fails. Audit a clean venv with the project installed (`python -m venv … && pip install -e . && pip-audit --skip-editable`).
+
+### Acceptance Criteria
+
+- [x] Scaffolded CI gates pytest: replace `pytest ... || true` with `pytest --tb=short || { rc=$?; [ "$rc" -eq 5 ] && exit 0 || exit "$rc"; }` (tolerate only exit 5)
+- [x] Scaffolded `.ai/notify.py` passes `ruff format --check` as generated (template is pre-formatted; assert in a test)
+- [x] `security-scan` uses the gitleaks **CLI** against the working tree (`gitleaks dir .`) instead of `gitleaks-action`; no `GITHUB_TOKEN` / `pull-requests: write` needed; exits non-zero only on a real finding
+- [x] `lint-and-test` installs the package before pytest (`pip install -e . ...`) so src-layout tests import cleanly
+- [x] `lint-and-test` installs from the project's own declaration -- `-e '.[dev]'` when a `dev` extra exists, else `-r requirements.txt` -- and NEVER hand-lists test packages on the pip line
+- [x] The generated install step has no `|| pip install ...` fallback; a broken extra must fail CI loudly rather than degrade to an incomplete environment
+- [x] Scaffolded `ruff` install is pinned (`ruff==<version>`), matching the fleet convention
+- [x] A generated `scripts/ci.sh` holds the lint/format/test sequence; the generated `ci.yml` calls it rather than restating the steps
+- [x] `_run_lint_and_tests` runs `scripts/ci.sh` when the project has one, and falls back to today's behaviour when it does not (existing repos keep working)
+- [x] A test asserts the generated `ci.yml` and `_run_lint_and_tests` execute the SAME script, so CI/local parity is enforced by a test rather than by discipline
+- [x] A test scaffolds a project, adds a test that imports a package declared ONLY in the `dev` extra, and asserts the generated CI installs it (the exact atrade PR #7 failure)
+- [x] `pip-audit` audits the project's deps in a clean venv (`python -m venv … && pip install -e . && pip-audit --skip-editable`), not the runner's ambient packages
+- [x] A test scaffolds a python project and asserts the generated `ci.yml` (a) gates pytest, (b) uses the gitleaks CLI not the action, (c) installs the package before pytest, and (d) audits an isolated venv
+- [x] A test asserts the generated `notify.py` is already ruff-formatted
+- [x] **Strongest test: scaffold a python project, add one trivial importing test, and assert the generated CI actually goes green** (catches the whole class of green-but-blind template bugs, not just known instances)
+- [x] Backward-compatible — does not break existing scaffolded repos
+- [x] All tests pass
+- [x] Lint clean
+
+### Files to Create or Modify
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `dtl.py` | Modify | Fix the inline CI workflow + `notify.py` templates (4 defects above) |
+| `tests/` | Modify | Assert pytest-gating, gitleaks-CLI, and pre-formatted notify.py in generated output |
+
+### Notes
+
+The reference fix is the atrade `ci.yml` after PRs #1 and #2 (`Psaphon/atrade`), which is green across all jobs with a real importing test suite (defects 1–4 fixed in #1, 5–6 in #2). The deeper lesson: `scaffold-security-scan`'s tests asserted the job was *generated*, never that a scaffold *passes* — so add a test that runs the generated CI logic, not just diffs the YAML. Tracked in PM memory `project_dtl_scaffold_ci_pytest_gate`.
+
+## Feature: ai-sandbox-git-identity
+
+**Branch:** `fix/ai-sandbox-git-identity`
+**Depends on:** none
+**Status:** Merged (#73)
+**Requires:** ai
+
+### Goal
+
+Commits made inside the AI sandbox must carry the host repo's git identity. On hub (2026-09-29, first supervised `dtl ai run`) the commit came out as `Developer <dev@localhost>`: the compose template falls back to those defaults when `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` are unset, and nothing sets them.
+
+### Acceptance Criteria
+
+- [x] `_compose_env()` sets `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` (and the committer pair) from `git -C <project> config user.name/user.email` when they are not already set in the environment
+- [x] When the project has no git identity configured, dtl prints a clear warning and leaves the variables unset (never invents one)
+- [x] An explicitly exported `GIT_AUTHOR_NAME`/`EMAIL` in the environment wins over the repo config
+- [x] Tests cover: identity from repo config, env override, missing identity warns
+- [x] All tests pass
+- [x] Lint clean
+
+## Feature: ai-sandbox-project-test-tools
+
+**Branch:** `fix/ai-sandbox-test-tools`
+**Depends on:** none
+**Status:** Merged (#75)
+**Requires:** ai
+
+### Goal
+
+The AI must be able to run the project's own lint and tests inside the sandbox before committing. On hub the sandbox had no `ruff`, `pytest` or `pyyaml`, so the AI improvised a throwaway venv in `/tmp`. Follow the fleet CI rule: install from the project's own declaration, never a hand-list.
+
+### Acceptance Criteria
+
+- [x] The generated sandbox prompt preamble (or `run.sh`) creates a venv in the container (not in the bind-mounted repo) and installs the project from its own declaration: `-e '.[dev]'` when a `dev` extra exists, else `-r requirements.txt`, else nothing
+- [x] When the project has `scripts/ci.sh`, the AI is told to run that before committing
+- [x] The install never writes into the repo working tree (no venv or egg-info left behind to dirty `git status`)
+- [x] A test proves a project with a `dev` extra gets its test tools, and one with neither declaration still runs
+- [x] All tests pass
+- [x] Lint clean
+
+## Feature: test-hygiene-hub
+
+**Branch:** `fix/test-hygiene-hub`
+**Depends on:** none
+**Status:** Merged (#74)
+**Requires:** ai
+
+### Goal
+
+devtools' own test suite must not touch the real machine. Found on hub 2026-09-29:
+1. Workflow tests wrote into the **real** `~/.local/state/dtl` (`workflow.log`, `*-workflow-state.json` named after tests). On hub that could overwrite a real overnight run's state.
+2. Tests that fake `docker`/`git`/`claude` by writing scripts into `tmp_path` fall through to the **real** binary when `/tmp` is mounted `noexec` (bash skips a file it cannot execute). hub mounts `/tmp` noexec; GitHub CI does not, so this only bites on hub.
+
+### Acceptance Criteria
+
+- [x] An autouse fixture points dtl's state directory (and any other per-user path dtl writes) at `tmp_path` for every test; a test asserts nothing is written under the real `~/.local/state/dtl` during the suite
+- [x] Fake CLIs fail closed: fakes are provided so that a non-executable fake can never fall through to a real binary (e.g. `BASH_FUNC_<name>%%` functions, or a PATH containing only a symlink dir of the needed tools)
+- [x] The suite passes with `TMPDIR` on a `noexec` mount (simulate with a check that the fake actually ran, not the real tool)
+- [x] All tests pass
+- [x] Lint clean
+
+## Feature: notify-ntfy-native
+
+**Branch:** `feature/notify-ntfy-native`
+**Depends on:** none
+**Status:** Merged (#76, #77)
+**Requires:** ai
+
+### Goal
+
+`dtl workflow` notifications must be readable on the phone. Today dtl POSTs a raw JSON body with `Content-Type: application/json` to the configured URL; ntfy shows that JSON verbatim as the message. hub has ntfy on `http://127.0.0.1:2586` (hub cannot resolve `*.ts.net`), topic `hub-alerts`.
+
+### Acceptance Criteria
+
+- [x] A `format = "ntfy"` option in `~/.config/dtl/notify.toml` sends ntfy-native messages: a human-readable one-line body, and `Title`, `Priority` and `Tags` headers per event type (`ai-failure` and `needs-attention` high, `feature-merged` default, `idle` low)
+- [x] The default (`format = "json"`) keeps today's JSON POST exactly, so existing receivers keep working
+- [x] `dtl notify test` sends through the configured format
+- [x] docs/notify.md documents the hub config (`url = "http://127.0.0.1:2586/hub-alerts"`, `format = "ntfy"`)
+- [x] Tests assert the exact headers and body for each event type, against a local HTTP server (real request, not a mocked urlopen)
+- [x] All tests pass
+- [x] Lint clean

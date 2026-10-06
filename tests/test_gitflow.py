@@ -9,7 +9,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dtl import (
-    _detect_auth_failure,
     _find_feature_for_branch,
     _parse_devplan,
     _run_lint_and_tests,
@@ -73,29 +72,9 @@ Gamma goal.
 """
 
 
-# ---------------------------------------------------------------------------
-# _detect_auth_failure
-# ---------------------------------------------------------------------------
-
-
-class TestDetectAuthFailure:
-    def test_detects_auth_error(self):
-        assert _detect_auth_failure("Error: Authentication failed for Claude API")
-
-    def test_detects_login_prompt(self):
-        assert _detect_auth_failure("Please run claude login to authenticate")
-
-    def test_detects_expired_token(self):
-        assert _detect_auth_failure("Your session has expired token please re-auth")
-
-    def test_normal_output_not_flagged(self):
-        assert not _detect_auth_failure("Successfully implemented the feature")
-
-    def test_empty_output(self):
-        assert not _detect_auth_failure("")
-
-    def test_case_insensitive(self):
-        assert _detect_auth_failure("UNAUTHORIZED access denied")
+# Note: _detect_auth_failure was removed in feature/interruption-taxonomy.
+# Equivalent (and stricter, false-positive-resistant) coverage now lives in
+# tests/test_workflow.py::TestRunClassification, exercising _classify_run.
 
 
 # ---------------------------------------------------------------------------
@@ -126,15 +105,15 @@ class TestRunLintAndTests:
         (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
         with patch("dtl.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-            passed, output = _run_lint_and_tests(tmp_path)
+            passed, _output = _run_lint_and_tests(tmp_path)
         assert passed
-        assert mock_run.call_count == 3  # pip install + lint + test
+        assert mock_run.call_count == 5  # venv + pip install + pytest probe + lint + test
 
     def test_lint_failure_stops_early(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
 
         def fake_run(cmd, **kwargs):
-            if "pip" in " ".join(str(c) for c in cmd):
+            if "pip" in " ".join(str(c) for c in cmd) or "-c" in cmd or "venv" in cmd:
                 return MagicMock(returncode=0, stdout="", stderr="")
             return MagicMock(returncode=1, stdout="", stderr="lint error")
 
@@ -144,7 +123,7 @@ class TestRunLintAndTests:
         assert "lint error" in output
 
     def test_no_project_files(self, tmp_path):
-        passed, output = _run_lint_and_tests(tmp_path)
+        passed, _output = _run_lint_and_tests(tmp_path)
         assert passed  # nothing to check = pass
 
     def test_node_project_detected(self, tmp_path):
@@ -242,18 +221,39 @@ class TestCmdWorkflowFinish:
             patch("dtl._run_lint_and_tests", return_value=(True, "all passed")),
             patch("dtl._git_is_dirty", return_value=False),
             patch("dtl._git_push_branch", return_value=True),
-            patch(
-                "dtl._gh_create_pr", return_value="https://github.com/test/pr/1"
-            ) as mock_pr,
-            patch("dtl.subprocess.run"),  # for git add/commit/push of status
+            patch("dtl._gh_create_pr", return_value="https://github.com/test/pull/1") as mock_pr,
+            patch("dtl._gh_enable_auto_merge", return_value=True) as mock_auto,
+            patch("dtl.subprocess.run"),  # for git add/commit of status
         ):
             cmd_workflow_finish(args)
 
         mock_pr.assert_called_once()
-        # Status should be PR Open
+        mock_auto.assert_called_once()
+        # The status is recorded on the feature branch, so the merge carries it
         _, features = _parse_devplan(plan_file.read_text())
         beta = next(f for f in features if f["name"] == "beta-feature")
-        assert beta["status"] == "PR Open"
+        assert beta["status"] == "Merged (#1)"
+
+    def test_auto_merge_waits_for_status_push(self, tmp_path):
+        plan_file = self._make_project(tmp_path)
+        args = MagicMock()
+        args.plan = str(plan_file)
+        args.project = str(tmp_path)
+        args.watch = False
+
+        # First push (the feature) succeeds; the status push fails.
+        with (
+            patch("dtl._git_current_branch", return_value="feature/beta-feature"),
+            patch("dtl._run_lint_and_tests", return_value=(True, "ok")),
+            patch("dtl._git_is_dirty", return_value=False),
+            patch("dtl._git_push_branch", side_effect=[True, False]),
+            patch("dtl._gh_create_pr", return_value="https://github.com/test/pull/1"),
+            patch("dtl._gh_enable_auto_merge") as mock_auto,
+            patch("dtl.subprocess.run"),
+            pytest.raises(SystemExit),
+        ):
+            cmd_workflow_finish(args)
+        mock_auto.assert_not_called()
 
     def test_exits_on_push_failure(self, tmp_path):
         plan_file = self._make_project(tmp_path)

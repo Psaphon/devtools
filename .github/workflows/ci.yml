@@ -19,10 +19,21 @@ jobs:
           python-version: "3.12"
       - name: Check syntax
         run: python -m py_compile dtl.py
+      # Ruff is PINNED deliberately. An unpinned `pip install ruff` means any
+      # upstream release can turn CI red with no change on our side — which is
+      # exactly what happened on 2026-08-26, when 0.16.4 expanded the default
+      # rule set and produced 134 errors in an unmodified dtl.py (0.15.7: zero).
+      # Every open PR was blocked, including one-line doc changes.
+      #
+      # Bump this deliberately, in its own PR, alongside the fixes the new
+      # version demands. Never unpin it.
+      #
+      # 0.15.7 -> 0.16.4 done that way: ruff.toml now declares an explicit
+      # rule set, so a future release's default changes cannot reach us.
       - name: Run ruff lint
-        run: pip install ruff && ruff check dtl.py
+        run: pip install ruff==0.16.4 && ruff check .
       - name: Run ruff format check
-        run: ruff format --check dtl.py
+        run: ruff format --check .
 
   test-scaffold:
     runs-on: ubuntu-latest
@@ -141,6 +152,25 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install pytest
+        # ruff and pyyaml are test dependencies: tests run `ruff format --check` on
+        # generated files and parse the generated CI workflows.
+        run: pip install pytest pyyaml ruff==0.16.4
       - name: Run unit tests
         run: pytest tests/ -v
+
+  # Single required check for the branch rulesets (devtools templates/rulesets).
+  # Requires every job to SUCCEED: "skipped" fails too, so a mis-scoped job can't
+  # let a PR merge untested. List every other job of this workflow in `needs`.
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [lint, test-scaffold, test-ai-attach, test-templates, test-commands, test-unit]
+    if: always()
+    steps:
+      - name: All required jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: ${RESULTS}"
+          for r in ${RESULTS}; do
+            [[ "${r}" == "success" ]] || { echo "::error::a required job ended '${r}'"; exit 1; }
+          done

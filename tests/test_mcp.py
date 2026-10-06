@@ -200,9 +200,7 @@ def test_settings_mcp_binary_name() -> None:
 
 
 def test_settings_multiple_mcp_servers() -> None:
-    raw = make_ai_claude_settings(
-        ["claude"], mcp_servers=["filesystem", "github", "memory"]
-    )
+    raw = make_ai_claude_settings(["claude"], mcp_servers=["filesystem", "github", "memory"])
     data = json.loads(raw)
     assert set(data["mcpServers"].keys()) == {"filesystem", "github", "memory"}
 
@@ -221,3 +219,22 @@ def test_settings_permissions_present() -> None:
     assert "permissions" in data
     assert "allow" in data["permissions"]
     assert len(data["permissions"]["allow"]) > 0
+
+
+def test_claude_settings_pins_sonnet_by_default() -> None:
+    """The sandbox must never fall back to the CLI's default model."""
+    assert json.loads(make_ai_claude_settings(["claude"]))["model"] == "sonnet"
+
+
+def test_claude_settings_honours_explicit_model() -> None:
+    assert json.loads(make_ai_claude_settings(["claude"], model="haiku"))["model"] == "haiku"
+
+
+def test_claude_compose_sets_anthropic_model_not_dead_var() -> None:
+    """Claude Code reads ANTHROPIC_MODEL; CLAUDE_MODEL is silently ignored."""
+    from dtl import make_ai_docker_compose
+
+    default = make_ai_docker_compose("claude")
+    assert "- ANTHROPIC_MODEL=sonnet" in default
+    assert "CLAUDE_MODEL" not in default
+    assert "- ANTHROPIC_MODEL=opus" in make_ai_docker_compose("claude", "opus")
