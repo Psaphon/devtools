@@ -3969,6 +3969,24 @@ def _watchdog_check_log_growth(prev_state: dict) -> tuple[str | None, int]:
     return anomaly, total_bytes
 
 
+# A problem the watchdog already reported stays quiet until it changes, clears, or
+# this long passes. Before, every 2-hourly check re-sent the same high-priority alert.
+WATCHDOG_REMIND_HOURS = 24
+
+
+def _watchdog_should_notify(
+    prev: dict | None, anomalies: list[str], now: datetime.datetime
+) -> bool:
+    """True when these anomalies differ from the last alert, or the reminder is due."""
+    if not prev or sorted(prev.get("anomalies", [])) != sorted(anomalies):
+        return True
+    try:
+        sent = datetime.datetime.fromisoformat(prev["sent"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return now - sent >= datetime.timedelta(hours=WATCHDOG_REMIND_HOURS)
+
+
 def _watchdog_notify_project(
     project_dir: Path,
     anomalies: list[str],
@@ -5753,8 +5771,11 @@ def cmd_watchdog_check(args: argparse.Namespace) -> None:
         log.setLevel(logging.INFO)
 
     prev_state = _watchdog_read_state()
-    now_str = datetime.datetime.now().isoformat(timespec="seconds")
+    now = datetime.datetime.now()
+    now_str = now.isoformat(timespec="seconds")
     all_anomalies: list[str] = []
+    prev_notified: dict = prev_state.get("notified", {})
+    notified: dict = {}
 
     # Check D: log growth — evaluated once, globally.
     log_anomaly, current_log_bytes = _watchdog_check_log_growth(prev_state)
@@ -5787,7 +5808,13 @@ def cmd_watchdog_check(args: argparse.Namespace) -> None:
 
         if project_anomalies:
             all_anomalies.extend(project_anomalies)
-            _watchdog_notify_project(project_dir, project_anomalies, log)
+            prev = prev_notified.get(project_dir.name)
+            if _watchdog_should_notify(prev, project_anomalies, now):
+                _watchdog_notify_project(project_dir, project_anomalies, log)
+                notified[project_dir.name] = {"anomalies": project_anomalies, "sent": now_str}
+            else:
+                log.info("[%s] Same anomalies already reported; not re-sending.", project_dir.name)
+                notified[project_dir.name] = prev
 
     if all_anomalies:
         print(f"FAIL — {len(all_anomalies)} anomaly/anomalies detected:")
@@ -5803,6 +5830,7 @@ def cmd_watchdog_check(args: argparse.Namespace) -> None:
             "last_anomalies": all_anomalies,
             "log_size_bytes": current_log_bytes,
             "log_size_timestamp": now_str,
+            "notified": notified,
         }
     )
 

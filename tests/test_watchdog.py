@@ -901,3 +901,78 @@ class TestCmdWatchdogCheck:
         assert "last_run" in state
         assert "last_result" in state
         assert "log_size_bytes" in state
+
+
+# ---------------------------------------------------------------------------
+# Alert once per problem
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogAlertOnce:
+    def _setup(self, tmp_path, monkeypatch):
+        project = make_project(tmp_path)
+        write_devplan(project, ["Not Started"])
+        (project / ".ai").mkdir()
+        (project / ".ai" / "notify.py").write_text("import sys; sys.exit(0)")
+        state_file = tmp_path / "ws.json"
+        monkeypatch.setattr(dtl, "_watchdog_state_path", lambda: state_file)
+        monkeypatch.setattr(dtl, "_dtl_state_dir", lambda: tmp_path / "state")
+        return project, state_file
+
+    def _check(self, project) -> int:
+        """Run one check; return how many alerts it sent."""
+        calls: list[list] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "ps" in cmd:
+                return MagicMock(stdout="other stuff\n", returncode=0)
+            if "gh" in cmd:
+                return MagicMock(stdout="[]", returncode=0)
+            return MagicMock(stdout="", returncode=0, stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            dtl.cmd_watchdog_check(argparse.Namespace(projects=str(project)))
+        return len([c for c in calls if "notify.py" in " ".join(c)])
+
+    def test_same_problem_alerts_once(self, tmp_path, monkeypatch, capsys):
+        project, _ = self._setup(tmp_path, monkeypatch)
+        assert self._check(project) == 1
+        assert self._check(project) == 0
+        assert self._check(project) == 0
+        # Still reported as a failure each run, just not re-sent.
+        assert capsys.readouterr().out.count("FAIL") == 3
+
+    def test_reminder_after_a_day(self, tmp_path, monkeypatch):
+        project, state_file = self._setup(tmp_path, monkeypatch)
+        assert self._check(project) == 1
+        state = json.loads(state_file.read_text())
+        old = datetime.datetime.now() - datetime.timedelta(hours=dtl.WATCHDOG_REMIND_HOURS + 1)
+        state["notified"][project.name]["sent"] = old.isoformat(timespec="seconds")
+        state_file.write_text(json.dumps(state))
+        assert self._check(project) == 1
+        assert self._check(project) == 0
+
+    def test_changed_problem_alerts_again(self, tmp_path, monkeypatch):
+        project, state_file = self._setup(tmp_path, monkeypatch)
+        assert self._check(project) == 1
+        state = json.loads(state_file.read_text())
+        state["notified"][project.name]["anomalies"] = ["something else"]
+        state_file.write_text(json.dumps(state))
+        assert self._check(project) == 1
+
+    def test_cleared_problem_alerts_again_when_it_returns(self, tmp_path, monkeypatch):
+        project, _ = self._setup(tmp_path, monkeypatch)
+        assert self._check(project) == 1
+        write_devplan(project, ["Merged"])
+        assert self._check(project) == 0
+        write_devplan(project, ["Not Started"])
+        assert self._check(project) == 1
+
+    def test_unreadable_sent_time_alerts(self):
+        now = datetime.datetime.now()
+        assert dtl._watchdog_should_notify({"anomalies": ["a"], "sent": "junk"}, ["a"], now)
+        assert dtl._watchdog_should_notify(None, ["a"], now)
+        assert not dtl._watchdog_should_notify(
+            {"anomalies": ["b", "a"], "sent": now.isoformat()}, ["a", "b"], now
+        )
