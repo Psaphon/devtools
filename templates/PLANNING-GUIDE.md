@@ -29,7 +29,7 @@ There is no "paste this into the PM" step any more.
 
 ## Before you plan: check what exists
 
-Read `PROJECTS-CONTEXT.md` (in your planning project; its source is private) (what's active, parked or stubbed, and the conventions). If the idea overlaps an active repo, propose `Plan type: features` for that repo instead of a new one. **One repo per deployment surface:** a second repo that also configures hub is almost always wrong. Ask the operator if unsure; the operator often has an older idea filed already.
+Read the private "Planner Context" artifact on the operator's account (find it by that exact title). It carries live project status, `PROJECTS-CONTEXT.md` (what's active, parked or stubbed, and the conventions) and the tech radar. If the idea overlaps an active repo, propose `Plan type: features` for that repo instead of a new one. **One repo per deployment surface:** a second repo that also configures hub is almost always wrong. Ask the operator if unsure; the operator often has an older idea filed already.
 
 ## Conversation mode (hybrid)
 
