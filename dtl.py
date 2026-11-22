@@ -105,7 +105,7 @@ STACKS: dict[str, dict] = {
         """),
         "dockerfile_run": ("RUN pip install --no-cache-dir --upgrade pip"),
         "ci_setup": textwrap.dedent("""\
-              - uses: actions/setup-python@v5
+              - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
                 with:
                   python-version: "3.12"
               - name: Run CI
@@ -113,7 +113,7 @@ STACKS: dict[str, dict] = {
         """),
         "claude_linter": "ruff check . && ruff format --check .",
         "security_audit_step": textwrap.dedent("""\
-            - uses: actions/setup-python@v5
+            - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
               with:
                 python-version: "3.12"
             - name: Dependency audit (pip-audit)
@@ -159,7 +159,7 @@ STACKS: dict[str, dict] = {
         """),
         "dockerfile_run": "# npm install happens via devcontainer postCreateCommand",
         "ci_setup": textwrap.dedent("""\
-              - uses: actions/setup-node@v4
+              - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
                 with:
                   node-version: "22"
               - run: npm ci
@@ -168,7 +168,7 @@ STACKS: dict[str, dict] = {
         """),
         "claude_linter": "npx eslint . && npx prettier --check .",
         "security_audit_step": textwrap.dedent("""\
-            - uses: actions/setup-node@v4
+            - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
               with:
                 node-version: "22"
             - name: Dependency audit (npm)
@@ -205,7 +205,7 @@ STACKS: dict[str, dict] = {
         """),
         "dockerfile_run": "# go mod download happens at build or postCreate",
         "ci_setup": textwrap.dedent("""\
-              - uses: actions/setup-go@v5
+              - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
                 with:
                   go-version: "1.23"
               - run: go vet ./...
@@ -828,13 +828,13 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 {ci_setup}
 
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Shellcheck
         run: |
           mapfile -t scripts < <(find . -name "*.sh" ! -path "./.git/*" ! -path "./.ai/*")
@@ -844,7 +844,7 @@ jobs:
   security-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # gitleaks CLI against the working tree, unpacked to /tmp: the runner user
       # cannot write /usr/local/bin. Same form as atrade's green CI.
       - name: Secret scan (gitleaks)
@@ -888,7 +888,7 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
       lint-and-test:
         runs-on: ubuntu-latest
         steps:
-          - uses: actions/checkout@v4
+          - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
           - name: Detect Python source
             id: pycheck
@@ -899,7 +899,7 @@ _CI_YML_SCAFFOLD = textwrap.dedent("""\
                 echo "found=false" >> "$GITHUB_OUTPUT"
               fi
 
-          - uses: actions/setup-python@v5
+          - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
             if: steps.pycheck.outputs.found == 'true'
             with:
               python-version: "3.12"
@@ -965,7 +965,7 @@ def make_cd_workflow(name: str) -> str:
           release:
             runs-on: ubuntu-latest
             steps:
-              - uses: actions/checkout@v4
+              - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
                 with:
                   fetch-depth: 0
 
